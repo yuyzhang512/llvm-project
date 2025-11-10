@@ -52,6 +52,11 @@ static cl::opt<unsigned>
                  cl::desc("Number of addresses from which to enable MIMG NSA."),
                  cl::init(2), cl::Hidden);
 
+static cl::opt<unsigned>
+    VDstThreshold("amdgpu-vdst-threshold",
+                 cl::desc("Number of cycles after we don't insert vdst waits."),
+                 cl::init(30), cl::Hidden);
+
 GCNSubtarget::~GCNSubtarget() = default;
 
 GCNSubtarget &GCNSubtarget::initializeSubtargetDependencies(const Triple &TT,
@@ -351,6 +356,13 @@ void GCNSubtarget::overrideSchedPolicy(MachineSchedPolicy &Policy,
   // register spills than just using one of these approaches on its own.
   Policy.OnlyTopDown = false;
   Policy.OnlyBottomUp = false;
+
+  const Function &F = Region.RegionBegin->getMF()->getFunction();
+  Attribute WorkloadAttr = F.getFnAttribute("amdgpu-workload-type");
+  bool IsMLWorkload = WorkloadAttr.isValid() && WorkloadAttr.getValueAsString() == "ml";
+  // Always schedule top-down for better blancing of HW resource usage.
+  if (IsMLWorkload || true)
+    Policy.OnlyTopDown = true;
 
   // Enabling ShouldTrackLaneMasks crashes the SI Machine Scheduler.
   if (!enableSIScheduler())
@@ -812,6 +824,8 @@ void GCNSubtarget::adjustSchedDependency(
   }
 }
 
+
+
 unsigned GCNSubtarget::getNSAThreshold(const MachineFunction &MF) const {
   if (getGeneration() >= AMDGPUSubtarget::GFX12)
     return 0; // Not MIMG encoding.
@@ -825,6 +839,10 @@ unsigned GCNSubtarget::getNSAThreshold(const MachineFunction &MF) const {
     return std::max(Value, 2);
 
   return NSAThreshold;
+}
+
+unsigned GCNSubtarget::getVDstThreshold(const MachineFunction &MF) const {
+  return VDstThreshold.getValue();
 }
 
 GCNUserSGPRUsageInfo::GCNUserSGPRUsageInfo(const Function &F,

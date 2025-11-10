@@ -1,0 +1,55 @@
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1250 -run-pass=postmisched %s -o - | FileCheck %s
+
+---
+name: hazard_repro
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $sgpr86, $sgpr87, $sgpr92, $sgpr93, $sgpr94, $vgpr50, $vgpr51, $vgpr52, $vgpr53, $vgpr54, $vgpr55, $vgpr56, $vgpr57, $vgpr58, $vgpr59, $vgpr60, $vgpr61, $vgpr62, $vgpr63, $vgpr64, $vgpr65, $vgpr66, $vgpr67, $vgpr68, $vgpr69, $vgpr70, $vgpr71, $vgpr72, $vgpr73, $vgpr74, $vgpr75, $vgpr76, $vgpr77, $vgpr78, $vgpr79, $vgpr80, $vgpr81, $vgpr82, $vgpr83, $vgpr84, $vgpr85, $vgpr86, $vgpr87, $vgpr88, $vgpr89, $vgpr90, $vgpr91, $vgpr92, $vgpr93, $vgpr94, $vgpr95, $vgpr96, $vgpr97, $vgpr98, $vgpr99, $vgpr100, $vgpr101, $vgpr102, $vgpr103, $vgpr104, $vgpr105, $vgpr106, $vgpr107, $vgpr108, $vgpr109, $vgpr110, $vgpr111, $vgpr112, $vgpr113, $vgpr586, $vgpr587, $vgpr588, $vgpr589, $vgpr720, $vgpr721, $vgpr722, $vgpr723, $vgpr724, $vgpr725, $vgpr726, $vgpr727
+
+    ; CHECK-LABEL: name: hazard_repro
+    ; CHECK: S_WAIT_TENSORCNT 8
+    ; CHECK: V_WMMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_w32_threeaddr
+    ; CHECK: ATOMIC_FENCE 5, 2
+    ; CHECK: S_BARRIER_SIGNAL_IMM -1
+    ; CHECK: S_BARRIER_WAIT -1
+    ; CHECK: V_CVT_SCALEF32_PK8_FP8_F32_e64
+    ; CHECK: S_AND_B32
+    ; CHECK: ATOMIC_FENCE 4, 2
+    ; CHECK: S_LSHL_B32
+    ; CHECK: V_WMMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_w32_threeaddr
+    ; CHECK: S_XOR_B32
+    ; CHECK: S_ADD_I32
+    ; CHECK-COUNT-6: V_NOP_e32
+    ; CHECK: V_MAXIMUM_F32_e64
+    ; CHECK: S_LSHL_B32
+    ; CHECK: S_LSHR_B32
+    ; CHECK: V_PK_ADD_F32
+    ; CHECK: V_MAXIMUM3_F32_e64
+    ; CHECK: V_WMMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_w32_threeaddr
+    ; CHECK: S_LSHR_B32
+    ; CHECK: S_OR_B32
+    ; CHECK: V_MAXIMUM3_F32_e64
+
+    S_WAIT_TENSORCNT 8, implicit-def dead $tensorcnt, implicit $tensorcnt
+    early-clobber $vgpr840_vgpr841_vgpr842_vgpr843_vgpr844_vgpr845_vgpr846_vgpr847 = V_WMMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_w32_threeaddr $vgpr66_vgpr67_vgpr68_vgpr69_vgpr70_vgpr71_vgpr72_vgpr73_vgpr74_vgpr75_vgpr76_vgpr77_vgpr78_vgpr79_vgpr80_vgpr81, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57_vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, 0, $sgpr87, $sgpr86, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, implicit $exec
+    ATOMIC_FENCE 5, 2
+    S_BARRIER_SIGNAL_IMM -1
+    S_BARRIER_WAIT -1
+    early-clobber $vgpr136_vgpr137 = nofpexcept V_CVT_SCALEF32_PK8_FP8_F32_e64 $vgpr720_vgpr721_vgpr722_vgpr723_vgpr724_vgpr725_vgpr726_vgpr727, 1065353216, implicit $mode, implicit $exec
+    $sgpr22 = S_AND_B32 $sgpr94, 1, implicit-def dead $scc
+    ATOMIC_FENCE 4, 2
+    $sgpr6 = nuw nsw S_LSHL_B32 $sgpr22, 1, implicit-def dead $scc
+    early-clobber $vgpr848_vgpr849_vgpr850_vgpr851_vgpr852_vgpr853_vgpr854_vgpr855 = V_WMMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_w32_threeaddr $vgpr82_vgpr83_vgpr84_vgpr85_vgpr86_vgpr87_vgpr88_vgpr89_vgpr90_vgpr91_vgpr92_vgpr93_vgpr94_vgpr95_vgpr96_vgpr97, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57_vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, 0, $sgpr87, $sgpr86, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, implicit $exec
+    $sgpr14 = S_XOR_B32 $sgpr6, 2, implicit-def dead $scc
+    $sgpr6 = S_ADD_I32 $sgpr92, $sgpr93, implicit-def dead $scc
+    $vgpr132 = V_MAXIMUM_F32_e64 0, $vgpr841, 0, $vgpr843, 0, 0, implicit $exec
+    $sgpr23 = nuw nsw S_LSHL_B32 $sgpr14, 13, implicit-def dead $scc
+    $sgpr6 = S_LSHR_B32 $sgpr6, 16, implicit-def dead $scc
+    $vgpr130_vgpr131 = nofpexcept V_PK_ADD_F32 8, $vgpr586_vgpr587, 8, $vgpr588_vgpr589, 0, 0, 0, 0, 0, implicit $mode, implicit $exec
+    $vgpr142 = V_MAXIMUM3_F32_e64 0, $vgpr840, 0, $vgpr842, 0, $vgpr844, 0, 0, implicit $exec
+    early-clobber $vgpr856_vgpr857_vgpr858_vgpr859_vgpr860_vgpr861_vgpr862_vgpr863 = V_WMMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_w32_threeaddr $vgpr98_vgpr99_vgpr100_vgpr101_vgpr102_vgpr103_vgpr104_vgpr105_vgpr106_vgpr107_vgpr108_vgpr109_vgpr110_vgpr111_vgpr112_vgpr113, $vgpr50_vgpr51_vgpr52_vgpr53_vgpr54_vgpr55_vgpr56_vgpr57_vgpr58_vgpr59_vgpr60_vgpr61_vgpr62_vgpr63_vgpr64_vgpr65, 8, 0, $sgpr87, $sgpr86, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, implicit $exec
+    $sgpr29 = S_LSHR_B32 $sgpr23, 4, implicit-def dead $scc
+    $sgpr39 = disjoint S_OR_B32 $sgpr6, 4194304, implicit-def dead $scc
+    $vgpr132 = V_MAXIMUM3_F32_e64 0, $vgpr132, 0, $vgpr845, 0, $vgpr847, 0, 0, implicit $exec
+...

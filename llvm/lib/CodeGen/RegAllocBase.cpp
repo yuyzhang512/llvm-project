@@ -17,6 +17,7 @@
 #include "llvm/CodeGen/LiveInterval.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/LiveRegMatrix.h"
+#include "llvm/CodeGen/MachineCycleAnalysis.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
@@ -45,6 +46,13 @@ STATISTIC(NumNewQueued, "Number of new live ranges queued");
 static cl::opt<bool, true>
     VerifyRegAlloc("verify-regalloc", cl::location(RegAllocBase::VerifyEnabled),
                    cl::Hidden, cl::desc("Verify during register allocation"));
+
+static cl::opt<bool>
+DisableLoopSpill("disable-loop-spill", cl::Hidden,
+                             cl::desc("Whether or not to discourage spilling into loops"),
+                             cl::init(true));
+
+
 
 const char RegAllocBase::TimerGroupName[] = "regalloc";
 const char RegAllocBase::TimerGroupDescription[] = "Register Allocation";
@@ -88,9 +96,42 @@ void RegAllocBase::seedLiveRegs() {
 void RegAllocBase::allocatePhysRegs() {
   seedLiveRegs();
 
+  MachineFunction &MF = VRM->getMachineFunction();
+  MachineCycleInfo CI;
+  CI.clear();
+  CI.compute(VRM->getMachineFunction());
+
+  MachineCycle *FirstCycle = nullptr;
+  for (auto &MBB : MF) {
+    auto Cycle = CI.getCycle(&MBB);
+    if (Cycle) {
+      FirstCycle = Cycle;
+      break;
+    }
+  }
+
+
   // Continue assigning vregs one at a time to available physical registers.
   while (const LiveInterval *VirtReg = dequeue()) {
     assert(!VRM->hasPhys(VirtReg->reg()) && "Register already assigned");
+
+
+    if (DisableLoopSpill) {
+      auto TheReg = VirtReg->reg();
+      bool FoundCycle = false;
+      for (auto &UseInst: MRI->use_nodbg_instructions(TheReg)) {
+        auto UseBlock = UseInst.getParent();
+        auto Cycle = CI.getCycle(UseBlock);
+        if (Cycle && Cycle == FirstCycle) {
+          FoundCycle = true;
+          break;
+        }
+      }
+
+      if (FoundCycle) {
+        const_cast<LiveInterval *>(VirtReg)->setWeight(VirtReg->weight() * 1000);
+      }
+    }
 
     // Unused registers can appear when the spiller coalesces snippets.
     if (MRI->reg_nodbg_empty(VirtReg->reg())) {

@@ -1979,6 +1979,7 @@ def FeatureISAVersion11_7_Common : FeatureSet<
 
 def FeatureISAVersion12 : FeatureSet<
   [FeatureGFX12,
+   FeatureSafeSmemPrefetch,
    FeatureBackOffBarrier,
    FeatureAddressableLocalMemorySize65536,
    FeatureLDSBankCount32,

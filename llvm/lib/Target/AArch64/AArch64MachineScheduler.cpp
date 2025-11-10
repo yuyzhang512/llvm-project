@@ -59,7 +59,8 @@ static bool mayOverlapWrite(const MachineInstr &MI0, const MachineInstr &MI1,
 }
 
 bool AArch64PostRASchedStrategy::tryCandidate(SchedCandidate &Cand,
-                                              SchedCandidate &TryCand) {
+                                              SchedCandidate &TryCand,
+                                              SchedBoundary *Zone) {
   bool OriginalResult = PostGenericScheduler::tryCandidate(Cand, TryCand);
 
   if (Cand.isValid()) {

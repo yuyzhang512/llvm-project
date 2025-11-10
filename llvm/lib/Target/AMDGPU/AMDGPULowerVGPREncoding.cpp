@@ -190,11 +190,6 @@ private:
   MachineBasicBlock::instr_iterator
   handleClause(MachineBasicBlock::instr_iterator I);
 
-  /// Check if an instruction \p I is immediately after another program state
-  /// instruction which it cannot coissue with. If so, insert before that
-  /// instruction to encourage more coissuing.
-  MachineBasicBlock::instr_iterator
-  handleCoissue(MachineBasicBlock::instr_iterator I);
 
   /// S_SET_VGPR_MSB immediately after S_SETREG_IMM32_B32 targeting MODE is
   /// silently dropped on GFX1250. When set, the next S_SET_VGPR_MSB insertion
@@ -210,6 +205,13 @@ private:
   /// Update bits[12:19] of the imm operand in S_SETREG_IMM32_B32 to contain
   /// the VGPR MSB mode value. \returns true if the immediate was changed.
   bool updateSetregModeImm(MachineInstr &MI, int64_t ModeValue);
+
+  /// Check if an instruction \p I is immediately after another program state
+  /// instruction which it cannot coissue with. If so, insert before that
+  /// instruction to encourage more coissuing.
+  MachineBasicBlock::instr_iterator
+  handleCoissue(MachineBasicBlock::instr_iterator I);
+
 };
 
 bool AMDGPULowerVGPREncoding::setMode(ModeTy NewMode,
@@ -401,7 +403,7 @@ AMDGPULowerVGPREncoding::handleClause(MachineBasicBlock::instr_iterator I) {
 
   // Otherwise adjust a number of instructions in the clause if it fits.
   // If it does not clause will just become shorter. Since the length
-  // recorded in the clause is one less, increment the length after the
+  // recorded in the clause is one less, increment the length after thed
   // update. Note that SIMM16[5:0] must be 1-62, not 0 or 63.
   if (ClauseLen < 63)
     Clause->getOperand(0).setImm(ClauseLen | (ClauseBreaks << 8));
@@ -548,6 +550,31 @@ bool AMDGPULowerVGPREncoding::handleSetregMode(MachineInstr &MI) {
   LLVM_DEBUG(dbgs() << "    -> inserted S_SET_VGPR_MSB after setreg: "
                     << *MostRecentModeSet);
   return true;
+}
+
+MachineBasicBlock::instr_iterator
+AMDGPULowerVGPREncoding::handleCoissue(MachineBasicBlock::instr_iterator I) {
+  if (I.isEnd())
+    return I;
+
+  if (I == I->getParent()->begin())
+    return I;
+
+  MachineBasicBlock::instr_iterator Prev = std::prev(I);
+  auto isProgramStateSALU = [this](MachineInstr *MI) {
+    return TII->isBarrier(MI->getOpcode()) || TII->isWaitcnt(MI->getOpcode()) ||
+           SIInstrInfo::isProgramStateSALU(*MI);
+  };
+
+  if (!isProgramStateSALU(&*Prev))
+    return I;
+
+  while (!Prev.isEnd() && (Prev != Prev->getParent()->begin()) &&
+         isProgramStateSALU(&*Prev)) {
+    --Prev;
+  }
+  // We have to return the next instruction because we insert before the result
+  return std::next(Prev);
 }
 
 bool AMDGPULowerVGPREncoding::run(MachineFunction &MF) {

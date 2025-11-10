@@ -83,6 +83,14 @@ STATISTIC(NumGlobalSplits, "Number of split global live ranges");
 STATISTIC(NumLocalSplits,  "Number of split local live ranges");
 STATISTIC(NumEvicted,      "Number of interferences evicted");
 
+  static cl::opt<unsigned> AntiHintPressureThreshold(                                                                                                                                                                                                                             
+      "regalloc-anti-hint-pressure-threshold",                                                                                                                                                                                                                                    
+      cl::desc("When register pressure exceeds this percentage of allocatable "                                                                                                                                                                                                   
+               "registers, disable anti-hints to avoid spills. For large "                                                                                                                                                                                                        
+               "register classes (>256 regs), a lower threshold of 40% is used "                                                                                                                                                                                                  
+               "by default."),                                                                                                                                                                                                                                                    
+      cl::init(80), cl::Hidden);  
+
 static cl::opt<SplitEditor::ComplementSpillMode> SplitSpillMode(
     "split-spill-mode", cl::Hidden,
     cl::desc("Spill mode for splitting live ranges"),
@@ -601,7 +609,7 @@ bool RegAllocEvictionAdvisor::canReassign(const LiveInterval &VirtReg,
   };
 
   for (MCRegister Reg :
-       AllocationOrder::create(VirtReg.reg(), *VRM, RegClassInfo, Matrix)) {
+       AllocationOrder::create(VirtReg.reg(), *VRM, RegClassInfo, Matrix, RA.shouldDisableAntiHints())) {
     if (Reg == FromReg)
       continue;
     // If no units have interference, reassignment is possible.
@@ -2649,10 +2657,28 @@ MCRegister RAGreedy::selectOrSplitImpl(const LiveInterval &VirtReg,
                                        unsigned Depth) {
   uint8_t CostPerUseLimit = uint8_t(~0u);
   // First try assigning a free register.
-  auto Order =
-      AllocationOrder::create(VirtReg.reg(), *VRM, RegClassInfo, Matrix);
-  if (MCRegister PhysReg =
-          tryAssign(VirtReg, Order, NewVRegs, FixedRegisters)) {
+  unsigned Cascade = ExtraInfo->getCascade(VirtReg.reg());
+    auto Order = AllocationOrder::create(VirtReg.reg(), *VRM, RegClassInfo, Matrix,                                                                                                                                                                                                        
+                                DisableAntiHints);                                                                                                                                                                                                                                
+    MCRegister PhysReg = tryAssign(VirtReg, Order, NewVRegs, FixedRegisters);                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                  
+    // If assignment failed and the interval hasn't been involved in eviction yet,                                                                                                                                                                                                
+    // and anti-hints weren't already disabled, try with the full order.                                                                                                                                                                                                          
+    // Anti-hints are preferences to avoid hazards, but using an anti-hinted                                                                                                                                                                                                      
+    // register is better than evicting or spilling.                                                                                                                                                                                                                              
+    if (!PhysReg && !DisableAntiHints && NewVRegs.empty() && Cascade == 0 &&                                                                                                                                                                                                      
+        VirtReg.isSpillable()) {                                                                                                                                                                                                                                                  
+      AllocationOrder FullOrder = AllocationOrder::createWithoutAntiHints(                                                                                                                                                                                                        
+          VirtReg.reg(), *VRM, RegClassInfo, Matrix);                                                                                                                                                                                                                             
+      PhysReg = tryAssign(VirtReg, FullOrder, NewVRegs, FixedRegisters);                                                                                                                                                                                                          
+      LLVM_DEBUG({                                                                                                                                                                                                                                                                
+        if (PhysReg)                                                                                                                                                                                                                                                              
+          dbgs() << "Assigned to anti-hinted register: " << VirtReg << " to "                                                                                                                                                                                                     
+                 << printReg(PhysReg, TRI) << '\n';                                                                                                                                                                                                                               
+      });                                                                                                                                                                                                                                                                         
+    }                                                                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                  
+    if (PhysReg) {      
     // When NewVRegs is not empty, we may have made decisions such as evicting
     // a virtual register, go with the earlier decisions and use the physical
     // register.
@@ -2679,6 +2705,27 @@ MCRegister RAGreedy::selectOrSplitImpl(const LiveInterval &VirtReg,
   // queue. The RS_Split ranges already failed to do this, and they should not
   // get a second chance until they have been split.
   if (Stage != RS_Split) {
+      // Before evicting, check if there's a free anti-hinted register. Using                                                                                                                                                                                                     
+      // an anti-hinted register is better than evicting another interval, which                                                                                                                                                                                                  
+      // could cause that interval to spill later.                                                                                                                                                                                                                                
+      if (Cascade == 0 && VirtReg.isSpillable()) {                                                                                                                                                                                                                                
+        AllocationOrder FullOrder = AllocationOrder::createWithoutAntiHints(                                                                                                                                                                                                      
+            VirtReg.reg(), *VRM, RegClassInfo, Matrix);                                                                                                                                                                                                                           
+        LLVM_DEBUG(dbgs() << "Checking anti-hinted registers for " << VirtReg << '\n');                                                                                                                                                                                           
+        unsigned NumChecked = 0;                                                                                                                                                                                                                                                  
+        for (MCRegister Reg : FullOrder) {                                                                                                                                                                                                                                        
+          ++NumChecked;                                                                                                                                                                                                                                                           
+          if (Matrix->checkInterference(VirtReg, Reg) == LiveRegMatrix::IK_Free) {                                                                                                                                                                                                
+            LLVM_DEBUG(dbgs() << "assigning (anti-hint register, avoiding eviction): "                                                                                                                                                                                            
+                              << VirtReg << " to " << printReg(Reg, TRI) << '\n');                                                                                                                                                                                                
+            return Reg;                                                                                                                                                                                                                                                           
+          }                                                                                                                                                                                                                                                                       
+        }                                                                                                                                                                                                                                                                         
+        LLVM_DEBUG(dbgs() << "  No free anti-hinted register found (checked "                                                                                                                                                                                                     
+                          << NumChecked << ")\n");                                                                                                                                                                                                                                
+      }                                                                                                                                                                                                                                                                           
+            
+
     if (MCRegister PhysReg =
             tryEvict(VirtReg, Order, NewVRegs, CostPerUseLimit,
                      FixedRegisters)) {
@@ -2700,6 +2747,38 @@ MCRegister RAGreedy::selectOrSplitImpl(const LiveInterval &VirtReg,
   // Wait until the second time, when all smaller ranges have been allocated.
   // This gives a better picture of the interference to split around.
   if (Stage < RS_Split) {
+      // Before waiting for second round, try allocation without anti-hints.                                                                                                                                                                                                      
+      // Anti-hints are just preferences to avoid hazards; using an anti-hinted                                                                                                                                                                                                   
+      // register is better than waiting and potentially spilling later.                                                                                                                                                                                                          
+      if (VirtReg.isSpillable()) {                                                                                                                                                                                                                                                
+        AllocationOrder FullOrder = AllocationOrder::createWithoutAntiHints(                                                                                                                                                                                                      
+            VirtReg.reg(), *VRM, RegClassInfo, Matrix);                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                  
+        // First try direct assignment                                                                                                                                                                                                                                            
+        for (MCRegister PhysReg : FullOrder) {                                                                                                                                                                                                                                    
+          if (Matrix->checkInterference(VirtReg, PhysReg) ==                                                                                                                                                                                                                      
+              LiveRegMatrix::IK_Free) {                                                                                                                                                                                                                                           
+            LLVM_DEBUG(dbgs() << "assigning (ignoring anti-hints, before split): "                                                                                                                                                                                                
+                              << VirtReg << " to " << printReg(PhysReg, TRI)                                                                                                                                                                                                      
+                              << '\n');                                                                                                                                                                                                                                           
+            return PhysReg;                                                                                                                                                                                                                                                       
+          }                                                                                                                                                                                                                                                                       
+        }                                                                                                                                                                                                                                                                         
+                                                                                                                                                                                                                                                                                  
+        // Try eviction with full order
+        if (MCRegister PhysReg = EvictAdvisor->tryFindEvictionCandidate(                                                                                                                                                                                                          
+                VirtReg, FullOrder, CostPerUseLimit, FixedRegisters)) {                                                                                                                                                                                                           
+          LLVM_DEBUG(dbgs() << "evicting (ignoring anti-hints, before split): "                                                                                                                                                                                                   
+                            << VirtReg << " to " << printReg(PhysReg, TRI) << '\n');                                                                                                                                                                                              
+          evictInterference(VirtReg, PhysReg, NewVRegs);                                                                                                                                                                                                                          
+          Register Hint = MRI->getSimpleHint(VirtReg.reg());                                                                                                                                                                                                                      
+          if (Hint && Hint != PhysReg)                                                                                                                                                                                                                                            
+            SetOfBrokenHints.insert(&VirtReg);                                                                                                                                                                                                                                    
+          return PhysReg;                                                                                                                                                                                                                                                         
+        }                                                                                                                                                                                                                                                                         
+      }                                                                                                                                                                                                                                                                           
+            
+
     ExtraInfo->setStage(VirtReg, RS_Split);
     LLVM_DEBUG(dbgs() << "wait for second round\n");
     NewVRegs.push_back(VirtReg.reg());
@@ -2713,6 +2792,32 @@ MCRegister RAGreedy::selectOrSplitImpl(const LiveInterval &VirtReg,
     if (PhysReg || (NewVRegs.size() - NewVRegSizeBefore))
       return PhysReg;
   }
+
+    // Before spilling, try allocation with the full register order including                                                                                                                                                                                                     
+    // anti-hinted registers. Anti-hints are just preferences to avoid hazards;                                                                                                                                                                                                   
+    // using them is better than spilling.                                                                                                                                                                                                                                        
+    if (Stage == RS_Split && VirtReg.isSpillable()) {                                                                                                                                                                                                                             
+      AllocationOrder FullOrder = AllocationOrder::createWithoutAntiHints(                                                                                                                                                                                                        
+          VirtReg.reg(), *VRM, RegClassInfo, Matrix);                                                                                                                                                                                                                             
+                                                                                                                                                                                                                                                                                  
+      // Try direct assignment with full order                                                                                                                                                                                                                                    
+      for (MCRegister PhysReg : FullOrder) {                                                                                                                                                                                                                                      
+        if (Matrix->checkInterference(VirtReg, PhysReg) == LiveRegMatrix::IK_Free) {                                                                                                                                                                                              
+          LLVM_DEBUG(dbgs() << "assigning (ignoring anti-hints): " << VirtReg
+                            << " to " << printReg(PhysReg, TRI) << '\n');                                                                                                                                                                                                         
+          return PhysReg;                                                                                                                                                                                                                                                         
+        }                                                                                                                                                                                                                                                                         
+      }                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                  
+      // Try normal eviction with full order                     
+      if (MCRegister PhysReg = EvictAdvisor->tryFindEvictionCandidate(                                                                                                                                                                                                            
+              VirtReg, FullOrder, CostPerUseLimit, FixedRegisters)) {                                                                                                                                                                                                             
+        LLVM_DEBUG(dbgs() << "evicting (ignoring anti-hints) to assign: "                                                                                                                                                                                                         
+                          << VirtReg << " to " << printReg(PhysReg, TRI) << '\n');                                                                                                                                                                                                
+        evictInterference(VirtReg, PhysReg, NewVRegs);                                                                                                                                                                                                                            
+        return PhysReg;                                                                                                                                                                                                                                                           
+      }                                                                                                                                                                                                                                                                           
+    }   
 
   // If we couldn't allocate a register from spilling, there is probably some
   // invalid inline assembly. The base class will report it.
@@ -2974,6 +3079,50 @@ bool RAGreedy::run(MachineFunction &mf) {
   VRAI->calculateSpillWeightsAndHints();
 
   LLVM_DEBUG(LIS->dump());
+
+
+    // Detect high register pressure and disable anti-hints if needed.                                                                                                                                                                                                            
+    // Anti-hints are preferences to avoid hazards, but when register pressure
+    // is high, using anti-hinted registers is better than spilling.
+    DisableAntiHints = false;                                                                                                                                                                                                                                                     
+    {                                                                                                                                                                                                                                                                             
+      const MachineRegisterInfo &MRI = MF->getRegInfo();                                                                                                                                                                                                                          
+      // Count virtual registers per register class and check pressure                                                                                                                                                                                                            
+      DenseMap<const TargetRegisterClass *, unsigned> VRegCountPerClass;                                                                                                                                                                                                          
+      for (unsigned I = 0, E = MRI.getNumVirtRegs(); I != E; ++I) {                                                                                                                                                                                                               
+        Register Reg = Register::index2VirtReg(I);                                                                                                                                                                                                                                
+        if (!MRI.reg_nodbg_empty(Reg) && !VRM->hasPhys(Reg)) {                                                                                                                                                                                                                    
+          const TargetRegisterClass *RC = MRI.getRegClass(Reg);                                                                                                                                                                                                                   
+          VRegCountPerClass[RC]++;                                                                                                                                                                                                                                                
+        }                                                                                                                                                                                                                                                                         
+      }                                                          
+  
+      // Check if any class has high pressure. Use the configurable threshold
+      // for most classes, but a lower threshold (half) for large vector register
+      // classes where anti-hints (like MFMA hazard avoidance) can significantly
+      // affect allocation patterns and lead to spills.                                                                                                                                                                                                                           
+      for (const auto &Entry : VRegCountPerClass) {                                                                                                                                                                                                                               
+        const TargetRegisterClass *RC = Entry.first;                                                                                                                                                                                                                              
+        unsigned VRegCount = Entry.second;                                                                                                                                                                                                                                        
+        unsigned NumAllocatable = RegClassInfo.getNumAllocatableRegs(RC);                                                                                                                                                                                                         
+        // Use a lower threshold for large vector register classes                                                                                                                                                                                                                
+        unsigned Threshold = (NumAllocatable > 256)                                                                                                                                                                                                                               
+                                 ? AntiHintPressureThreshold / 2                                                                                                                                                                                                                  
+                                 : AntiHintPressureThreshold.getValue();                                                                                                                                                                                                          
+        if (NumAllocatable > 0 && VRegCount * 100 > NumAllocatable * Threshold) {                                                                                                                                                                                                 
+          LLVM_DEBUG(dbgs() << "High register pressure for "                                                                                                                                                                                                                      
+                            << TRI->getRegClassName(RC) << " (" << VRegCount                                                                                                                                                                                                      
+                            << "/" << NumAllocatable << " = "                                                                                                                                                                                                                     
+                            << (VRegCount * 100 / NumAllocatable)                                                                                                                                                                                                                 
+                            << "%, threshold " << Threshold                                                                                                                                                                                                                       
+                            << "%). Disabling anti-hints.\n");                                                                                                                                                                                                                    
+          DisableAntiHints = true;                               
+          break;
+        }
+      }
+    }                                                                                                                                                                                                                                                                             
+  
+
 
   SA.reset(new SplitAnalysis(*VRM, *LIS, *Loops));
   SE.reset(new SplitEditor(*SA, *LIS, *VRM, *DomTree, *MBFI, *VRAI));

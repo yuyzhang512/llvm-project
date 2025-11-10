@@ -242,12 +242,15 @@ static cl::opt<std::string> SchedOnlyFunc("misched-only-func", cl::Hidden,
   cl::desc("Only schedule this function"));
 static cl::opt<unsigned> SchedOnlyBlock("misched-only-block", cl::Hidden,
                                         cl::desc("Only schedule this MBB#"));
+cl::opt<int> DebugOnlyBlock("misched-debug-only-block", cl::Hidden,
+                            cl::init(-1),
+                            cl::desc("Only emit debug output for this MBB#"));
 #endif // NDEBUG
 
 /// Avoid quadratic complexity in unusually large basic blocks by limiting the
 /// size of the ready lists.
 static cl::opt<unsigned> ReadyListLimit("misched-limit", cl::Hidden,
-  cl::desc("Limit ready list to N instructions"), cl::init(256));
+  cl::desc("Limit ready list to N instructions"), cl::init(2000));
 
 static cl::opt<bool> EnableRegPressure("misched-regpressure", cl::Hidden,
   cl::desc("Enable register pressure scheduling."), cl::init(true));
@@ -868,13 +871,22 @@ void MachineSchedulerBase::scheduleRegions(ScheduleDAGInstrs &Scheduler,
         Scheduler.exitRegion();
         continue;
       }
-      LLVM_DEBUG(dbgs() << "********** MI Scheduling **********\n");
-      LLVM_DEBUG(dbgs() << MF->getName() << ":" << printMBBReference(*MBB)
-                        << " " << MBB->getName() << "\n  From: " << *I
-                        << "    To: ";
-                 if (RegionEnd != MBB->end()) dbgs() << *RegionEnd;
-                 else dbgs() << "End\n";
-                 dbgs() << " RegionInstrs: " << NumRegionInstrs << '\n');
+
+#ifndef NDEBUG
+      bool SavedDebugFlag = DebugFlag;
+      if (DebugOnlyBlock >= 0 && DebugOnlyBlock != (int)MBB->getNumber())
+        DebugFlag = false;
+#endif
+
+      LLVM_DEBUG({
+        dbgs() << "********** MI Scheduling **********\n";
+        dbgs() << MF->getName() << ":" << printMBBReference(*MBB)
+               << " " << MBB->getName() << "\n  From: " << *I
+               << "    To: ";
+        if (RegionEnd != MBB->end()) dbgs() << *RegionEnd;
+        else dbgs() << "End\n";
+        dbgs() << " RegionInstrs: " << NumRegionInstrs << '\n';
+      });
       if (DumpCriticalPathLength) {
         errs() << MF->getName();
         errs() << ":%bb. " << MBB->getNumber();
@@ -887,6 +899,10 @@ void MachineSchedulerBase::scheduleRegions(ScheduleDAGInstrs &Scheduler,
 
       // Close the current region.
       Scheduler.exitRegion();
+
+#ifndef NDEBUG
+      DebugFlag = SavedDebugFlag;
+#endif
     }
     Scheduler.finishBlock();
     // FIXME: Ideally, no further passes should rely on kill flags. However,
@@ -1184,8 +1200,9 @@ void ScheduleDAGMI::initQueues(ArrayRef<SUnit *> TopRoots,
 /// Update scheduler queues after scheduling an instruction.
 void ScheduleDAGMI::updateQueues(SUnit *SU, bool IsTopNode) {
   // Release dependent instructions for scheduling.
-  if (IsTopNode)
+  if (IsTopNode) {
     releaseSuccessors(SU);
+}
   else
     releasePredecessors(SU);
 
@@ -1702,6 +1719,11 @@ void ScheduleDAGMILive::schedule() {
   // Initialize the strategy before modifying the DAG.
   // This may initialize a DFSResult to be used for queue priority.
   SchedImpl->initialize(this);
+
+  for (auto SU : SUnits) {
+    SU.ComputeDepth();
+    SU.ComputeHeight();
+  }
 
   LLVM_DEBUG(dump());
   if (PrintDAGs) dump();
@@ -2756,19 +2778,19 @@ bool SchedBoundary::checkHazard(SUnit *SU) {
 // Find the unscheduled node in ReadySUs with the highest latency.
 unsigned SchedBoundary::
 findMaxLatency(ArrayRef<SUnit*> ReadySUs) {
-  SUnit *LateSU = nullptr;
+  //SUnit *LateSU = nullptr;
   unsigned RemLatency = 0;
   for (SUnit *SU : ReadySUs) {
     unsigned L = getUnscheduledLatency(SU);
     if (L > RemLatency) {
       RemLatency = L;
-      LateSU = SU;
+      //LateSU = SU;
     }
   }
-  if (LateSU) {
-    LLVM_DEBUG(dbgs() << Available.getName() << " RemLatency SU("
-                      << LateSU->NodeNum << ") " << RemLatency << "c\n");
-  }
+  //if (LateSU) {
+  //  LLVM_DEBUG(dbgs() << Available.getName() << " RemLatency SU("
+  //                    << LateSU->NodeNum << ") " << RemLatency << "c\n");
+  //}
   return RemLatency;
 }
 
@@ -2783,6 +2805,7 @@ getOtherResourceCount(unsigned &OtherCritIdx) {
 
   unsigned OtherCritCount = Rem->RemIssueCount
     + (RetiredMOps * SchedModel->getMicroOpFactor());
+
   LLVM_DEBUG(dbgs() << "  " << Available.getName() << " + Remain MOps: "
                     << OtherCritCount / SchedModel->getMicroOpFactor() << '\n');
   for (unsigned PIdx = 1, PEnd = SchedModel->getNumProcResourceKinds();
@@ -2945,7 +2968,8 @@ void SchedBoundary::bumpNode(SUnit *SU) {
   // checkHazard should prevent scheduling multiple instructions per cycle that
   // exceed the issue width.
   const MCSchedClassDesc *SC = DAG->getSchedClass(SU);
-  unsigned IncMOps = SchedModel->getNumMicroOps(SU->getInstr());
+  unsigned IncMOps = std::min(SchedModel->getNumMicroOps(SU->getInstr()), (unsigned)1);
+
   assert(
       (CurrMOps == 0 || (CurrMOps + IncMOps) <= SchedModel->getIssueWidth()) &&
       "Cannot schedule this instruction's MicroOps in the current cycle.");
@@ -3045,6 +3069,11 @@ void SchedBoundary::bumpNode(SUnit *SU) {
       }
     }
   }
+  if (HazardRec->isEnabled()) {
+    unsigned StallCount = HazardRec->getStallCount(SU);
+    NextCycle = std::max(CurrCycle + StallCount, NextCycle);
+  }
+
   // Update ExpectedLatency and DependentLatency.
   unsigned &TopLatency = isTop() ? ExpectedLatency : DependentLatency;
   unsigned &BotLatency = isTop() ? DependentLatency : ExpectedLatency;
@@ -3177,6 +3206,7 @@ SUnit *SchedBoundary::pickOnlyChoice() {
     return *Available.begin();
   return nullptr;
 }
+
 
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
 
@@ -4033,6 +4063,7 @@ bool GenericScheduler::tryCandidate(SchedCandidate &Cand,
     if (tryLess(TryCand.ResDelta.CritResources, Cand.ResDelta.CritResources,
                 TryCand, Cand, ResourceReduce))
       return TryCand.Reason != NoCand;
+
     if (tryGreater(TryCand.ResDelta.DemandedResources,
                    Cand.ResDelta.DemandedResources,
                    TryCand, Cand, ResourceDemand))
@@ -4079,6 +4110,7 @@ void GenericScheduler::pickNodeFromQueue(SchedBoundary &Zone,
       if (TryCand.ResDelta == SchedResourceDelta())
         TryCand.initResourceDelta(DAG, SchedModel);
       Cand.setBest(TryCand);
+
       LLVM_DEBUG(traceCandidate(Cand));
     }
   }
@@ -4175,7 +4207,7 @@ SUnit *GenericScheduler::pickNode(bool &IsTopNode) {
     if (!SU) {
       CandPolicy NoPolicy;
       TopCand.reset(NoPolicy);
-      pickNodeFromQueue(Top, NoPolicy, DAG->getTopRPTracker(), TopCand);
+      pickNodeFromQueue(Top, TopCand.Policy, DAG->getTopRPTracker(), TopCand);
       assert(TopCand.Reason != NoCand && "failed to find a candidate");
       tracePick(TopCand);
       SU = TopCand.SU;
@@ -4186,7 +4218,7 @@ SUnit *GenericScheduler::pickNode(bool &IsTopNode) {
     if (!SU) {
       CandPolicy NoPolicy;
       BotCand.reset(NoPolicy);
-      pickNodeFromQueue(Bot, NoPolicy, DAG->getBotRPTracker(), BotCand);
+      pickNodeFromQueue(Bot, BotCand.Policy, DAG->getBotRPTracker(), BotCand);
       assert(BotCand.Reason != NoCand && "failed to find a candidate");
       tracePick(BotCand);
       SU = BotCand.SU;
@@ -4382,7 +4414,8 @@ void PostGenericScheduler::registerRoots() {
 /// \param TryCand refers to the next SUnit candidate, otherwise uninitialized.
 /// \return \c true if TryCand is better than Cand (Reason is NOT NoCand)
 bool PostGenericScheduler::tryCandidate(SchedCandidate &Cand,
-                                        SchedCandidate &TryCand) {
+                                        SchedCandidate &TryCand,
+                                        SchedBoundary *Zone) {
   // Initialize the candidate if needed.
   if (!Cand.isValid()) {
     TryCand.Reason = FirstValid;
@@ -4433,14 +4466,15 @@ bool PostGenericScheduler::tryCandidate(SchedCandidate &Cand,
 }
 
 void PostGenericScheduler::pickNodeFromQueue(SchedBoundary &Zone,
-                                             SchedCandidate &Cand) {
+                                             SchedCandidate &Cand,
+                                             bool &IsPending) {
   ReadyQueue &Q = Zone.Available;
   for (SUnit *SU : Q) {
     SchedCandidate TryCand(Cand.Policy);
     TryCand.SU = SU;
     TryCand.AtTop = Zone.isTop();
     TryCand.initResourceDelta(DAG, SchedModel);
-    if (tryCandidate(Cand, TryCand)) {
+    if (tryCandidate(Cand, TryCand, &Zone)) {
       Cand.setBest(TryCand);
       LLVM_DEBUG(traceCandidate(Cand));
     }
@@ -4448,7 +4482,8 @@ void PostGenericScheduler::pickNodeFromQueue(SchedBoundary &Zone,
 }
 
 /// Pick the best candidate node from either the top or bottom queue.
-SUnit *PostGenericScheduler::pickNodeBidirectional(bool &IsTopNode) {
+SUnit *PostGenericScheduler::pickNodeBidirectional(bool &IsTopNode,
+                                                   bool &IsPending) {
   // FIXME: This is similiar to GenericScheduler::pickNodeBidirectional. Factor
   // out common parts.
 
@@ -4478,7 +4513,7 @@ SUnit *PostGenericScheduler::pickNodeBidirectional(bool &IsTopNode) {
   if (!BotCand.isValid() || BotCand.SU->isScheduled ||
       BotCand.Policy != BotPolicy) {
     BotCand.reset(CandPolicy());
-    pickNodeFromQueue(Bot, BotCand);
+    pickNodeFromQueue(Bot, BotCand, IsPending);
     assert(BotCand.Reason != NoCand && "failed to find the first candidate");
   } else {
     LLVM_DEBUG(traceCandidate(BotCand));
@@ -4486,7 +4521,7 @@ SUnit *PostGenericScheduler::pickNodeBidirectional(bool &IsTopNode) {
     if (VerifyScheduling) {
       SchedCandidate TCand;
       TCand.reset(CandPolicy());
-      pickNodeFromQueue(Bot, BotCand);
+      pickNodeFromQueue(Bot, BotCand, IsPending);
       assert(TCand.SU == BotCand.SU &&
              "Last pick result should correspond to re-picking right now");
     }
@@ -4498,7 +4533,7 @@ SUnit *PostGenericScheduler::pickNodeBidirectional(bool &IsTopNode) {
   if (!TopCand.isValid() || TopCand.SU->isScheduled ||
       TopCand.Policy != TopPolicy) {
     TopCand.reset(CandPolicy());
-    pickNodeFromQueue(Top, TopCand);
+    pickNodeFromQueue(Top, TopCand, IsPending);
     assert(TopCand.Reason != NoCand && "failed to find the first candidate");
   } else {
     LLVM_DEBUG(traceCandidate(TopCand));
@@ -4506,7 +4541,7 @@ SUnit *PostGenericScheduler::pickNodeBidirectional(bool &IsTopNode) {
     if (VerifyScheduling) {
       SchedCandidate TCand;
       TCand.reset(CandPolicy());
-      pickNodeFromQueue(Top, TopCand);
+      pickNodeFromQueue(Top, TopCand, IsPending);
       assert(TCand.SU == TopCand.SU &&
              "Last pick result should correspond to re-picking right now");
     }
@@ -4518,7 +4553,7 @@ SUnit *PostGenericScheduler::pickNodeBidirectional(bool &IsTopNode) {
   assert(TopCand.isValid());
   SchedCandidate Cand = BotCand;
   TopCand.Reason = NoCand;
-  if (tryCandidate(Cand, TopCand)) {
+  if (tryCandidate(Cand, TopCand, nullptr)) {
     Cand.setBest(TopCand);
     LLVM_DEBUG(traceCandidate(Cand));
   }
@@ -4530,6 +4565,7 @@ SUnit *PostGenericScheduler::pickNodeBidirectional(bool &IsTopNode) {
 
 /// Pick the next node to schedule.
 SUnit *PostGenericScheduler::pickNode(bool &IsTopNode) {
+  bool IsPending = false;
   if (DAG->top() == DAG->bottom()) {
     assert(Top.Available.empty() && Top.Pending.empty() &&
            Bot.Available.empty() && Bot.Pending.empty() && "ReadyQ garbage");
@@ -4546,7 +4582,7 @@ SUnit *PostGenericScheduler::pickNode(bool &IsTopNode) {
       // Set the bottom-up policy based on the state of the current bottom
       // zone and the instructions outside the zone, including the top zone.
       setPolicy(BotCand.Policy, /*IsPostRA=*/true, Bot, nullptr);
-      pickNodeFromQueue(Bot, BotCand);
+      pickNodeFromQueue(Bot, BotCand, IsPending);
       assert(BotCand.Reason != NoCand && "failed to find a candidate");
       tracePick(BotCand, /*IsPostRA=*/true);
       SU = BotCand.SU;
@@ -4562,14 +4598,14 @@ SUnit *PostGenericScheduler::pickNode(bool &IsTopNode) {
       // Set the top-down policy based on the state of the current top zone
       // and the instructions outside the zone, including the bottom zone.
       setPolicy(TopCand.Policy, /*IsPostRA=*/true, Top, nullptr);
-      pickNodeFromQueue(Top, TopCand);
+      pickNodeFromQueue(Top, TopCand, IsPending);
       assert(TopCand.Reason != NoCand && "failed to find a candidate");
       tracePick(TopCand, /*IsPostRA=*/true);
       SU = TopCand.SU;
     }
     IsTopNode = true;
   } else {
-    SU = pickNodeBidirectional(IsTopNode);
+    SU = pickNodeBidirectional(IsTopNode, IsPending);
   }
   assert(!SU->isScheduled && "SUnit scheduled twice.");
 

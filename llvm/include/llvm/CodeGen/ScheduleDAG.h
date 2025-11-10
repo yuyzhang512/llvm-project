@@ -487,9 +487,10 @@ class TargetRegisterInfo;
 
     LLVM_ABI void dumpAttributes() const;
 
-  private:
     LLVM_ABI void ComputeDepth();
     LLVM_ABI void ComputeHeight();
+
+  private:
   };
 
   /// Returns true if the specified SDep is equivalent except for latency.

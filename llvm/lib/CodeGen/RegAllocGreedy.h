@@ -285,8 +285,16 @@ private:
 
   bool ReverseLocalAssignment = false;
 
+    /// When register pressure is high, disable anti-hints for the entire function                                                                                                                                                                                                
+    /// to avoid early allocation decisions that lead to spills later.
+    bool DisableAntiHints = false;      
+
 public:
   RAGreedy(RequiredAnalyses &Analyses, const RegAllocFilterFunc F = nullptr);
+
+
+    /// Check if anti-hints should be disabled for this function.
+    bool shouldDisableAntiHints() const { return DisableAntiHints; }
 
   Spiller &spiller() override { return *SpillerInstance; }
   void enqueueImpl(const LiveInterval *LI) override;

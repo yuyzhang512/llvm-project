@@ -77,6 +77,7 @@ void BarrierLatency::apply(ScheduleDAGInstrs *DAG) {
   const SIInstrInfo *TII = static_cast<const SIInstrInfo *>(DAG->TII);
   constexpr unsigned FenceLatency = 2000;
   const unsigned BarrierSignalWaitLatency = BarrierSignalWaitLatencyOpt;
+  return;
 
   for (SUnit &SU : DAG->SUnits) {
     const MachineInstr *MI = SU.getInstr();

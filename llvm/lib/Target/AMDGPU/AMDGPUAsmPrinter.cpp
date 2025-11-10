@@ -21,6 +21,7 @@
 #include "AMDGPUMCResourceInfo.h"
 #include "AMDGPUResourceUsageAnalysis.h"
 #include "AMDGPUTargetMachine.h"
+#include "AMDGPUStaticSimulator.h"
 #include "GCNSubtarget.h"
 #include "MCTargetDesc/AMDGPUInstPrinter.h"
 #include "MCTargetDesc/AMDGPUMCExpr.h"
@@ -40,6 +41,7 @@
 #include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/MC/MCAssembler.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCSectionELF.h"
 #include "llvm/MC/MCStreamer.h"
@@ -53,6 +55,11 @@
 
 using namespace llvm;
 using namespace llvm::AMDGPU;
+
+static cl::opt<unsigned> ForceTCPSplit(
+    "amdgpu-tcp-split",
+    cl::desc("Force COMPUTE_PGM_RSRC3_GFX125_TCP_SPLIT value (0-7)"),
+    cl::init(0), cl::Hidden);
 
 // This should get the default rounding mode from the kernel. We just set the
 // default here, but this could change if the OpenCL rounding mode pragmas are
@@ -319,6 +326,83 @@ void AMDGPUAsmPrinter::emitBasicBlockStart(const MachineBasicBlock &MBB) {
     DisasmLineMaxLen = std::max(DisasmLineMaxLen, DisasmLines.back().size());
     HexLines.emplace_back("");
   }
+  
+  // Per-block sim metrics
+  if (isVerbose()) {
+    const SIMachineFunctionInfo *MFI = 
+        MBB.getParent()->getInfo<SIMachineFunctionInfo>();
+    if (MFI && MFI->hasStaticSimReport()) {
+      const AMDGPU::KernelPerfReport *Report = MFI->getStaticSimReport();
+      auto It = Report->PerBlock.find(&MBB);
+      if (It != Report->PerBlock.end()) {
+        const AMDGPU::PerBlockInfo &Info = It->second;
+        std::string Comment;
+        raw_string_ostream OS(Comment);
+        const AMDGPU::BlockMetrics &M = Info.Cold;
+        
+        if (Info.InLoop) {
+          OS << "=== Block (loop): Cold=" << Info.Cold.TotalCycles << "cyc"
+             << " Warm=" << Info.Warm.TotalCycles << "cyc"
+             << " Trip=" << Info.TripCount
+             << " Scaled=" << Info.getScaled().TotalCycles << "cyc";
+          if (Info.IsLoopHeader)
+            OS << " [header]";
+          OS << " ===";
+        } else {
+          OS << "=== Block: " << M.TotalCycles << " cycles";
+          if (Info.Frequency != 1.0f)
+            OS << formatv(" freq={0:F2}", Info.Frequency);
+          OS << " ===";
+        }
+        OutStreamer->emitRawComment(OS.str(), false);
+        
+        {
+          std::string Str;
+          raw_string_ostream OS2(Str);
+          OS2 << "  ";
+          M.printInstBreakdown(OS2);
+          OutStreamer->emitRawComment(OS2.str(), false);
+        }
+        
+        if (M.StallCycles() > 0) {
+          float StallPct = 100.0f * M.StallCycles() / M.TotalCycles;
+          OutStreamer->emitRawComment(
+              formatv("  Stall: {0} cycles ({1:F0}%)", M.StallCycles(), StallPct).str(),
+              false);
+          
+          std::string Str;
+          raw_string_ostream OS2(Str);
+          OS2 << "    ";
+          M.printStallBreakdown(OS2);
+          OutStreamer->emitRawComment(OS2.str(), false);
+          
+          if (M.StallFunctionalUnit > 0) {
+            Str.clear();
+            OS2 << "      FU: ";
+            M.printFUBreakdown(OS2);
+            OutStreamer->emitRawComment(OS2.str(), false);
+          }
+        }
+        
+        if (Info.InLoop && Info.Cold.TotalCycles > 0 && Info.Warm.TotalCycles > 0) {
+          float Speedup = (float)Info.Cold.TotalCycles / Info.Warm.TotalCycles;
+          OutStreamer->emitRawComment(
+              formatv("  Speedup: {0:F2}x warm vs cold", Speedup).str(),
+              false);
+        }
+
+        // WMMA efficiency for blocks with WMMA instructions
+        if (M.TotalWMMAOccupancy > 0 && M.TotalCycles > 0) {
+          OutStreamer->emitRawComment(
+              formatv("  WMMA efficiency: {0} / {1} cycles ({2:F0}%)",
+                      M.TotalWMMAOccupancy, M.TotalCycles,
+                      M.getWMMAEfficiency() * 100.0f).str(),
+              false);
+        }
+      }
+    }
+  }
+  
   AsmPrinter::emitBasicBlockStart(MBB);
 }
 
@@ -908,6 +992,22 @@ bool AMDGPUAsmPrinter::runOnMachineFunction(MachineFunction &MF) {
                   amdhsa::COMPUTE_PGM_RSRC3_GFX90A_TG_SPLIT, Ctx)),
           false);
     }
+    
+    // Static simulator summary
+    const SIMachineFunctionInfo *SIMFI = MF.getInfo<SIMachineFunctionInfo>();
+    if (SIMFI->hasStaticSimReport()) {
+      OutStreamer->emitRawComment("", false);
+      const AMDGPU::KernelPerfReport *Report = SIMFI->getStaticSimReport();
+      std::string ReportStr;
+      raw_string_ostream ReportOS(ReportStr);
+      Report->print(ReportOS, MF.getName());
+      StringRef ReportRef(ReportStr);
+      SmallVector<StringRef, 64> Lines;
+      ReportRef.split(Lines, '\n');
+      for (StringRef Line : Lines)
+        if (!Line.empty())
+          OutStreamer->emitRawComment(Line.str(), false);
+    }
   }
 
   if (DumpCodeInstEmitter) {
@@ -1304,11 +1404,17 @@ void AMDGPUAsmPrinter::getSIProgramInfo(SIProgramInfo &ProgInfo,
                 amdhsa::COMPUTE_PGM_RSRC3_GFX90A_TG_SPLIT_SHIFT);
   }
 
-  if (STM.hasGFX1250Insts())
+  if (AMDGPU::isGFX1250(STM)) {
     ProgInfo.ComputePGMRSrc3 =
         SetBits(ProgInfo.ComputePGMRSrc3, ProgInfo.NamedBarCnt,
                 amdhsa::COMPUTE_PGM_RSRC3_GFX125_NAMED_BAR_CNT,
                 amdhsa::COMPUTE_PGM_RSRC3_GFX125_NAMED_BAR_CNT_SHIFT);
+    if (ForceTCPSplit)
+      ProgInfo.ComputePGMRSrc3 =
+          SetBits(ProgInfo.ComputePGMRSrc3, CreateExpr(ForceTCPSplit.getValue()),
+                  amdhsa::COMPUTE_PGM_RSRC3_GFX125_TCP_SPLIT,
+                  amdhsa::COMPUTE_PGM_RSRC3_GFX125_TCP_SPLIT_SHIFT);
+  }
 
   ProgInfo.Occupancy = createOccupancy(
       STM.computeOccupancy(F, ProgInfo.LDSSize).second,

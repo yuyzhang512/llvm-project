@@ -477,6 +477,15 @@ public:
     return get(Opcode).TSFlags & SIInstrFlags::SALU;
   }
 
+  static bool isProgramStateSALU(const MachineInstr &MI) {
+    return MI.getOpcode() == AMDGPU::S_DELAY_ALU ||
+           MI.getOpcode() == AMDGPU::S_SET_VGPR_MSB ||
+           MI.getOpcode() == AMDGPU::ATOMIC_FENCE;
+  }
+
+  /// Get next real instruction, skipping debug/meta/implicit-def instructions.
+  static MachineInstr *getNextRealInstr(MachineInstr *MI);
+
   static bool isVALU(const MachineInstr &MI) {
     return MI.getDesc().TSFlags & SIInstrFlags::VALU;
   }
@@ -1558,6 +1567,8 @@ public:
   /// instruction.
   static unsigned getNumWaitStates(const MachineInstr &MI);
 
+  static unsigned getNumWaitStatesOther(const MachineInstr *MI);
+
   /// Returns the operand named \p Op.  If \p MI does not have an
   /// operand named \c Op, this function returns nullptr.
   LLVM_READONLY
@@ -1751,6 +1762,8 @@ public:
   // This is used if an operand is a 32 bit register but needs to be aligned
   // regardless.
   void enforceOperandRCAlignment(MachineInstr &MI, AMDGPU::OpName OpName) const;
+
+  unsigned getRepeatRate(const MachineInstr &MI) const;
 };
 
 /// \brief Returns true if a reg:subreg pair P has a TRC class

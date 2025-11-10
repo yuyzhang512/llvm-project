@@ -44,7 +44,7 @@ protected:
   void enterMBB(MachineBasicBlock *MBB) override;
   void leaveMBB() override;
 
-  bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand) override;
+  bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand, SchedBoundary *Zone = nullptr) override;
   bool biasAddiCandidate(SchedCandidate &Cand, SchedCandidate &TryCand) const;
 };
 

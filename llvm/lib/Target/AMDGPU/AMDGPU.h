@@ -438,6 +438,13 @@ public:
   static bool isRequired() { return true; }
 };
 
+class AMDGPUStaticSimulatorPass
+    : public PassInfoMixin<AMDGPUStaticSimulatorPass> {
+public:
+  PreservedAnalyses run(MachineFunction &MF,
+                        MachineFunctionAnalysisManager &MFAM);
+};
+
 class SIInsertHardClausesPass : public PassInfoMixin<SIInsertHardClausesPass> {
 public:
   PreservedAnalyses run(MachineFunction &MF,
@@ -539,6 +546,10 @@ extern char &SIInsertHardClausesID;
 
 void initializeSIInsertWaitcntsLegacyPass(PassRegistry &);
 extern char &SIInsertWaitcntsID;
+
+void initializeAMDGPUStaticSimulatorLegacyPass(PassRegistry &);
+FunctionPass *createAMDGPUStaticSimulatorPass();
+extern char &AMDGPUStaticSimulatorLegacyID;
 
 void initializeSIFormMemoryClausesLegacyPass(PassRegistry &);
 extern char &SIFormMemoryClausesID;

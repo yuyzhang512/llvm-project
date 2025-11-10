@@ -1,0 +1,62 @@
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1250 -run-pass=machine-scheduler -amdgpu-sched-strategy=ml -verify-machineinstrs %s -o - 2>&1 | FileCheck -check-prefix=GFX1250 %s
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1250 -run-pass=postmisched -verify-machineinstrs %s -o - 2>&1 | FileCheck -check-prefix=POSTRA %s
+
+# Test that the hazard recognizer properly handles TRANS32 hazards.
+# A TRANS32 instruction must be followed by a VALU instruction.
+# Anything else should cause a hazard (stall).
+
+---
+name:            test_trans32_valu_no_hazard
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+body:             |
+  bb.0:
+    ; GFX1250-LABEL: name: test_trans32_valu_no_hazard
+    ; GFX1250: V_EXP_F32
+    ; GFX1250-NEXT: V_ADD_F32
+    ; POSTRA-LABEL: name: test_trans32_valu_no_hazard
+    ; POSTRA: V_EXP_F32
+    ; POSTRA-NEXT: V_ADD_F32
+    ; Test that TRANS32 followed by VALU is scheduled without stalls.
+    
+    $vgpr0 = IMPLICIT_DEF
+    
+    ; TRANS32 instruction (V_EXP_F32)
+    $vgpr1 = V_EXP_F32_e32 $vgpr0, implicit $mode, implicit $exec
+    
+    ; VALU instruction (V_ADD_F32) - Should be scheduled immediately after
+    $vgpr2 = V_ADD_F32_e32 $vgpr0, $vgpr1, implicit $mode, implicit $exec
+    
+    S_NOP 0, implicit $vgpr2
+    S_ENDPGM 0
+...
+
+---
+name:            test_trans32_salu_hazard
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+body:             |
+  bb.0:
+    ; GFX1250-LABEL: name: test_trans32_salu_hazard
+    ; GFX1250: V_EXP_F32
+    ; GFX1250-NEXT: S_ADD_I32
+    ; POSTRA-LABEL: name: test_trans32_salu_hazard
+    ; POSTRA: V_EXP_F32
+    ; POSTRA-NEXT: S_ADD_I32
+    ; Test that TRANS32 followed by SALU causes a hazard.
+    
+    $vgpr0 = IMPLICIT_DEF
+    $sgpr0 = IMPLICIT_DEF
+    $sgpr1 = IMPLICIT_DEF
+    
+    ; TRANS32 instruction (V_EXP_F32)
+    $vgpr1 = V_EXP_F32_e32 $vgpr0, implicit $mode, implicit $exec
+    
+    ; SALU instruction (S_ADD_I32) - Should cause a stall if scheduled immediately after
+    $sgpr2 = S_ADD_I32 $sgpr0, $sgpr1, implicit-def dead $scc
+    
+    S_NOP 0, implicit $vgpr1, implicit $sgpr2
+    S_ENDPGM 0
+...

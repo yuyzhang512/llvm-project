@@ -20,6 +20,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/Register.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 
 namespace llvm {
 
@@ -29,6 +30,9 @@ class LiveRegMatrix;
 
 class LLVM_LIBRARY_VISIBILITY AllocationOrder {
   const SmallVector<MCPhysReg, 16> Hints;
+  // Used as storage if the Order received in the constructor needs to be
+  // altered.
+  SmallVector<MCPhysReg, 16> FilteredOrderStorage;
   ArrayRef<MCPhysReg> Order;
   // How far into the Order we can iterate. This is 0 if the AllocationOrder is
   // constructed with HardHints = true, Order.size() otherwise. While
@@ -83,7 +87,16 @@ public:
   /// @param RegClassInfo Information about reserved and allocatable registers.
   static AllocationOrder create(Register VirtReg, const VirtRegMap &VRM,
                                 const RegisterClassInfo &RegClassInfo,
-                                const LiveRegMatrix *Matrix);
+                                const LiveRegMatrix *Matrix,
+                                bool SkipAntiHints = false);
+
+    /// Create an AllocationOrder without anti-hint filtering.                                                                                                                                                                                                                    
+    /// This is used as a fallback when the regular allocation fails and we want                                                                                                                                                                                                  
+    /// to try using anti-hinted registers to avoid spilling.                                                                                                                                                                                                                     
+    static AllocationOrder createWithoutAntiHints(Register VirtReg,                                                                                                                                                                                                               
+                                                  const VirtRegMap &VRM,                                                                                                                                                                                                          
+                                                  const RegisterClassInfo &RegClassInfo,                                                                                                                                                                                          
+                                                  const LiveRegMatrix *Matrix); 
 
   /// Create an AllocationOrder given the Hints, Order, and HardHints values.
   /// Use the create method above - the ctor is for unittests.
@@ -117,6 +130,11 @@ public:
                static_cast<uint32_t>(std::numeric_limits<MCPhysReg>::max()));
     return Reg.isPhysical() && is_contained(Hints, Reg.id());
   }
+
+  /// Apply anti-hints to the allocation order.
+  void applyAntiHints(ArrayRef<MCPhysReg> AntiHintedPhysRegs,
+                      const TargetRegisterInfo *TRI);
+
 };
 
 } // end namespace llvm

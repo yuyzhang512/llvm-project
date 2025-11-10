@@ -290,7 +290,7 @@ codegen::RegisterCodeGenFlags::RegisterCodeGenFlags() {
 
   static cl::opt<FPOpFusion::FPOpFusionMode> FuseFPOps(
       "fp-contract", cl::desc("Enable aggressive formation of fused FP ops"),
-      cl::init(FPOpFusion::Standard),
+      cl::init(FPOpFusion::Fast),
       cl::values(
           clEnumValN(FPOpFusion::Fast, "fast",
                      "Fuse FP ops whenever profitable"),

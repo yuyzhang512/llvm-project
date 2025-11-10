@@ -24,7 +24,7 @@ public:
     PostGenericScheduler(C) {}
 
 protected:
-  bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand) override;
+  bool tryCandidate(SchedCandidate &Cand, SchedCandidate &TryCand, SchedBoundary *Zone = nullptr) override;
 };
 
 } // end namespace llvm

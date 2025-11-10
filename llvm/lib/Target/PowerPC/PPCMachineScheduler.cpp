@@ -178,7 +178,8 @@ bool PPCPostRASchedStrategy::biasAddiCandidate(SchedCandidate &Cand,
 }
 
 bool PPCPostRASchedStrategy::tryCandidate(SchedCandidate &Cand,
-                                          SchedCandidate &TryCand) {
+                                          SchedCandidate &TryCand,
+                                          SchedBoundary *Zone) {
   // From PostGenericScheduler::tryCandidate
 
   // Initialize the candidate if needed.

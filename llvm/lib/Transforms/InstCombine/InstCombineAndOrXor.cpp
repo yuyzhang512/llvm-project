@@ -2506,6 +2506,32 @@ Instruction *InstCombinerImpl::visitAnd(BinaryOperator &I) {
       return BinaryOperator::CreateOr(And, ConstantInt::get(Ty, Together));
     }
 
+    // ((X | C1) >> N) & C2 --> ((X & (C2 << N)) >> N) | ((C1 >> N) & C2)
+    // This reassociates the and-mask through the shift to expose a constant
+    // that can be folded into GEP offsets.
+    // Only profitable when the or is disjoint, enabling the transformation.
+    {
+      const APInt *DisjointOrC, *ShAmtC;
+      if (match(Op0, m_OneUse(m_LShr(m_DisjointOr(m_Value(X), m_APInt(DisjointOrC)),
+                                     m_APInt(ShAmtC))))) {
+        unsigned Width = Ty->getScalarSizeInBits();
+        if (ShAmtC->ult(Width)) {
+          unsigned ShAmt = ShAmtC->getZExtValue();
+          // Compute the new mask to apply before shifting: C2 << N
+          APInt NewAndMask = C->shl(ShAmt);
+          // Compute the constant result: (C1 >> N) & C2
+          APInt ConstResult = DisjointOrC->lshr(ShAmt) & *C;
+          // Create: (X & (C2 << N)) >> N
+          Value *NewAnd = Builder.CreateAnd(X, ConstantInt::get(Ty, NewAndMask));
+          Value *NewLShr =
+              Builder.CreateLShr(NewAnd, ConstantInt::get(Ty, *ShAmtC));
+          // Create: ((X & (C2 << N)) >> N) | ((C1 >> N) & C2)
+          return BinaryOperator::CreateOr(NewLShr,
+                                          ConstantInt::get(Ty, ConstResult));
+        }
+      }
+    }
+
     unsigned Width = Ty->getScalarSizeInBits();
     const APInt *ShiftC;
     if (match(Op0, m_OneUse(m_SExt(m_AShr(m_Value(X), m_APInt(ShiftC))))) &&

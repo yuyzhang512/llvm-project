@@ -1,0 +1,154 @@
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1250 -run-pass=machine-scheduler -amdgpu-sched-strategy=ml -verify-machineinstrs %s -o - 2>&1 | FileCheck -check-prefix=GFX1250 %s
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1250 -run-pass=machine-scheduler -amdgpu-sched-strategy=ml -amdgpu-print-schedule-metrics -verify-machineinstrs %s -o /dev/null 2>&1 | FileCheck -check-prefix=METRICS %s
+
+# Test that the ML scheduler with pre-RA hazard recognizer properly handles
+# WMMA co-execution constraints during pre-RA scheduling.
+#
+# The pre-RA hazard recognizer tracks WMMA pipeline state to enable
+# intelligent scheduling decisions when mixing WMMA with VALU/MEM/SALU.
+
+# Check that metrics are printed with structural stall information.
+# METRICS: Region 0 (Max ILP Initial Schedule)
+# METRICS: Schedule Metric
+# METRICS: structural stalls
+
+---
+name:            test_wmma_valu_coexec_no_dep
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+body:             |
+  bb.0:
+    ; GFX1250-LABEL: name: test_wmma_valu_coexec_no_dep
+    ; Test that WMMA followed by independent VALU is scheduled.
+    ; The pre-RA hazard recognizer should track WMMA pipeline state.
+
+    ; Input matrices for WMMA
+    %0:vreg_256_align2 = IMPLICIT_DEF
+    %1:vreg_256_align2 = IMPLICIT_DEF
+    %2:vreg_256_align2 = IMPLICIT_DEF
+
+    ; Independent VALU inputs
+    %3:vgpr_32 = IMPLICIT_DEF
+    %4:vgpr_32 = IMPLICIT_DEF
+
+    ; WMMA instruction followed by independent VALU
+    early-clobber %5:vreg_256_align2 = V_WMMA_F32_16X16X32_BF16_w32_twoaddr 8, %0, 8, %1, 8, %2, 0, 0, 0, 0, implicit $exec
+    %6:vgpr_32 = V_ADD_F32_e32 %3, %4, implicit $mode, implicit $exec
+
+    S_NOP 0, implicit %5, implicit %6
+    S_ENDPGM 0
+...
+
+---
+name:            test_wmma_salu_coexec
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+body:             |
+  bb.0:
+    ; GFX1250-LABEL: name: test_wmma_salu_coexec
+    ; Test that SALU can co-execute with WMMA during Execute phase.
+    ; SALU should be schedulable immediately after WMMA.
+
+    ; Input matrices for WMMA
+    %0:vreg_256_align2 = IMPLICIT_DEF
+    %1:vreg_256_align2 = IMPLICIT_DEF
+    %2:vreg_256_align2 = IMPLICIT_DEF
+
+    ; SALU inputs
+    %3:sgpr_32 = IMPLICIT_DEF
+    %4:sgpr_32 = IMPLICIT_DEF
+
+    ; WMMA followed by SALU - SALU can co-execute during all WMMA phases
+    early-clobber %5:vreg_256_align2 = V_WMMA_F32_16X16X32_BF16_w32_twoaddr 8, %0, 8, %1, 8, %2, 0, 0, 0, 0, implicit $exec
+    %6:sgpr_32 = S_ADD_I32 %3, %4, implicit-def dead $scc
+
+    S_NOP 0, implicit %5, implicit %6
+    S_ENDPGM 0
+...
+
+---
+name:            test_wmma_chain_scheduling
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+body:             |
+  bb.0:
+    ; GFX1250-LABEL: name: test_wmma_chain_scheduling
+    ; Test scheduling of WMMA chain - second WMMA should be able to
+    ; start after first WMMA's execute phase.
+
+    ; First WMMA inputs
+    %0:vreg_256_align2 = IMPLICIT_DEF
+    %1:vreg_256_align2 = IMPLICIT_DEF
+    %2:vreg_256_align2 = IMPLICIT_DEF
+
+    ; Second WMMA inputs
+    %3:vreg_256_align2 = IMPLICIT_DEF
+    %4:vreg_256_align2 = IMPLICIT_DEF
+    %5:vreg_256_align2 = IMPLICIT_DEF
+
+    ; Two independent WMMA operations
+    early-clobber %6:vreg_256_align2 = V_WMMA_F32_16X16X32_BF16_w32_twoaddr 8, %0, 8, %1, 8, %2, 0, 0, 0, 0, implicit $exec
+    early-clobber %7:vreg_256_align2 = V_WMMA_F32_16X16X32_BF16_w32_twoaddr 8, %3, 8, %4, 8, %5, 0, 0, 0, 0, implicit $exec
+
+    S_NOP 0, implicit %6, implicit %7
+    S_ENDPGM 0
+...
+
+---
+name:            test_wmma_valu_dep_structural_stall
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+body:             |
+  bb.0:
+    ; GFX1250-LABEL: name: test_wmma_valu_dep_structural_stall
+    ; Test that VALU dependent on WMMA result will incur structural stalls
+    ; during the ValuBlocked phase. The pre-RA hazard recognizer should
+    ; report this as structural stall cycles.
+
+    ; Input matrices for WMMA
+    %0:vreg_256_align2 = IMPLICIT_DEF
+    %1:vreg_256_align2 = IMPLICIT_DEF
+    %2:vreg_256_align2 = IMPLICIT_DEF
+
+    ; WMMA followed by VALU that reads from WMMA result
+    ; This should cause structural stalls during ValuBlocked phase
+    early-clobber %3:vreg_256_align2 = V_WMMA_F32_16X16X32_BF16_w32_twoaddr 8, %0, 8, %1, 8, %2, 0, 0, 0, 0, implicit $exec
+    %4:vgpr_32 = V_MOV_B32_e32 %3.sub0, implicit $exec
+
+    S_NOP 0, implicit %4
+    S_ENDPGM 0
+...
+
+---
+name:            test_wmma_interleaved_with_salu
+tracksRegLiveness: true
+machineFunctionInfo:
+  isEntryFunction: true
+body:             |
+  bb.0:
+    ; GFX1250-LABEL: name: test_wmma_interleaved_with_salu
+    ; Test interleaving WMMA with multiple SALU operations.
+    ; SALU should co-execute during all WMMA phases.
+
+    ; Input matrices for WMMA
+    %0:vreg_256_align2 = IMPLICIT_DEF
+    %1:vreg_256_align2 = IMPLICIT_DEF
+    %2:vreg_256_align2 = IMPLICIT_DEF
+
+    ; SALU inputs
+    %3:sgpr_32 = IMPLICIT_DEF
+    %4:sgpr_32 = IMPLICIT_DEF
+    %5:sgpr_32 = IMPLICIT_DEF
+
+    ; Mix of WMMA and multiple SALU operations
+    early-clobber %6:vreg_256_align2 = V_WMMA_F32_16X16X32_BF16_w32_twoaddr 8, %0, 8, %1, 8, %2, 0, 0, 0, 0, implicit $exec
+    %7:sgpr_32 = S_ADD_I32 %3, %4, implicit-def dead $scc
+    %8:sgpr_32 = S_MUL_I32 %7, %5
+
+    S_NOP 0, implicit %6, implicit %8
+    S_ENDPGM 0
+...

@@ -5984,6 +5984,7 @@ bool AMDGPUAsmParser::ParseDirectiveAMDHSAKernel() {
   const MCExpr *NextFreeVGPR = ZeroExpr;
   const MCExpr *AccumOffset = MCConstantExpr::create(0, getContext());
   const MCExpr *NamedBarCnt = ZeroExpr;
+  const MCExpr *TCPSplit = ZeroExpr;
   uint64_t SharedVGPRCount = 0;
   uint64_t PreloadLength = 0;
   uint64_t PreloadOffset = 0;
@@ -6204,6 +6205,12 @@ bool AMDGPUAsmParser::ParseDirectiveAMDHSAKernel() {
       if (!isGFX1250Plus())
         return Error(IDRange.Start, "directive requires gfx1250+", IDRange);
       NamedBarCnt = ExprVal;
+    } else if (ID == ".amdhsa_tcp_split") {
+      if (!isGFX1250())
+        return Error(IDRange.Start, "directive requires gfx1250+", IDRange);
+      if (EvaluatableExpr && !isUInt<3>(Val))
+        return OutOfRangeError(ValRange);
+      TCPSplit = ExprVal;
     } else if (ID == ".amdhsa_reserve_vcc") {
       if (EvaluatableExpr && !isUInt<1>(Val))
         return OutOfRangeError(ValRange);
@@ -6457,11 +6464,16 @@ bool AMDGPUAsmParser::ParseDirectiveAMDHSAKernel() {
                                  getContext());
   }
 
-  if (isGFX1250Plus())
+  if (isGFX1250()) {
     MCKernelDescriptor::bits_set(KD.compute_pgm_rsrc3, NamedBarCnt,
                                  COMPUTE_PGM_RSRC3_GFX125_NAMED_BAR_CNT_SHIFT,
                                  COMPUTE_PGM_RSRC3_GFX125_NAMED_BAR_CNT,
                                  getContext());
+    MCKernelDescriptor::bits_set(KD.compute_pgm_rsrc3, TCPSplit,
+                                 COMPUTE_PGM_RSRC3_GFX125_TCP_SPLIT_SHIFT,
+                                 COMPUTE_PGM_RSRC3_GFX125_TCP_SPLIT,
+                                 getContext());
+  }
 
   if (IVersion.Major >= 10 && IVersion.Major < 12) {
     // SharedVGPRCount < 16 checked by PARSE_ENTRY_BITS

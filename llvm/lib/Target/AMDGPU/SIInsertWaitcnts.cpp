@@ -26,6 +26,7 @@
 #include "AMDGPU.h"
 #include "AMDGPUWaitcntUtils.h"
 #include "GCNSubtarget.h"
+#include "GCNHazardRecognizer.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "SIMachineFunctionInfo.h"
 #include "Utils/AMDGPUBaseInfo.h"
@@ -45,6 +46,8 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "si-insert-waitcnts"
+
+bool DebugVDst = false;
 
 DEBUG_COUNTER(ForceExpCounter, DEBUG_TYPE "-forceexp",
               "Force emit s_waitcnt expcnt(0) instrs");
@@ -67,6 +70,11 @@ static cl::opt<bool> ForceEmitZeroLoadFlag(
 static cl::opt<bool> ExpertSchedulingModeFlag(
     "amdgpu-expert-scheduling-mode",
     cl::desc("Enable expert scheduling mode 2 for all functions (GFX12+ only)"),
+    cl::init(true), cl::Hidden);
+
+static cl::opt<bool> DisableXDLStallMode(
+    "amdgpu-disable-xdl-stall-sched-mode",
+    cl::desc("Enable sched mode 4 to disable xdl->xdl stall)"),
     cl::init(false), cl::Hidden);
 
 namespace {
@@ -106,7 +114,7 @@ static unsigned getWaitCountMax(const AMDGPU::HardwareLimits &Limits,
 ///   [LDSDMA_BEGIN,    LDSDMA_END  ) : LDS DMA IDs
 ///
 /// NOTE: The choice of encoding these as "u16 chunks" is arbitrary.
-/// It gives (2 << 16) - 1 entries per category which is more than enough
+/// It gives (2 << 16) - 1 entries per category which is more than enoughZ
 /// for all register units. MCPhysReg is u16 so we don't even support >u16
 /// physical register numbers at this time, let alone >u16 register units.
 /// In any case, an assertion in "WaitcntBrackets" ensures REGUNITS_END
@@ -158,6 +166,7 @@ static constexpr VMEMID toVMEMID(MCRegUnit RU) {
   DECL(VGPR_DPMACC_WRITE)        /* write VGPR dest in DPMACC VALU */          \
   DECL(VGPR_TRANS_WRITE)         /* write VGPR dest in TRANS VALU */           \
   DECL(VGPR_XDL_WRITE)           /* write VGPR dest in XDL VALU */             \
+  DECL(VGPR_XDL_ORDERED_WRITE)   /* XDL ordered w/ Core/Side-MACC for VaVdst */\
   DECL(VGPR_LDS_READ)            /* read VGPR source in LDS */                 \
   DECL(VGPR_FLAT_READ)           /* read VGPR source in FLAT */                \
   DECL(VGPR_VMEM_READ)           /* read VGPR source in other VMEM */          \
@@ -483,7 +492,7 @@ protected:
           WaitEventSet({VMEM_GROUP, SMEM_GROUP}),
           WaitEventSet({ASYNC_ACCESS}),
           WaitEventSet({VGPR_CSMACC_WRITE, VGPR_DPMACC_WRITE, VGPR_TRANS_WRITE,
-                        VGPR_XDL_WRITE}),
+                        VGPR_XDL_WRITE, VGPR_XDL_ORDERED_WRITE}),
           WaitEventSet({VGPR_LDS_READ, VGPR_FLAT_READ, VGPR_VMEM_READ})};
 
 public:
@@ -518,6 +527,15 @@ struct PreheaderFlushFlags {
 };
 
 class SIInsertWaitcnts {
+public:
+  bool shouldFlushVDst(MachineInstr &MI);
+
+  DenseMap<Register, MachineInstr *> VALUWrites;
+  DenseMap<Register, MachineInstr *> VALUReads;
+
+  std::unique_ptr<GCNHazardRecognizer> HazardRec;
+
+private:
   DenseMap<const Value *, MachineBasicBlock *> SLoadAddresses;
   DenseMap<MachineBasicBlock *, PreheaderFlushFlags> PreheadersToFlush;
   MachineLoopInfo &MLI;
@@ -1728,6 +1746,16 @@ bool WaitcntBrackets::counterOutOfOrder(AMDGPU::InstCounterType T) const {
     return Events.twoOrMore();
   }
 
+  // XDL instructions with 32-bit accumulators (VGPR_XDL_ORDERED_WRITE)
+  // complete in-order with both Core/Side-MACC (VGPR_CSMACC_WRITE) and other
+  // XDL (VGPR_XDL_WRITE) for the VA_VDST counter. Remove XDL_ORDERED from the
+  // event set since it never contributes to out-of-order completion with those
+  // types. If neither CSMACC nor XDL is present, substitute CSMACC to preserve
+  // out-of-order detection against TRANS/DPMACC.
+  if (T == VA_VDST) {
+    return false;
+  }
+
   return hasMixedPendingEvents(T);
 }
 
@@ -2448,6 +2476,119 @@ bool WaitcntGeneratorGFX12Plus::createNewWaitcnt(
   return Modified;
 }
 
+/// \returns true if the callee inserts an s_waitcnt 0 on function entry.
+static bool callWaitsOnFunctionEntry(const MachineInstr &MI) {
+  // Currently all conventions wait, but this may not always be the case.
+  //
+  // TODO: If IPRA is enabled, and the callee is isSafeForNoCSROpt, it may make
+  // senses to omit the wait and do it in the caller.
+  return true;
+}
+
+/// \returns true if the callee is expected to wait for any outstanding waits
+/// before returning.
+static bool callWaitsOnFunctionReturn(const MachineInstr &MI) { return true; }
+
+
+
+bool SIInsertWaitcnts::shouldFlushVDst(MachineInstr &MI) {
+  if (!TII.isDS(MI))
+    return false;
+  unsigned Waits = 60;
+  MachineInstr *LastRead = nullptr;
+  MachineInstr *LastWrite = nullptr;
+  MachineInstr *RAWWrite = nullptr;
+  MachineInstr *MinInstr = nullptr;
+  for (auto &Op : MI.operands()) {
+    if (!Op.isReg())
+      continue;
+    
+    const bool IsVGPR = TRI.isVectorRegister(MRI, Op.getReg());
+    if (!IsVGPR)
+      continue;
+    
+    auto TheReg = Op.getReg();
+
+    if (TRI.regsOverlap(TheReg, AMDGPU::EXEC))
+      continue;
+
+    if (Op.isDef()) {
+      //if (VALUReads.contains(Op.getReg())) {
+
+      for (auto Entry : VALUReads) {
+        auto CandReg = Entry.first;
+        if (!TRI.regsOverlap(CandReg, Op.getReg()))
+          continue;
+
+          LastRead = VALUReads[CandReg];
+          if (LastRead->getParent() != MI.getParent())
+            LastRead = &*MI.getParent()->begin();
+          unsigned TempWaits = HazardRec->getWaitStatesBetween(LastRead, &MI);
+          Waits = std::min(TempWaits, Waits);
+          if (Waits == TempWaits) {
+            if (DebugVDst)
+              errs() << "WAR\n";
+            MinInstr = LastRead;
+          }
+        }
+      //}
+      //if (VALUWrites.contains(Op.getReg())) {
+      for (auto Entry : VALUWrites) {
+        auto CandReg = Entry.first;
+        if (!TRI.regsOverlap(CandReg, Op.getReg()))
+          continue;
+
+        LastWrite = VALUWrites[CandReg];
+        if (LastWrite->getParent() != MI.getParent())
+          LastWrite = &*MI.getParent()->begin();
+        unsigned TempWaits = HazardRec->getWaitStatesBetween(LastWrite, &MI);
+        Waits = std::min(TempWaits, Waits);
+        if (Waits == TempWaits) {
+          if (DebugVDst)
+            errs() << "WAW\n";
+          MinInstr = LastWrite;
+        }
+        }
+      //}
+    }
+
+    if (Op.isUse()) {
+      for (auto Entry : VALUWrites) {
+      auto CandReg = Entry.first;
+      if (!TRI.regsOverlap(CandReg, Op.getReg()))
+        continue;
+
+      RAWWrite = VALUWrites[CandReg];
+      if (RAWWrite->getParent() != MI.getParent())
+        RAWWrite = &*MI.getParent()->begin();
+      unsigned TempWaits = HazardRec->getWaitStatesBetween(RAWWrite, &MI);
+        Waits = std::min(TempWaits, Waits);
+        if (Waits == TempWaits) {
+          if (DebugVDst)
+            errs() << "RAW\n";
+          MinInstr = RAWWrite;
+        }
+      }
+    }
+  }
+
+  if  (Waits < ST.getVDstThreshold(*MI.getMF())) {
+    if (DebugVDst)
+      errs() << "Insufficient waits: " << Waits << "\n";
+
+    if (MinInstr && DebugVDst) {
+      errs() << "MinInstr: \n";
+      MinInstr->dump();
+      errs() << "DS: \n";
+      MI.dump();
+    }
+    return false;
+  }
+
+  return true;
+
+}
+
 ///  Generate s_waitcnt instruction to be placed before cur_Inst.
 ///  Instructions of a given type are returned in order,
 ///  but instructions of different types can complete out of order.
@@ -2634,6 +2775,15 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(
         if (!Op.isReg())
           continue;
 
+        if (TII.isVALU(MI)) {
+          if (Op.isDef()) {
+            VALUWrites[Op.getReg()] = &MI;
+          }
+          else {
+            VALUReads[Op.getReg()] = &MI;
+          }
+        }
+
         // If the instruction does not read tied source, skip the operand.
         if (Op.isTied() && Op.isUse() && TII.doesNotReadTiedSource(MI))
           continue;
@@ -2721,6 +2871,15 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(
   // expert scheduling mode.
   if (TII.isVALU(MI))
     Wait.set(AMDGPU::VA_VDST, ~0u);
+  
+  unsigned OldVDst = Wait.get(AMDGPU::VA_VDST);
+  bool Flushed = false;
+  if (TII.isDS(MI)) {
+    if (shouldFlushVDst(MI)) {
+      Wait.set(AMDGPU::VA_VDST, ~0u);
+      Flushed = true;
+    }
+  }
 
   // Since the translation for VMEM addresses occur in-order, we can apply the
   // XCnt if the current instruction is of VMEM type and has a memory
@@ -2754,8 +2913,12 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(
   if (ForceEmitZeroLoadFlag && Wait.get(AMDGPU::LOAD_CNT) != ~0u)
     Wait.set(AMDGPU::LOAD_CNT, 0);
 
-  return generateWaitcnt(Wait, MI.getIterator(), *MI.getParent(), ScoreBrackets,
+  auto Ret = generateWaitcnt(Wait, MI.getIterator(), *MI.getParent(), ScoreBrackets,
                          OldWaitcntInstr);
+  if (Flushed)
+    Wait.set(VA_VDST, OldVDst);
+  
+  return Ret;
 }
 
 bool SIInsertWaitcnts::generateWaitcnt(AMDGPU::Waitcnt Wait,
@@ -2804,8 +2967,11 @@ SIInsertWaitcnts::getExpertSchedulingEventType(const MachineInstr &Inst) const {
     // out-of-order with respect to each other, so each of these classes
     // has its own event.
 
-    if (TII.isXDL(Inst))
+    if (TII.isXDL(Inst)) {
+      if (AMDGPU::getWMMAIsVAVDSTOrderedXDL(Inst.getOpcode()))
+        return VGPR_XDL_ORDERED_WRITE;
       return VGPR_XDL_WRITE;
+    }
 
     if (TII.isTRANS(Inst))
       return VGPR_TRANS_WRITE;
@@ -3195,9 +3361,12 @@ void SIInsertWaitcnts::setSchedulingMode(MachineBasicBlock &MBB,
                                          MachineBasicBlock::iterator I,
                                          bool ExpertMode) const {
   const unsigned EncodedReg = AMDGPU::Hwreg::HwregEncoding::encode(
-      AMDGPU::Hwreg::ID_SCHED_MODE, AMDGPU::Hwreg::HwregOffset::Default, 2);
+      AMDGPU::Hwreg::ID_SCHED_MODE, AMDGPU::Hwreg::HwregOffset::Default, 5);
+
+  unsigned SchedMode = ExpertMode ? 2 : 0;
+  SchedMode |= DisableXDLStallMode ? (1 << 4) : 0;
   BuildMI(MBB, I, DebugLoc(), TII.get(AMDGPU::S_SETREG_IMM32_B32))
-      .addImm(ExpertMode ? 2 : 0)
+      .addImm(SchedMode)
       .addImm(EncodedReg);
 }
 
@@ -3703,18 +3872,16 @@ SIInsertWaitcntsPass::run(MachineFunction &MF,
 bool SIInsertWaitcnts::run() {
   const SIMachineFunctionInfo *MFI = MF.getInfo<SIMachineFunctionInfo>();
 
+  HazardRec = std::make_unique<GCNHazardRecognizer>(MF, GCNHazardRecognizer::OperatingMode::PostRA);
+
+
   AMDGPU::IsaVersion IV = AMDGPU::getIsaVersion(ST.getCPU());
 
   // Initialize hardware limits first, as they're needed by the generators.
   Limits = AMDGPU::HardwareLimits(IV);
 
   if (ST.hasExtendedWaitCounts()) {
-    IsExpertMode = ST.hasExpertSchedulingMode() &&
-                   (ExpertSchedulingModeFlag.getNumOccurrences()
-                        ? ExpertSchedulingModeFlag
-                        : MF.getFunction()
-                              .getFnAttribute("amdgpu-expert-scheduling-mode")
-                              .getValueAsBool());
+    IsExpertMode = true;
     MaxCounter = IsExpertMode ? AMDGPU::NUM_EXPERT_INST_CNTS
                               : AMDGPU::NUM_EXTENDED_INST_CNTS;
     // Initialize WCG per MF. It contains state that depends on MF attributes.
@@ -3789,6 +3956,9 @@ bool SIInsertWaitcnts::run() {
   bool Repeat;
   do {
     Repeat = false;
+    VALUWrites.clear();
+    VALUReads.clear();
+
 
     for (auto BII = BlockInfos.begin(), BIE = BlockInfos.end(); BII != BIE;
          ++BII) {

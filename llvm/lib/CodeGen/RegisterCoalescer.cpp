@@ -2037,6 +2037,7 @@ void RegisterCoalescer::setUndefOnPrunedSubRegUses(LiveInterval &LI,
 bool RegisterCoalescer::joinCopy(
     MachineInstr *CopyMI, bool &Again,
     SmallPtrSetImpl<MachineInstr *> &CurrentErasedInstrs) {
+
   Again = false;
   LLVM_DEBUG(dbgs() << LIS->getInstructionIndex(*CopyMI) << '\t' << *CopyMI);
 

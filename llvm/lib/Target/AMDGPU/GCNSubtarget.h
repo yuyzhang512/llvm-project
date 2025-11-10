@@ -83,6 +83,8 @@ protected:
   bool ATTRIBUTE = DEFAULT;
 #include "AMDGPUGenSubtargetInfo.inc"
 
+  bool DisablePostMISched = false;
+
 private:
   SIInstrInfo InstrInfo;
   SITargetLowering TLInfo;
@@ -226,6 +228,10 @@ public:
   bool hasMin3Max3_16() const {
     return getGeneration() >= AMDGPUSubtarget::GFX9;
   }
+
+
+  bool enablePostRAScheduler() const override { return !DisablePostMISched; }
+  void setDisablePostMISched(bool Value) { DisablePostMISched = Value; }
 
   bool hasSwap() const { return HasGFX9Insts; }
 
@@ -941,6 +947,8 @@ public:
   // \returns the number of address arguments from which to enable MIMG NSA
   // on supported architectures.
   unsigned getNSAThreshold(const MachineFunction &MF) const;
+
+  unsigned getVDstThreshold(const MachineFunction &MF) const;
 
   // \returns true if the subtarget has a hazard requiring an "s_nop 0"
   // instruction before "s_sendmsg sendmsg(MSG_DEALLOC_VGPRS)".

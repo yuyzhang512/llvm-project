@@ -26,6 +26,7 @@
 #include "AMDGPUIGroupLP.h"
 #include "AMDGPUISelDAGToDAG.h"
 #include "AMDGPULowerVGPREncoding.h"
+#include "AMDGPUMLSchedStrategy.h"
 #include "AMDGPUMacroFusion.h"
 #include "AMDGPUNextUseAnalysis.h"
 #include "AMDGPUPerfHintAnalysis.h"
@@ -131,6 +132,12 @@
 
 using namespace llvm;
 using namespace llvm::PatternMatch;
+
+static cl::opt<bool> StaticSimIsSchedPerf(
+    "amdgpu-static-sim-measure-sched",
+    cl::desc("Whether or not to run StaticSim immediately after scheduling, to get a more direct measurement of scheduling"),
+    cl::Hidden, cl::init(false));
+
 
 namespace {
 //===----------------------------------------------------------------------===//
@@ -710,6 +717,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPULowerVGPREncodingLegacyPass(*PR);
   initializeSIInsertHardClausesLegacyPass(*PR);
   initializeSIInsertWaitcntsLegacyPass(*PR);
+  initializeAMDGPUStaticSimulatorLegacyPass(*PR);
   initializeSIModeRegisterLegacyPass(*PR);
   initializeSIWholeQuadModeLegacyPass(*PR);
   initializeSILowerControlFlowLegacyPass(*PR);
@@ -746,6 +754,12 @@ static ScheduleDAGInstrs *createSIMachineScheduler(MachineSchedContext *C) {
   return new SIScheduleDAGMI(C);
 }
 
+static bool isMLWorkload(const Function &F) {
+  return true;
+  //Attribute WorkloadAttr = F.getFnAttribute("amdgpu-workload-type");
+  //return WorkloadAttr.isValid() && WorkloadAttr.getValueAsString() == "ml";
+}
+
 static ScheduleDAGInstrs *
 createGCNMaxOccupancyMachineScheduler(MachineSchedContext *C) {
   const GCNSubtarget &ST = C->MF->getSubtarget<GCNSubtarget>();
@@ -767,6 +781,21 @@ createGCNMaxILPMachineScheduler(MachineSchedContext *C) {
   ScheduleDAGMILive *DAG =
       new GCNScheduleDAGMILive(C, std::make_unique<GCNMaxILPSchedStrategy>(C));
   DAG->addMutation(createIGroupLPDAGMutation(AMDGPU::SchedulingPhase::Initial));
+  return DAG;
+}
+
+static ScheduleDAGInstrs *createGCNMLMachineScheduler(MachineSchedContext *C) {
+  const GCNSubtarget &ST = C->MF->getSubtarget<GCNSubtarget>();
+
+  ScheduleDAGMILive *DAG =
+      new GCNScheduleDAGMILive(C, std::make_unique<AMDGPUMLSchedStrategy>(C));
+  DAG->addMutation(createLoadClusterDAGMutation(DAG->TII, DAG->TRI));
+  if (ST.shouldClusterStores())
+    DAG->addMutation(createStoreClusterDAGMutation(DAG->TII, DAG->TRI));
+  DAG->addMutation(createIGroupLPDAGMutation(AMDGPU::SchedulingPhase::Initial));
+  DAG->addMutation(createAMDGPUMacroFusionDAGMutation());
+  DAG->addMutation(createAMDGPUExportClusteringDAGMutation());
+  DAG->addMutation(createAMDGPUBarrierLatencyDAGMutation(C->MF));
   return DAG;
 }
 
@@ -1284,10 +1313,18 @@ Error GCNTargetMachine::buildCodeGenPipeline(
 ScheduleDAGInstrs *
 GCNTargetMachine::createMachineScheduler(MachineSchedContext *C) const {
   const GCNSubtarget &ST = C->MF->getSubtarget<GCNSubtarget>();
+  const_cast<GCNSubtarget *>(&ST)->setDisablePostMISched(true);
   if (ST.enableSIScheduler())
     return createSIMachineScheduler(C);
 
-  StringRef SchedStrategy = AMDGPU::getSchedStrategy(C->MF->getFunction());
+  if (isMLWorkload(C->MF->getFunction()))
+    return createGCNMLMachineScheduler(C);
+
+  Attribute SchedStrategyAttr =
+      C->MF->getFunction().getFnAttribute("amdgpu-sched-strategy");
+  StringRef SchedStrategy = SchedStrategyAttr.isValid()
+                                ? SchedStrategyAttr.getValueAsString()
+                                : AMDGPUSchedStrategy;
 
   if (SchedStrategy == "max-ilp")
     return createGCNMaxILPMachineScheduler(C);
@@ -1304,18 +1341,18 @@ GCNTargetMachine::createMachineScheduler(MachineSchedContext *C) const {
   if (SchedStrategy == "iterative-maxocc")
     return createIterativeGCNMaxOccupancyMachineScheduler(C);
 
-  if (SchedStrategy == "coexec") {
-    diagnoseUnsupportedCoExecSchedulerSelection(C->MF->getFunction(), ST);
-    return createGCNCoExecMachineScheduler(C);
-  }
+  if (SchedStrategy == "ml")
+    return createGCNMLMachineScheduler(C);
 
   return createGCNMaxOccupancyMachineScheduler(C);
 }
 
 ScheduleDAGInstrs *
 GCNTargetMachine::createPostMachineScheduler(MachineSchedContext *C) const {
-  if (useNoopPostScheduler(C->MF->getFunction()))
-    return createGCNNoopPostMachineScheduler(C);
+  if (isMLWorkload(C->MF->getFunction()))
+    return new GCNPostScheduleDAGMILive(
+        C, std::make_unique<AMDGPUMLPostSchedStrategy>(C),
+        /*RemoveKillFlags=*/true);
 
   ScheduleDAGMI *DAG =
       new GCNPostScheduleDAGMILive(C, std::make_unique<PostGenericScheduler>(C),
@@ -1731,6 +1768,9 @@ void GCNPassConfig::addOptimizedRegAlloc() {
 
   if (EnableRewritePartialRegUses)
     insertPass(&RenameIndependentSubregsID, &GCNRewritePartialRegUsesID);
+  
+  if (StaticSimIsSchedPerf)
+    insertPass(&MachineSchedulerID, &AMDGPUStaticSimulatorLegacyID);
 
   if (isPassEnabled(EnablePreRAOptimizations))
     insertPass(&MachineSchedulerID, &GCNPreRAOptimizationsID);
@@ -1746,6 +1786,7 @@ void GCNPassConfig::addOptimizedRegAlloc() {
   // compilation time, so we only enable it from O2.
   if (TM->getOptLevel() > CodeGenOptLevel::Less)
     insertPass(&MachineSchedulerID, &SIFormMemoryClausesID);
+
 
   TargetPassConfig::addOptimizedRegAlloc();
 }
@@ -1844,7 +1885,7 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
   addPass(&GCNPreRALongBranchRegID);
 
   addPass(createSGPRAllocPass(true));
-
+  addPreRewrite();
   // Commit allocated register changes. This is mostly necessary because too
   // many things rely on the use lists of the physical registers, such as the
   // verifier. This is only necessary with allocators which use LiveIntervals,
@@ -1926,6 +1967,11 @@ void GCNPassConfig::addPreEmitPass() {
     addPass(&AMDGPUInsertDelayAluID);
 
   addPass(&BranchRelaxationPassID);
+
+  // Static simulator runs last to analyze the final machine code
+  if (!StaticSimIsSchedPerf)
+    addPass(createAMDGPUStaticSimulatorPass());
+
 }
 
 void GCNPassConfig::addPostBBSections() {
@@ -2541,6 +2587,7 @@ Error AMDGPUCodeGenPassBuilder::addRegAssignmentOptimized(
   else
     addMachineFunctionPass(RAGreedyPass({onlyAllocateSGPRs, "sgpr"}), PMW);
 
+  addPreRewrite(PMW);
   // Commit allocated register changes. This is mostly necessary because too
   // many things rely on the use lists of the physical registers, such as the
   // verifier. This is only necessary with allocators which use LiveIntervals,
@@ -2639,6 +2686,9 @@ void AMDGPUCodeGenPassBuilder::addPreEmitPass(PassManagerWrapper &PMW) const {
   }
 
   addMachineFunctionPass(BranchRelaxationPass(), PMW);
+
+  // Static simulator runs last to analyze the final machine code
+  addMachineFunctionPass(AMDGPUStaticSimulatorPass(), PMW);
 }
 
 bool AMDGPUCodeGenPassBuilder::isPassEnabled(const cl::opt<bool> &Opt,

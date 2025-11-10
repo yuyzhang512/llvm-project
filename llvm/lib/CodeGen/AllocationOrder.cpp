@@ -28,8 +28,10 @@ using namespace llvm;
 // Compare VirtRegMap::getRegAllocPref().
 AllocationOrder AllocationOrder::create(Register VirtReg, const VirtRegMap &VRM,
                                         const RegisterClassInfo &RegClassInfo,
-                                        const LiveRegMatrix *Matrix) {
+                                        const LiveRegMatrix *Matrix,
+                                        bool SkipAntiHints) {
   const MachineFunction &MF = VRM.getMachineFunction();
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
   const TargetRegisterInfo *TRI = &VRM.getTargetRegInfo();
   auto Order = RegClassInfo.getOrder(MF.getRegInfo().getRegClass(VirtReg));
   SmallVector<MCPhysReg, 16> Hints;
@@ -44,8 +46,87 @@ AllocationOrder AllocationOrder::create(Register VirtReg, const VirtRegMap &VRM,
       dbgs() << '\n';
     }
   });
-  assert(all_of(Hints,
-                [&](MCPhysReg Hint) { return is_contained(Order, Hint); }) &&
+
+  // Get anti-hints
+  SmallVector<MCPhysReg, 16> AntiHintedPhysRegs;
+  MRI.getPhysRegAntiHints(VirtReg, AntiHintedPhysRegs, VRM);
+
+  LLVM_DEBUG({
+    if (!SkipAntiHints && !AntiHintedPhysRegs.empty()) {
+      dbgs() << "anti-hints:";
+      for (MCPhysReg AntiHint : AntiHintedPhysRegs)
+        dbgs() << ' ' << printReg(AntiHint, TRI);
+      dbgs() << '\n';
+    }
+  });
+
+  // Create allocation order object
+  AllocationOrder AO(std::move(Hints), Order, HardHints);
+
+  // Apply anti-hints filtering if needed
+  if (!AntiHintedPhysRegs.empty()) {
+    AO.applyAntiHints(AntiHintedPhysRegs, TRI);
+
+    LLVM_DEBUG({
+      if (!AO.Hints.empty()) {
+        dbgs() << "filtered hints:";
+        for (MCPhysReg Hint : AO.Hints)
+          dbgs() << ' ' << printReg(Hint, TRI);
+        dbgs() << '\n';
+      }
+    });
+  }
+
+  assert(all_of(AO.Hints,
+                [&](MCPhysReg Hint) { return is_contained(AO.Order, Hint); }) &&
          "Target hint is outside allocation order.");
-  return AllocationOrder(std::move(Hints), Order, HardHints);
+  return AO;
+}
+
+  AllocationOrder AllocationOrder::createWithoutAntiHints(                                                                                                                                                                                                                        
+      Register VirtReg, const VirtRegMap &VRM,                   
+      const RegisterClassInfo &RegClassInfo, const LiveRegMatrix *Matrix) {                                                                                                                                                                                                       
+    const MachineFunction &MF = VRM.getMachineFunction();                                                                                                                                                                                                                         
+    const TargetRegisterInfo *TRI = &VRM.getTargetRegInfo();                                                                                                                                                                                                                      
+    auto Order = RegClassInfo.getOrder(MF.getRegInfo().getRegClass(VirtReg));                                                                                                                                                                                                     
+    SmallVector<MCPhysReg, 16> Hints;                                                                                                                                                                                                                                             
+    bool HardHints =                                                                                                                                                                                                                                                              
+        TRI->getRegAllocationHints(VirtReg, Order, Hints, MF, &VRM, Matrix);                                                                                                                                                                                                      
+                                                                                                                                                                                                                                                                                  
+    // Create allocation order without applying anti-hints                                                                                                                                                                                                                        
+    return AllocationOrder(std::move(Hints), Order, HardHints);                                                                                                                                                                                                                   
+  }     
+
+void AllocationOrder::applyAntiHints(ArrayRef<MCPhysReg> AntiHintedPhysRegs,
+                                     const TargetRegisterInfo *TRI) {
+  // Helper to check if a register overlaps with any anti-hint
+  auto isAntiHinted = [&](MCPhysReg Reg) {
+    return std::any_of(
+        AntiHintedPhysRegs.begin(), AntiHintedPhysRegs.end(),
+        [&](MCPhysReg AntiHint) { return TRI->regsOverlap(Reg, AntiHint); });
+  };
+
+  // Create filtered order
+  FilteredOrderStorage.clear();
+  FilteredOrderStorage.assign(Order.begin(), Order.end());
+
+  // Partition: non-anti-hinted registers go first
+  auto PartitionPoint = std::stable_partition(
+      FilteredOrderStorage.begin(), FilteredOrderStorage.end(),
+      [&](MCPhysReg Reg) { return !isAntiHinted(Reg); });
+
+  // Update Order
+  Order = FilteredOrderStorage;
+
+  LLVM_DEBUG({
+    size_t NonAntiHintedCount =
+        std::distance(FilteredOrderStorage.begin(), PartitionPoint);
+    size_t AntiHintedCount =
+        std::distance(PartitionPoint, FilteredOrderStorage.end());
+    dbgs() << "    Added " << NonAntiHintedCount
+           << " non-anti-hinted registers first\n"
+           << "    Added " << AntiHintedCount
+           << " anti-hinted registers at the end\n"
+           << "  Anti-hint filtering complete\n";
+  });
 }
