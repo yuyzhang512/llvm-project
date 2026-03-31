@@ -21,13 +21,16 @@
 #include "AMDGPU.h"
 #include "GCNSubtarget.h"
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
+#include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachinePostDominators.h"
 #include "llvm/CodeGen/TargetSchedule.h"
 #include "llvm/Support/BranchProbability.h"
+#include "llvm/TargetParser/TargetParser.h"
 using namespace llvm;
 
 #define DEBUG_TYPE "si-pre-emit-peephole"
@@ -40,6 +43,7 @@ private:
   const SIRegisterInfo *TRI = nullptr;
   MachineLoopInfo *MLI = nullptr;
 
+  bool rotateLgkmcnt(MachineFunction &MF) const;
   bool optimizeVccBranch(MachineInstr &MI) const;
   void updateMLIBeforeRemovingEdge(MachineBasicBlock *From,
                                    MachineBasicBlock *To) const;
@@ -112,6 +116,135 @@ INITIALIZE_PASS(SIPreEmitPeepholeLegacy, DEBUG_TYPE,
 char SIPreEmitPeepholeLegacy::ID = 0;
 
 char &llvm::SIPreEmitPeepholeID = SIPreEmitPeepholeLegacy::ID;
+
+// Rotate the first s_waitcnt(lgkmcnt)+s_barrier pair out of the loop body.
+//
+// Step 1 -- Merge standalone lgkmcnt waitcnts into waitcnt+barrier pairs.
+//   Before:  s_waitcnt lgkmcnt(0)  ... MFMAs ...  s_waitcnt+s_barrier
+//   After:   s_waitcnt+s_barrier   ... MFMAs ...
+//
+// Step 2 -- Rotate the first pair: copy it to the end of the preheader and
+//   before the back-edge branch, then delete the original.  This lets the
+//   first iteration's ds_read/buffer_load start immediately instead of
+//   stalling at the top of the loop.
+bool SIPreEmitPeephole::rotateLgkmcnt(MachineFunction &MF) const {
+  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
+  AMDGPU::IsaVersion IV = AMDGPU::getIsaVersion(ST.getCPU());
+  unsigned LgkmcntMax = AMDGPU::getLgkmcntBitMask(IV);
+
+  // Helper: does this S_WAITCNT wait on lgkmcnt?
+  auto hasLgkmcnt = [&](const MachineInstr &MI) -> bool {
+    if (MI.getOpcode() != AMDGPU::S_WAITCNT)
+      return false;
+    unsigned Lgkmcnt = AMDGPU::decodeLgkmcnt(IV, MI.getOperand(0).getImm());
+    return Lgkmcnt < LgkmcntMax;
+  };
+
+  // Find the self-loop MBB (loop body).
+  MachineBasicBlock *LoopMBB = nullptr;
+  for (MachineBasicBlock &MBB : MF) {
+    if (MBB.isSuccessor(&MBB)) {
+      LoopMBB = &MBB;
+      break;
+    }
+  }
+  if (!LoopMBB)
+    return false;
+
+  // Find the preheader (non-self predecessor).
+  MachineBasicBlock *Preheader = nullptr;
+  for (MachineBasicBlock *Pred : LoopMBB->predecessors()) {
+    if (Pred != LoopMBB) {
+      Preheader = Pred;
+      break;
+    }
+  }
+  if (!Preheader)
+    return false;
+
+  // --- Step 1: collect waitcnt+barrier pairs, merging standalone waitcnts ---
+  using SyncPair = std::pair<MachineInstr *, MachineInstr *>;
+  SmallVector<SyncPair, 4> SyncPairs;
+  SmallVector<MachineInstr *, 4> ToErase;
+
+  for (auto It = LoopMBB->begin(), E = LoopMBB->end(); It != E; ++It) {
+    if (!hasLgkmcnt(*It))
+      continue;
+    auto Next = std::next(It);
+    if (Next == E || !TII->isBarrierStart(Next->getOpcode()))
+      continue;
+
+    // Found a waitcnt+barrier pair.  Scan backward for a standalone
+    // lgkmcnt waitcnt in the same region.
+    MachineInstr *Standalone = nullptr;
+    for (auto K = It; K != LoopMBB->begin();) {
+      --K;
+      unsigned Opc = K->getOpcode();
+      // Region boundary -- stop.
+      if (TII->isBarrierStart(Opc))
+        break;
+      // ds_read or buffer_load between them -- stop.
+      if ((SIInstrInfo::isDS(*K) && K->mayLoad()) ||
+          SIInstrInfo::isLDSDMA(*K))
+        break;
+      if (hasLgkmcnt(*K)) {
+        Standalone = &*K;
+        break;
+      }
+    }
+
+    MachineInstr *Waitcnt = &*It;
+    MachineInstr *Barrier = &*Next;
+
+    if (Standalone) {
+      // Merge: move the waitcnt+barrier pair to the standalone's position.
+      LLVM_DEBUG(dbgs() << "rotateLgkmcnt: merging standalone "
+                        << *Standalone << "  into " << *Waitcnt << *Barrier);
+      Waitcnt->moveBefore(Standalone);
+      Barrier->moveBefore(Standalone);
+      ToErase.push_back(Standalone);
+    }
+
+    SyncPairs.push_back({Waitcnt, Barrier});
+    // Skip past the barrier.
+    It = MachineBasicBlock::iterator(Barrier);
+  }
+
+  if (SyncPairs.empty())
+    return false;
+
+  // Erase merged standalone waitcnts.
+  for (MachineInstr *MI : ToErase)
+    MI->eraseFromParent();
+
+  // --- Step 2: rotate the first sync pair ---
+  MachineInstr *FirstWait = SyncPairs[0].first;
+  MachineInstr *FirstBar = SyncPairs[0].second;
+
+  LLVM_DEBUG(dbgs() << "rotateLgkmcnt: rotating " << *FirstWait << *FirstBar);
+
+  // 2a. Copy to end of preheader (before its terminator).
+  MachineBasicBlock::iterator PreTerm = Preheader->getFirstTerminator();
+  BuildMI(*Preheader, PreTerm, FirstWait->getDebugLoc(),
+          TII->get(FirstWait->getOpcode()))
+      .addImm(FirstWait->getOperand(0).getImm());
+  BuildMI(*Preheader, PreTerm, FirstBar->getDebugLoc(),
+          TII->get(FirstBar->getOpcode()));
+
+  // 2b. Copy before the back-edge branch at end of loop.
+  MachineBasicBlock::iterator LoopTerm = LoopMBB->getFirstTerminator();
+  BuildMI(*LoopMBB, LoopTerm, FirstWait->getDebugLoc(),
+          TII->get(FirstWait->getOpcode()))
+      .addImm(FirstWait->getOperand(0).getImm());
+  BuildMI(*LoopMBB, LoopTerm, FirstBar->getDebugLoc(),
+          TII->get(FirstBar->getOpcode()));
+
+  // 2c. Remove the originals.
+  FirstBar->eraseFromParent();
+  FirstWait->eraseFromParent();
+
+  return true;
+}
 
 void SIPreEmitPeephole::updateMLIBeforeRemovingEdge(
     MachineBasicBlock *From, MachineBasicBlock *To) const {
@@ -848,6 +981,10 @@ bool SIPreEmitPeephole::run(MachineFunction &MF, MachineLoopInfo *LoopInfo) {
   // Perform the extra MF scans only for supported archs
   if (!ST.hasGFX940Insts())
     return Changed;
+
+  // Rotate the first lgkmcnt waitcnt+barrier pair out of the loop.
+  Changed |= rotateLgkmcnt(MF);
+
   for (MachineBasicBlock &MBB : MF) {
     // Unpack packed instructions overlapped by MFMAs. This allows the
     // compiler to co-issue unpacked instructions with MFMA
