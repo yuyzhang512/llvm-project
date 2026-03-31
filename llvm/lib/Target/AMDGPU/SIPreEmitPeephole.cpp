@@ -43,6 +43,7 @@ private:
   const SIRegisterInfo *TRI = nullptr;
   MachineLoopInfo *MLI = nullptr;
 
+  bool separateWaitcntAndBarrier(MachineBasicBlock &MBB) const;
   bool rotateLgkmcnt(MachineFunction &MF) const;
   bool optimizeVccBranch(MachineInstr &MI) const;
   void updateMLIBeforeRemovingEdge(MachineBasicBlock *From,
@@ -116,6 +117,38 @@ INITIALIZE_PASS(SIPreEmitPeepholeLegacy, DEBUG_TYPE,
 char SIPreEmitPeepholeLegacy::ID = 0;
 
 char &llvm::SIPreEmitPeepholeID = SIPreEmitPeepholeLegacy::ID;
+
+// Pattern:  MFMA -> S_WAITCNT -> S_BARRIER
+// Becomes:  S_WAITCNT -> MFMA -> S_BARRIER
+//
+// Moving the waitcnt before the MFMA lets the MFMA execute during the
+// barrier synchronization window, hiding its latency instead of stalling.
+bool SIPreEmitPeephole::separateWaitcntAndBarrier(
+    MachineBasicBlock &MBB) const {
+  bool Changed = false;
+
+  for (auto It = MBB.begin(), E = MBB.end(); It != E; ++It) {
+    if (!TII->isBarrierStart(It->getOpcode()))
+      continue;
+    if (It == MBB.begin() || std::prev(It) == MBB.begin())
+      continue;
+
+    auto WaitIt = std::prev(It);
+    auto MFMAIt = std::prev(WaitIt);
+
+    if (!SIInstrInfo::isWaitcnt(WaitIt->getOpcode()))
+      continue;
+    if (!SIInstrInfo::isMFMA(*MFMAIt))
+      continue;
+
+    // Move the waitcnt before the MFMA.
+    LLVM_DEBUG(dbgs() << "SeparateWaitcntAndBarrier: moving " << *WaitIt
+                      << "  before " << *MFMAIt);
+    MBB.splice(MFMAIt, &MBB, WaitIt);
+    Changed = true;
+  }
+  return Changed;
+}
 
 // Rotate the first s_waitcnt(lgkmcnt)+s_barrier pair out of the loop body.
 //
@@ -986,6 +1019,11 @@ bool SIPreEmitPeephole::run(MachineFunction &MF, MachineLoopInfo *LoopInfo) {
   Changed |= rotateLgkmcnt(MF);
 
   for (MachineBasicBlock &MBB : MF) {
+    // Pattern:  MFMA -> S_WAITCNT -> S_BARRIER
+    // Becomes:  S_WAITCNT -> MFMA -> S_BARRIER
+    // Lets MFMA execute during the barrier sync window.
+    Changed |= separateWaitcntAndBarrier(MBB);
+
     // Unpack packed instructions overlapped by MFMAs. This allows the
     // compiler to co-issue unpacked instructions with MFMA
     auto SchedModel = TII->getSchedModel();
