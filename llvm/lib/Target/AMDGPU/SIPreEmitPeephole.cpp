@@ -118,11 +118,13 @@ char SIPreEmitPeepholeLegacy::ID = 0;
 
 char &llvm::SIPreEmitPeepholeID = SIPreEmitPeepholeLegacy::ID;
 
-// Pattern:  MFMA -> S_WAITCNT -> S_BARRIER
-// Becomes:  S_WAITCNT -> MFMA -> S_BARRIER
+// Pattern:  MFMA -> [safe instrs] -> S_WAITCNT -> S_BARRIER
+// Becomes:  [safe instrs] -> S_WAITCNT -> MFMA -> S_BARRIER
 //
-// Moving the waitcnt before the MFMA lets the MFMA execute during the
+// Moving the MFMA right before the barrier lets it execute during the
 // barrier synchronization window, hiding its latency instead of stalling.
+// Safe intermediate instructions (e.g. ASYNCMARK, WAIT_ASYNCMARK, other
+// waitcnts) are left in place before the MFMA.
 bool SIPreEmitPeephole::separateWaitcntAndBarrier(
     MachineBasicBlock &MBB) const {
   bool Changed = false;
@@ -130,21 +132,39 @@ bool SIPreEmitPeephole::separateWaitcntAndBarrier(
   for (auto It = MBB.begin(), E = MBB.end(); It != E; ++It) {
     if (!TII->isBarrierStart(It->getOpcode()))
       continue;
-    if (It == MBB.begin() || std::prev(It) == MBB.begin())
+    if (It == MBB.begin())
       continue;
 
     auto WaitIt = std::prev(It);
-    auto MFMAIt = std::prev(WaitIt);
-
     if (!SIInstrInfo::isWaitcnt(WaitIt->getOpcode()))
       continue;
-    if (!SIInstrInfo::isMFMA(*MFMAIt))
+
+    // Scan backward past the waitcnt looking for an MFMA.  Allow safe
+    // intermediate instructions (waitcnts and WAIT_ASYNCMARK) between the
+    // MFMA and the waitcnt preceding the barrier.
+    auto ScanIt = WaitIt;
+    while (ScanIt != MBB.begin()) {
+      --ScanIt;
+      if (SIInstrInfo::isMFMA(*ScanIt))
+        break;
+      // Allow skipping over waitcnts, ASYNCMARK, and WAIT_ASYNCMARK.
+      if (SIInstrInfo::isWaitcnt(ScanIt->getOpcode()) ||
+          ScanIt->getOpcode() == AMDGPU::ASYNCMARK ||
+          ScanIt->getOpcode() == AMDGPU::WAIT_ASYNCMARK)
+        continue;
+      // Any other instruction -- stop scanning.
+      ScanIt = MBB.end();
+      break;
+    }
+
+    if (ScanIt == MBB.end() || ScanIt == MBB.begin() ||
+        !SIInstrInfo::isMFMA(*ScanIt))
       continue;
 
-    // Move the waitcnt before the MFMA.
-    LLVM_DEBUG(dbgs() << "SeparateWaitcntAndBarrier: moving " << *WaitIt
-                      << "  before " << *MFMAIt);
-    MBB.splice(MFMAIt, &MBB, WaitIt);
+    // Move the MFMA to right before the barrier.
+    LLVM_DEBUG(dbgs() << "SeparateWaitcntAndBarrier: moving " << *ScanIt
+                      << "  before " << *It);
+    MBB.splice(It, &MBB, ScanIt);
     Changed = true;
   }
   return Changed;
@@ -1019,8 +1039,8 @@ bool SIPreEmitPeephole::run(MachineFunction &MF, MachineLoopInfo *LoopInfo) {
   Changed |= rotateLgkmcnt(MF);
 
   for (MachineBasicBlock &MBB : MF) {
-    // Pattern:  MFMA -> S_WAITCNT -> S_BARRIER
-    // Becomes:  S_WAITCNT -> MFMA -> S_BARRIER
+    // Pattern:  MFMA -> [safe instrs] -> S_WAITCNT -> S_BARRIER
+    // Becomes:  [safe instrs] -> S_WAITCNT -> MFMA -> S_BARRIER
     // Lets MFMA execute during the barrier sync window.
     Changed |= separateWaitcntAndBarrier(MBB);
 
