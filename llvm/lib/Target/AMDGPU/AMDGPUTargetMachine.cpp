@@ -57,6 +57,7 @@
 #include "SILowerWWMCopies.h"
 #include "SIMachineFunctionInfo.h"
 #include "SIMachineScheduler.h"
+#include "SILICMRegRename.h"
 #include "SIOptimizeExecMasking.h"
 #include "SIOptimizeExecMaskingPreRA.h"
 #include "SIOptimizeVGPRLiveRange.h"
@@ -83,6 +84,7 @@
 #include "llvm/CodeGen/GlobalISel/RegBankSelect.h"
 #include "llvm/CodeGen/MIRParser/MIParser.h"
 #include "llvm/CodeGen/MachineCSE.h"
+#include "llvm/CodeGen/MachineCopyPropagation.h"
 #include "llvm/CodeGen/MachineLICM.h"
 #include "llvm/CodeGen/MachineScheduler.h"
 #include "llvm/CodeGen/Passes.h"
@@ -676,6 +678,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeSIOptimizeExecMaskingLegacyPass(*PR);
   initializeSIPreAllocateWWMRegsLegacyPass(*PR);
   initializeSIFormMemoryClausesLegacyPass(*PR);
+  initializeSILICMRegRenameLegacyPass(*PR);
   initializeSIPostRABundlerLegacyPass(*PR);
   initializeGCNCreateVOPDLegacyPass(*PR);
   initializeAMDGPUUnifyDivergentExitNodesPass(*PR);
@@ -1709,6 +1712,11 @@ void GCNPassConfig::addOptimizedRegAlloc() {
   if (TM->getOptLevel() > CodeGenOptLevel::Less)
     insertPass(&MachineSchedulerID, &SIFormMemoryClausesID);
 
+  // Rename registers to enable post-RA MachineLICM to hoist loop-invariant
+  // instructions whose destination register is clobbered by another def.
+  // Must run after MachineCopyPropagation and before MachineLICM.
+  insertPass(&MachineCopyPropagationID, &SILICMRegRenameLegacyID);
+
   TargetPassConfig::addOptimizedRegAlloc();
 }
 
@@ -2482,6 +2490,10 @@ Error AMDGPUCodeGenPassBuilder::addOptimizedRegAlloc(
   // compilation time, so we only enable it from O2.
   if (TM.getOptLevel() > CodeGenOptLevel::Less)
     insertPass<MachineSchedulerPass>(SIFormMemoryClausesPass());
+
+  // Rename registers to enable post-RA MachineLICM to hoist loop-invariant
+  // instructions whose destination register is clobbered by another def.
+  insertPass<MachineCopyPropagationPass>(SILICMRegRenamePass());
 
   return Base::addOptimizedRegAlloc(PMW);
 }
