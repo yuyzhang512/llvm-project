@@ -182,34 +182,14 @@ char SILICMRegRenameLegacy::ID = 0;
 
 char &llvm::SILICMRegRenameLegacyID = SILICMRegRenameLegacy::ID;
 
-static void dumpMIRToFile(MachineFunction &MF, std::string Suffix) {
-  std::string Filename =
-      (MF.getName() + "_si-licm-reg-rename_" + Suffix + ".mir").str();
-  std::error_code EC;
-  raw_fd_ostream OS(Filename, EC);
-  if (EC) {
-    errs() << "Error opening " << Filename << ": " << EC.message() << "\n";
-    return;
-  }
-  MF.print(OS);
-  errs() << "Dumped MIR to " << Filename << "\n";
-}
-static int Idx = 0;
 bool SILICMRegRenameLegacy::runOnMachineFunction(MachineFunction &MF) {
   if (skipFunction(MF.getFunction()))
     return false;
   if (!EnableLICMRegRename)
     return false;
 
-  dumpMIRToFile(MF, "before" + std::to_string(Idx));
-
   auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
-  bool Changed = SILICMRegRename(&MF, &MLI).run();
-
-  if (Changed)
-    dumpMIRToFile(MF, "after" + std::to_string(Idx++));
-
-  return Changed;
+  return SILICMRegRename(&MF, &MLI).run();
 }
 
 // ---- Implementation ----
@@ -493,7 +473,7 @@ bool SILICMRegRename::isRenameCandidate(MachineInstr &MI,
     }
   }
 
-  if (DefCount < 2) {
+  if (DefCount != 2) {
     LLVM_DEBUG(dbgs() << "  Skipping (DefCount=" << DefCount << "): " << MI);
     return false;
   }
@@ -666,20 +646,23 @@ bool SILICMRegRename::renameDefAndUsers(MachineInstr &MI, Register OldReg,
   }
 
   // Rewrite uses between MI and OtherDef (forward, wrapping around).
-  // If MIIdx < OtherIdx: rewrite uses at positions (MIIdx, OtherIdx)
-  // If MIIdx > OtherIdx: rewrite uses at positions (MIIdx, end] + [0, OtherIdx)
+  // If MIIdx < OtherIdx: rewrite uses at positions (MIIdx, OtherIdx]
+  // If MIIdx > OtherIdx: rewrite uses at positions (MIIdx, end] + [0, OtherIdx]
+  // Note: OtherDef is INCLUDED for use-operand renaming because it may read
+  // OldReg as an input (e.g. V_CNDMASK_B32 that both reads and writes $vgpr7).
+  // Only its def operand must remain as OldReg.
   Idx = 0;
   for (MachineInstr &I : *LoopBB) {
-    if (&I == &MI || &I == OtherDef) {
+    if (&I == &MI) {
       Idx++;
       continue;
     }
 
     bool InRange;
     if (MIIdx < OtherIdx) {
-      InRange = (Idx > MIIdx && Idx < OtherIdx);
+      InRange = (Idx > MIIdx && Idx <= OtherIdx);
     } else {
-      InRange = (Idx > MIIdx || Idx < OtherIdx);
+      InRange = (Idx > MIIdx || Idx <= OtherIdx);
     }
 
     if (InRange) {
@@ -775,6 +758,32 @@ void SILICMRegRename::collectMFMAAccChains(
 
     // Need exactly one persistent and one temp.
     if (!Persistent || !Temp)
+      continue;
+
+    // Verify that the persistent VGPR is not used by any non-chain instruction
+    // in the loop body. If it is (e.g., as src0/src1 in other MFMAs, or read
+    // by V_CVT_PK, DS_WRITE, etc.), we cannot safely rewrite to AGPR because
+    // those instructions would read stale VGPR values.
+    DenseSet<MachineInstr *> ChainMIs(Chain.MFMAs.begin(), Chain.MFMAs.end());
+    bool PersistentUsedElsewhere = false;
+    for (const MachineInstr &MI : *LoopBB) {
+      if (ChainMIs.count(const_cast<MachineInstr *>(&MI)))
+        continue;
+      for (const MachineOperand &MO : MI.operands()) {
+        if (!MO.isReg())
+          continue;
+        Register Reg = MO.getReg();
+        if (!Reg || !Reg.isPhysical())
+          continue;
+        if (TRI->regsOverlap(Reg, Persistent)) {
+          PersistentUsedElsewhere = true;
+          break;
+        }
+      }
+      if (PersistentUsedElsewhere)
+        break;
+    }
+    if (PersistentUsedElsewhere)
       continue;
 
     Chain.PersistentVGPR = Persistent;
@@ -878,7 +887,6 @@ bool SILICMRegRename::rewriteMFMAChainToAGPR(MFMAAccChain &Chain,
       TRI->getMinimalPhysRegClass(Chain.PersistentVGPR);
   unsigned RegSize = TRI->getRegSizeInBits(*PersRC) / 32;
 
-  SmallVector<MachineInstr *, 4> ToErase;
   for (unsigned i = 0; i < RegSize; ++i) {
     unsigned SubIdx = SIRegisterInfo::getSubRegFromChannel(i, 1);
     MCRegister VGPRSub = TRI->getSubReg(Chain.PersistentVGPR, SubIdx);
@@ -891,24 +899,20 @@ bool SILICMRegRename::rewriteMFMAChainToAGPR(MFMAAccChain &Chain,
         if (MO.getReg() != VGPRSub)
           continue;
 
-        // Replace COPY with V_ACCVGPR_WRITE_B32_e64 using BuildMI to get
-        // correct implicit operands (e.g. $exec).
-        if (MI.isCopy()) {
-          Register SrcReg = MI.getOperand(1).getReg();
-          BuildMI(*Preheader, MI, MI.getDebugLoc(),
+        // Insert V_ACCVGPR_WRITE_B32_e64 after the instruction to copy the
+        // VGPR result into the AGPR. Keep the original instruction intact
+        // because the persistent VGPR may still be used elsewhere (e.g., as
+        // src0/src1 in other MFMA instructions).
+        {
+          auto InsertPt = std::next(MachineBasicBlock::iterator(MI));
+          BuildMI(*Preheader, InsertPt, MI.getDebugLoc(),
                   TII->get(AMDGPU::V_ACCVGPR_WRITE_B32_e64), AGPRSub)
-              .addReg(SrcReg);
-          ToErase.push_back(&MI);
-        } else {
-          MO.setReg(AGPRSub);
+              .addReg(VGPRSub);
         }
         break;
       }
     }
   }
-  for (MachineInstr *MI : ToErase)
-    MI->eraseFromParent();
-
   // Step C: Insert AGPR→VGPR copies for persistent VGPR in exit blocks.
   // Temp VGPR doesn't need epilogue copies (transient).
   SmallVector<MachineBasicBlock *, 4> ExitBlocks;
@@ -934,14 +938,11 @@ bool SILICMRegRename::rewriteMFMAChainToAGPR(MFMAAccChain &Chain,
   }
 
   // Step D: Update loop block live-ins.
-  LoopBB->removeLiveIn(Chain.PersistentVGPR);
-  for (unsigned i = 0; i < RegSize; ++i) {
-    unsigned SubIdx = SIRegisterInfo::getSubRegFromChannel(i, 1);
-    MCRegister VGPRSub = TRI->getSubReg(Chain.PersistentVGPR, SubIdx);
-    LoopBB->removeLiveIn(VGPRSub);
-  }
+  // Keep the persistent VGPR as live-in — it may still be used as src0/src1
+  // in other MFMA instructions (e.g. A/B matrix input).
   LoopBB->addLiveIn(PersAGPR);
-  LoopBB->addLiveIn(TempAGPR);
+  // Note: TempAGPR is transient (defined and killed within each iteration),
+  // so it is NOT live across the back-edge and must not be added as a live-in.
   LoopBB->sortUniqueLiveIns();
 
   return true;
@@ -959,10 +960,14 @@ bool SILICMRegRename::canonicalizeMFMAChain(MFMAAccChain &Chain,
     MachineOperand *Dst = TII->getNamedOperand(*MI, AMDGPU::OpName::vdst);
     MachineOperand *Src2 = TII->getNamedOperand(*MI, AMDGPU::OpName::src2);
 
-    if (Dst && Dst->isReg() && Dst->getReg() == Chain.TempVGPR)
+    if (Dst && Dst->isReg() && Dst->getReg() == Chain.TempVGPR) {
       Dst->setReg(Chain.PersistentVGPR);
-    if (Src2 && Src2->isReg() && Src2->getReg() == Chain.TempVGPR)
+      Dst->setIsRenamable(true);
+    }
+    if (Src2 && Src2->isReg() && Src2->getReg() == Chain.TempVGPR) {
       Src2->setReg(Chain.PersistentVGPR);
+      Src2->setIsRenamable(true);
+    }
   }
 
   return true;
