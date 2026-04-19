@@ -559,7 +559,6 @@ def : InstRW<[WriteXDL8PassWMMA], (instregex "^V_[S]*WMMA[C]*_.*_(IU8|IU4)_w32")
 def : InstRW<[WriteWMMAScale_16X16X128_F8F6F4], (instregex "^V_WMMA_.*_16X16X128_F8F6F4.*_w32")>; // both f4 1 I slot, f8 3 I slots
 def : InstRW<[WriteXDL4PassWMMA], (instregex "^V_WMMA.*_F32_32X16X128_F4")>; // 3 I slots
 def : InstRW<[Write4PassWMMA],    (instregex "^V_WMMA_F32_16X16X4_F32_w32")>;
-def : InstRW<[WriteXDL2PassWMMA], (instregex "^V_WMMA.*_F32_32X16X128_F4")>;
 
 let NumMicroOps = 0 in {
 def : HWWriteRes<WriteVALUDummy, [HWVALU],  5>;

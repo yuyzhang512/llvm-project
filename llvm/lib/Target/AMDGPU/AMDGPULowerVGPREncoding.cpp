@@ -552,31 +552,6 @@ bool AMDGPULowerVGPREncoding::handleSetregMode(MachineInstr &MI) {
   return true;
 }
 
-MachineBasicBlock::instr_iterator
-AMDGPULowerVGPREncoding::handleCoissue(MachineBasicBlock::instr_iterator I) {
-  if (I.isEnd())
-    return I;
-
-  if (I == I->getParent()->begin())
-    return I;
-
-  MachineBasicBlock::instr_iterator Prev = std::prev(I);
-  auto isProgramStateSALU = [this](MachineInstr *MI) {
-    return TII->isBarrier(MI->getOpcode()) || TII->isWaitcnt(MI->getOpcode()) ||
-           SIInstrInfo::isProgramStateSALU(*MI);
-  };
-
-  if (!isProgramStateSALU(&*Prev))
-    return I;
-
-  while (!Prev.isEnd() && (Prev != Prev->getParent()->begin()) &&
-         isProgramStateSALU(&*Prev)) {
-    --Prev;
-  }
-  // We have to return the next instruction because we insert before the result
-  return std::next(Prev);
-}
-
 bool AMDGPULowerVGPREncoding::run(MachineFunction &MF) {
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
   if (!ST.has1024AddressableVGPRs())

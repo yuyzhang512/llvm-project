@@ -135,10 +135,7 @@ const unsigned ScheduleMetrics::ScaleFactor = 100;
 
 GCNSchedStrategy::GCNSchedStrategy(const MachineSchedContext *C)
     : GenericScheduler(C), TargetOccupancy(0), MF(nullptr),
-      DownwardTracker(*C->LIS), UpwardTracker(*C->LIS), HasHighPressure(false) {
-  if (GCNTrackers.getNumOccurrences() > 0)
-    GCNTrackersOverride = GCNTrackers;
-}
+      DownwardTracker(*C->LIS), UpwardTracker(*C->LIS), HasHighPressure(false) {}
 
 void GCNSchedStrategy::initialize(ScheduleDAGMI *DAG) {
   GenericScheduler::initialize(DAG);
