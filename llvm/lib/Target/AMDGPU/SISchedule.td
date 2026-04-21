@@ -125,8 +125,8 @@ def HWBranch : ProcResource<1> {
 def HWExport : ProcResource<1> {
   let BufferSize = 1;
 }
-def HWLGKM   : ProcResource<16> {
-  let BufferSize = 0;
+def HWLGKM   : ProcResource<1> {
+  let BufferSize = 1;
 }
 def HWSALU   : ProcResource<1> {
   let BufferSize = 1;
@@ -139,7 +139,7 @@ def HWVALU   : ProcResource<1> {
 }
 
 def HWTransVALU : ProcResource<1> { // Transcendental VALU
-  let BufferSize = 0;
+  let BufferSize = 1;
 }
 def HWRC   : ProcResource<1> { // Register destination cache
   let BufferSize = 1;
@@ -542,13 +542,12 @@ def : HWWriteRes<WritePseudoScalarTrans, [HWVALU, HWRC],   8>;
 
 def : HWWriteRes<WriteBranch,            [HWBranch],       32>;
 def : HWWriteRes<WriteExport,            [HWExport, HWRC], 16>;
-let ReleaseAtCycles = [20,0] in
 def : HWWriteRes<WriteLDS,               [HWLGKM,   HWRC], 60>;
 def : HWWriteRes<WriteSALU,              [HWSALU,   HWRC], 2>;
 def : HWWriteRes<WriteSFPU,              [HWSALU,   HWRC], 4>;
 def : HWWriteRes<WriteSMEM,              [HWLGKM,   HWRC], 20>;
-def : HWWriteRes<WriteVMEM,              [HWVMEM,   HWRC], 1>;
-def : HWWriteRes<WriteBarrier,           [HWBranch],       1>;
+def : HWWriteRes<WriteVMEM,              [HWVMEM,   HWRC], 320>;
+def : HWWriteRes<WriteBarrier,           [HWBranch],       2000>;
 
 def : InstRW<[WriteCopy], (instrs COPY)>;
 

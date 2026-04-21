@@ -1720,11 +1720,6 @@ void ScheduleDAGMILive::schedule() {
   // This may initialize a DFSResult to be used for queue priority.
   SchedImpl->initialize(this);
 
-  for (auto SU : SUnits) {
-    SU.ComputeDepth();
-    SU.ComputeHeight();
-  }
-
   LLVM_DEBUG(dump());
   if (PrintDAGs) dump();
   if (ViewMISchedDAGs) viewGraph();

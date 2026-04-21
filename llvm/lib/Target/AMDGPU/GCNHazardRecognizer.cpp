@@ -367,7 +367,7 @@ void GCNHazardRecognizer::updateCVTState(const MachineInstr &MI, bool SubOne) {
 }
 
 void GCNHazardRecognizer::updateSSrcState(const MachineInstr &MI, bool SubOne) {
-  if (!SIInstrInfo::isVALU(MI))
+  if (!SIInstrInfo::isVALU(MI) || SIInstrInfo::isLDSDMA(MI))
     return;
 
   if (MI.getOpcode() == AMDGPU::V_READFIRSTLANE_B32) {
@@ -1015,8 +1015,9 @@ unsigned GCNHazardRecognizer::PreEmitNoopsCommon(MachineInstr *MI) const {
 
   int WaitStates = 0;
 
-  if (SIInstrInfo::isSMRD(*MI))
+  if (SIInstrInfo::isSMRD(*MI)) {
     return std::max(WaitStates, checkSMRDHazards(MI));
+  }
 
   if (ST.hasNSAtoVMEMBug())
     WaitStates = std::max(WaitStates, checkNSAtoVMEMHazard(MI));
@@ -1141,8 +1142,9 @@ void GCNHazardRecognizer::preRAAdvanceCycle() {
     --CyclesUntilTRANS32;
   if (CyclesUntilVALU)
     --CyclesUntilVALU;
-  if (CyclesUntilSALU)
+  if (CyclesUntilSALU) {
     --CyclesUntilSALU;
+  }
 }
 
 void GCNHazardRecognizer::AdvanceCycle() {

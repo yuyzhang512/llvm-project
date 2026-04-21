@@ -379,8 +379,7 @@ void GCNSchedStrategy::initCandidate(SchedCandidate &Cand, SUnit *SU,
   // FIXME: Better heuristics to determine whether to prefer SGPRs or VGPRs.
   const unsigned MaxVGPRPressureInc = 16;
   bool ShouldTrackVGPRs = VGPRPressure + MaxVGPRPressureInc >= VGPRExcessLimit;
-  bool ShouldTrackSGPRs =
-      false && !ShouldTrackVGPRs && SGPRPressure >= SGPRExcessLimit;
+  bool ShouldTrackSGPRs = !ShouldTrackVGPRs && SGPRPressure >= SGPRExcessLimit;
 
   // FIXME: We have to enter REG-EXCESS before we reach the actual threshold
   // to increase the likelihood we don't go over the limits.  We should improve
@@ -424,13 +423,6 @@ void GCNSchedStrategy::initCandidate(SchedCandidate &Cand, SUnit *SU,
     }
   }
 
-
-  int VGPRReduction = (int)NewVGPRPressure - (int)OldVGPRPressure;
-  if (true) {
-      Cand.RPDelta.CriticalMax =
-          PressureChange(AMDGPU::RegisterPressureSets::VGPR_32);
-          Cand.RPDelta.CriticalMax.setUnitInc(VGPRReduction);
-  }
 }
 
 static bool shouldCheckPending(SchedBoundary &Zone,
@@ -1967,7 +1959,6 @@ void GCNSchedStage::checkScheduling() {
   DAG.Pressure[RegionIdx] = PressureAfter;
   SIMachineFunctionInfo *SMI = static_cast<SIMachineFunctionInfo *>(&DAG.MFI);
   SMI->setMaxRP(DAG.Pressure[RegionIdx].getArchVGPRNum());
-  return;
 
   LLVM_DEBUG(dbgs() << "Pressure after scheduling: " << print(PressureAfter));
   LLVM_DEBUG(dbgs() << "Region: " << RegionIdx << ".\n");
