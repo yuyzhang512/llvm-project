@@ -36,6 +36,7 @@
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
 #include "llvm/CodeGen/MachineOperand.h"
+#include "llvm/CodeGen/LiveIntervalUnion.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
 #include "llvm/CodeGen/Rematerializer.h"
 #include "llvm/MC/LaneBitmask.h"
@@ -188,7 +189,7 @@ void GCNSchedStrategy::initialize(ScheduleDAGMI *DAG) {
     float Ratio = (float)VGPRThresholdPercent / 100.0;
     VGPRExcessLimit *= Ratio;
   }
-  else 
+  else
     VGPRExcessLimit -= std::min(VGPRLimitBias + ErrorMargin, VGPRExcessLimit);
 
   LLVM_DEBUG(dbgs() << "VGPRCriticalLimit = " << VGPRCriticalLimit
@@ -1045,6 +1046,8 @@ GCNScheduleDAGMILive::createSchedStage(GCNSchedStageID SchedStageID) {
   case GCNSchedStageID::MemoryClauseInitialSchedule:
     return std::make_unique<MemoryClauseInitialScheduleStage>(SchedStageID,
                                                               *this);
+  case GCNSchedStageID::RAPressureReschedule:
+    return std::make_unique<RAPressureRescheduleStage>(SchedStageID, *this);
   }
 
   llvm_unreachable("Unknown SchedStageID.");
@@ -1329,6 +1332,9 @@ raw_ostream &llvm::operator<<(raw_ostream &OS, const GCNSchedStageID &StageID) {
     break;
   case GCNSchedStageID::MemoryClauseInitialSchedule:
     OS << "Max memory clause Initial Schedule";
+    break;
+  case GCNSchedStageID::RAPressureReschedule:
+    OS << "RA Pressure Reschedule";
     break;
   }
 
@@ -2244,6 +2250,162 @@ bool ILPInitialScheduleStage::shouldRevertScheduling(unsigned WavesAfter) {
 bool MemoryClauseInitialScheduleStage::shouldRevertScheduling(
     unsigned WavesAfter) {
   return mayCauseSpilling(WavesAfter);
+}
+
+static cl::opt<bool> EnableRAPressureReschedule(
+    "amdgpu-ra-pressure-reschedule", cl::Hidden,
+    cl::desc("Enable RA pressure reschedule stage"),
+    cl::init(true));
+
+static cl::opt<unsigned> RAPressureThreshold(
+    "amdgpu-ra-pressure-threshold", cl::Hidden,
+    cl::desc("Percent increase of RA pressure over instant pressure to "
+             "trigger rescheduling"),
+    cl::init(10));
+
+static cl::opt<unsigned> RAPressureVGPRReduction(
+    "amdgpu-ra-pressure-vgpr-reduction", cl::Hidden,
+    cl::desc("Reduction factor (percent) for VGPR threshold during RA pressure "
+             "reschedule stage"),
+    cl::init(80));
+
+bool RAPressureRescheduleStage::initGCNSchedStage() {
+  if (!EnableRAPressureReschedule)
+    return false;
+
+  if (!GCNSchedStage::initGCNSchedStage())
+    return false;
+
+  // Use a tighter VGPRExcessLimit by reducing VGPRThresholdPercent
+  SavedVGPRThresholdPercent = VGPRThresholdPercent;
+  VGPRThresholdPercent = (VGPRThresholdPercent * RAPressureVGPRReduction) / 100;
+
+  LLVM_DEBUG(dbgs() << "RAPressure: Starting RAPressureReschedule stage, "
+                    << "VGPRThresholdPercent: " << SavedVGPRThresholdPercent
+                    << " -> " << VGPRThresholdPercent
+                    << ", VGPRExcessLimit = " << S.VGPRExcessLimit
+                    << ", VGPRCriticalLimit = " << S.VGPRCriticalLimit
+                    << "\n");
+  return true;
+}
+
+void RAPressureRescheduleStage::finalizeGCNSchedStage() {
+  VGPRThresholdPercent = SavedVGPRThresholdPercent;
+  GCNSchedStage::finalizeGCNSchedStage();
+}
+
+bool RAPressureRescheduleStage::initGCNRegion() {
+  if (!GCNSchedStage::initGCNRegion()) {
+    return false;
+  }
+
+  unsigned InstantRP = DAG.Pressure[RegionIdx].getVGPRNum(ST.hasGFX90AInsts());
+  unsigned RAPressure = computeRAPressureVGPRs(RegionIdx);
+
+  LLVM_DEBUG(dbgs() << "RAPressure: Region " << RegionIdx << ": InstantRP="
+                    << InstantRP << ", RAPressure=" << RAPressure);
+
+  bool DoRescheduling = false;
+  if (RAPressure > S.VGPRExcessLimit && RAPressure > InstantRP && InstantRP > 0) {
+    unsigned IncreasePercent = ((RAPressure - InstantRP) * 100) / InstantRP;
+    if (IncreasePercent > RAPressureThreshold) {
+      LLVM_DEBUG(dbgs() << " [" << IncreasePercent << "% > "
+                        << RAPressureThreshold << "%, rescheduling]");
+      DoRescheduling = true;
+    } else {
+      LLVM_DEBUG(dbgs() << " [" << IncreasePercent << "%]");
+    }
+  }
+
+  LLVM_DEBUG(dbgs() << "\n");
+  return DoRescheduling;
+}
+
+bool RAPressureRescheduleStage::shouldRevertScheduling(unsigned WavesAfter) {
+  if (!PressureAfter.less(MF, PressureBefore)) {
+    LLVM_DEBUG(dbgs() << "RAPressure: Reverting scheduling\n");
+    return true;
+  }
+  return false;
+}
+
+unsigned RAPressureRescheduleStage::computeRAPressureVGPRs(unsigned RegionIdx) const {
+  LiveIntervals *LIS = DAG.getLIS();
+  MachineRegisterInfo &MRI = DAG.MF.getRegInfo();
+  const SIRegisterInfo &TRI = static_cast<const SIRegisterInfo &>(*DAG.TRI);
+
+  auto [RegionBegin, RegionEnd] = DAG.Regions[RegionIdx];
+
+  SmallVector<LiveInterval *> RegionIntervals;
+  SmallPtrSet<LiveInterval *, 32> Seen;
+
+  // Collect live-ins
+  for (auto &[RegNum, LaneMask] : DAG.LiveIns[RegionIdx]) {
+    Register VReg(RegNum);
+    if (!VReg.isVirtual() || !LIS->hasInterval(VReg))
+      continue;
+    // Only VGPR intervals
+    if (!TRI.isVGPRClass(MRI.getRegClass(VReg)))
+      continue;
+    LiveInterval &LI = LIS->getInterval(VReg);
+    if (Seen.insert(&LI).second)
+      RegionIntervals.push_back(&LI);
+  }
+
+  // Collect defs in region
+  for (auto I = RegionBegin; I != RegionEnd; ++I) {
+    for (MachineOperand &MO : I->operands()) {
+      if (!MO.isReg() || !MO.isDef() || !MO.getReg().isVirtual())
+        continue;
+      Register VReg = MO.getReg();
+      if (!LIS->hasInterval(VReg))
+        continue;
+      if (!TRI.isVGPRClass(MRI.getRegClass(VReg)))
+        continue;
+      LiveInterval &LI = LIS->getInterval(VReg);
+      if (Seen.insert(&LI).second)
+        RegionIntervals.push_back(&LI);
+    }
+  }
+
+  llvm::sort(RegionIntervals, [](auto *LHS, auto *RHS) {
+    return LHS->beginIndex() < RHS->beginIndex();
+  });
+
+  LiveIntervalUnion::Allocator Alloc;
+  std::vector<LiveIntervalUnion> Slots;
+  unsigned MaxSlotUsed = 0;
+
+  for (LiveInterval *LI : RegionIntervals) {
+    const TargetRegisterClass *RC = MRI.getRegClass(LI->reg());
+    unsigned Size = TRI.getRegClassWeight(RC).RegWeight;
+    unsigned Alignment = (RC->TSFlags & 0x3) ? (RC->TSFlags & 0x3) : 1;
+
+    unsigned Start = 0;
+    while (true) {
+      while (Slots.size() < Start + Size)
+        Slots.emplace_back(Alloc);
+
+      bool Fits = true;
+      for (unsigned Idx = Start; Idx < Start + Size; Idx++) {
+        LiveIntervalUnion::Query Q(*LI, Slots[Idx]);
+        if (Q.checkInterference()) {
+          Start = alignTo(Idx + 1, Alignment);
+          Fits = false;
+          break;
+        }
+      }
+
+      if (Fits) {
+        for (unsigned Idx = Start; Idx < Start + Size; Idx++)
+          Slots[Idx].unify(*LI, *LI);
+        MaxSlotUsed = std::max(MaxSlotUsed, Start + Size);
+        break;
+      }
+    }
+  }
+
+  return MaxSlotUsed;
 }
 
 bool GCNSchedStage::mayCauseSpilling(unsigned WavesAfter) {

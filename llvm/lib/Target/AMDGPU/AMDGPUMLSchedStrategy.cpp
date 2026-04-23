@@ -784,6 +784,7 @@ void RegionMixInfo::dumpReadyPending(raw_ostream &OS) const {
 AMDGPUMLSchedStrategy::AMDGPUMLSchedStrategy(const MachineSchedContext *C)
     : GCNSchedStrategy(C) {
   SchedStages.push_back(GCNSchedStageID::ILPInitialSchedule);
+  SchedStages.push_back(GCNSchedStageID::RAPressureReschedule);
   SchedStages.push_back(GCNSchedStageID::PreRARematerialize);
   // Use more accurate GCN pressure trackers.
   UseGCNTrackers = true;
