@@ -73,11 +73,28 @@ void addLatencyToEdge(SDep &PredDep, SUnit &SU, unsigned Latency) {
   SU.setDepthDirty();
 }
 
+
+void setLatencyForEdge(SDep &PredDep, SUnit &SU, unsigned Latency) {
+  SUnit *PredSU = PredDep.getSUnit();
+  SDep ForwardD = PredDep;
+  ForwardD.setSUnit(&SU);
+  for (SDep &SuccDep : PredSU->Succs) {
+    if (SuccDep == ForwardD) {
+      SuccDep.setLatency(Latency);
+      break;
+    }
+  }
+  PredDep.setLatency(Latency);
+  PredSU->setDepthDirty();
+  SU.setDepthDirty();
+}
+
+
+
 void BarrierLatency::apply(ScheduleDAGInstrs *DAG) {
   const SIInstrInfo *TII = static_cast<const SIInstrInfo *>(DAG->TII);
   constexpr unsigned FenceLatency = 2000;
   const unsigned BarrierSignalWaitLatency = BarrierSignalWaitLatencyOpt;
-  return;
 
   for (SUnit &SU : DAG->SUnits) {
     const MachineInstr *MI = SU.getInstr();
@@ -109,6 +126,28 @@ void BarrierLatency::apply(ScheduleDAGInstrs *DAG) {
           addLatencyToEdge(PredDep, SU, BarrierSignalWaitLatency);
         }
       }
+    } else if (Op == AMDGPU::S_WAIT_TENSORCNT) {
+      // Now update latencies for all predecessor tensor loads.
+      for (SDep &PredDep : SU.Preds) {
+        SUnit *PredSU = PredDep.getSUnit();
+        if (!TII->isLDSDMA(*PredSU->getInstr()) && !TII->isDS(*PredSU->getInstr()))
+          continue;
+
+
+          setLatencyForEdge(PredDep, SU, 1);
+      }
+    }
+
+    else if (TII->isLDSDMA(*MI)) {
+        // Now update latencies for all predecessor tensor loads.
+      for (SDep &PredDep : SU.Preds) {
+        SUnit *PredSU = PredDep.getSUnit();
+        if (!TII->isLDSDMA(*PredSU->getInstr()))
+          continue;
+
+
+          setLatencyForEdge(PredDep, SU, 1);
+      }    
     }
   }
 }

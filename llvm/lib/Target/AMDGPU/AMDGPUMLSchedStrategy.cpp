@@ -839,7 +839,6 @@ unsigned AMDGPUMLSchedStrategy::getHWUICyclesForInst(SUnit *SU,
   auto Opc = SU->getInstr()->getOpcode();
 
   bool IsDMA = const_cast<SIInstrInfo *>(SII)->isLDSDMA(Opc);
-
   unsigned Latency = IsDMA ? SU->Latency : ReleaseAtCycle;
   // FIXME -- harcoded?
   // This is used to determine hardware unit balancing between LDS and other
@@ -2803,7 +2802,6 @@ bool AMDGPUMLSchedStrategy::tryPendingCandidate(SchedCandidate &Cand,
     return TryCand.Reason != NoCand;*/
 
   if (SameBoundary) {
-
     // Prioritize instructions that read unbuffered resources by stall cycles.
     if (tryLess(Heurs.getLatencyStallCycles(TryCand.SU, Zone),
                 Heurs.getLatencyStallCycles(Cand.SU, Zone), TryCand, Cand,
