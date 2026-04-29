@@ -719,7 +719,7 @@ InstructionFlavor llvm::classifyFlavor(const MachineInstr *MI,
   if (SII->isDS(*MI))
     return InstructionFlavor::DS;
 
-  if (SII->isFLAT(*MI) || SII->isFLATGlobal(*MI) || SII->isFLATScratch(*MI))
+  if (SII->isFLAT(*MI) || SII->isFLATGlobal(*MI) || SII->isFLATScratch(*MI) || SII->isVMEM(*MI))
     return InstructionFlavor::VMEM;
 
   if (SII->isSALU(*MI))
