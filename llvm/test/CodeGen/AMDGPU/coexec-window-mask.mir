@@ -1,20 +1,30 @@
-# RUN: llc -mtriple=amdgcn -mcpu=gfx1250 -run-pass=machine-scheduler -amdgpu-sched-strategy=coexec -amdgpu-shadow-mix=1 -debug-only=machine-scheduler 2>&1 %s | FileCheck %s
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1250 -run-pass=machine-scheduler -amdgpu-sched-strategy=coexec -amdgpu-shadow-mix=1 -debug-only=machine-scheduler 2>&1 %s | FileCheck %s --check-prefix=COMBINED
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1250 -run-pass=machine-scheduler -amdgpu-sched-strategy=coexec -amdgpu-shadow-mix=1 -amdgpu-coexec-window-singular-flavor=1 -debug-only=machine-scheduler 2>&1 %s | FileCheck %s --check-prefix=SINGULAR
 # REQUIRES: asserts
 
 # Test that CoexecWindow uses bitmask-based slot requirements instead of individual flavors.
 # The MemCoExec slots should accept DS OR SALU OR VMEM instructions.
 
+# === COMBINED MASK MODE (default) ===
 # Verify slots are expressed as bitmasks, not individual flavors:
 # - Slot 0 should show Mask=MemCoExec (meaning DS|SALU|VMEM), not just "DS"
 # - This allows any instruction matching the mask to satisfy the slot
-# CHECK: CoexecWindow populated (Producer: WMMA)
-# CHECK-NEXT: Slot 0: Mask=MemCoExec, Required=1
-# CHECK-NEXT: Slot 1: Mask=V, Required=
-# CHECK-NEXT: Slot 2: Mask=W, Required=1
+# COMBINED: CoexecWindow populated (Producer: WMMA)
+# COMBINED-NEXT: Slot 0: Mask=MemCoExec, Required=1
+# COMBINED-NEXT: Slot 1: Mask=V, Required=
+# COMBINED-NEXT: Slot 2: Mask=W, Required=1
 
 # WMMACoolOff should check slots by mask, not by individual flavor.
 # When a slot can't be satisfied, the debug output shows the mask:
-# CHECK: WMMACoolOff: Can't satisfy slot (Mask=V
+# COMBINED: WMMACoolOff: Can't satisfy slot (Mask=V
+
+# === SINGULAR FLAVOR MODE (-amdgpu-coexec-window-singular-flavor=1) ===
+# Verify slots use individual flavors instead of combined masks:
+# - Slot 0 should show Mask=D (just DS), not MemCoExec
+# SINGULAR: CoexecWindow populated (Producer: WMMA)
+# SINGULAR-NEXT: Slot 0: Mask=D, Required=1
+# SINGULAR-NEXT: Slot 1: Mask=V, Required=
+# SINGULAR-NEXT: Slot 2: Mask=W, Required=1
 
 --- |
   define void @test_memcoexec_slot_accepts_ds() #0 { ret void }

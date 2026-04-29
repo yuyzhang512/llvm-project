@@ -571,20 +571,32 @@ public:
   }
 
   // Legacy constructor for backward compatibility
+  // UseSingularFlavor: when true, use individual flavor masks (DS only, SALU only)
+  //                    when false, use combined masks (DS|SALU|VMEM for E slots)
   CoexecWindow(InstructionFlavor ProducerFlavor, unsigned RequiredVALU1c,
-               unsigned RequiredSALU, unsigned RequiredDS,
-               RegionMixInfo &MixInfo)
+               unsigned RequiredSALU, unsigned RequiredDS, unsigned RequiredVMEM,
+               RegionMixInfo &MixInfo, bool UseSingularFlavor = false)
       : WindowProducer(ProducerFlavor) {
-    // Convert legacy parameters to slot requirements
-    // E slots (DS requirement): can hold DS OR SALU OR VMEM
-    if (RequiredDS > 0)
-      Slots.push_back(SlotRequirement(FlavorMasks::MemCoExec, RequiredDS));
-    // SALU slots: SALU only (separate from E slots)
-    if (RequiredSALU > 0)
-      Slots.push_back(SlotRequirement(FlavorMasks::SALU, RequiredSALU));
-    // VALU slots: SingleCycleVALU only
-    if (RequiredVALU1c > 0)
-      Slots.push_back(SlotRequirement(FlavorMasks::VALU1c, RequiredVALU1c));
+    if (UseSingularFlavor) {
+      // Singular flavor mode: each slot requires exactly one flavor type
+      if (RequiredDS > 0)
+        Slots.push_back(SlotRequirement(FlavorMasks::DS, RequiredDS));
+      if (RequiredSALU > 0)
+        Slots.push_back(SlotRequirement(FlavorMasks::SALU, RequiredSALU));
+      if (RequiredVMEM > 0)
+        Slots.push_back(SlotRequirement(FlavorMasks::VMEM, RequiredVMEM));
+      if (RequiredVALU1c > 0)
+        Slots.push_back(SlotRequirement(FlavorMasks::VALU1c, RequiredVALU1c));
+    } else {
+      // Combined mask mode: E slots can hold DS OR SALU OR VMEM
+      // Combine DS, SALU, and VMEM requirements into MemCoExec slots
+      unsigned MemCoExecCount = RequiredDS + RequiredSALU + RequiredVMEM;
+      if (MemCoExecCount > 0)
+        Slots.push_back(SlotRequirement(FlavorMasks::MemCoExec, MemCoExecCount));
+      // VALU slots: SingleCycleVALU only
+      if (RequiredVALU1c > 0)
+        Slots.push_back(SlotRequirement(FlavorMasks::VALU1c, RequiredVALU1c));
+    }
     // Producer slot
     Slots.push_back(SlotRequirement(flavorToMask(ProducerFlavor), 1));
 
@@ -759,6 +771,7 @@ public:
   unsigned ShadowMixWMMAMinVALU1cVal;
   unsigned ShadowMixWMMAMinDSVal;
   unsigned ShadowMixWMMAMinSALUVal;
+  unsigned ShadowMixWMMAMinVMEMVal;
   bool ShadowMixRulesVal;
   bool ShadowPriorityWMMAOverDSVal;
   bool ShadowPriorityWMMAOverSALUVal;

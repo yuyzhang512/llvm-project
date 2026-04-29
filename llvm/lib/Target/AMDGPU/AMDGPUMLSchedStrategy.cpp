@@ -92,6 +92,21 @@ static cl::opt<unsigned> ShadowMixWMMAMinSALU(
              "SALU check. SALU can fill WMMA co-exec slots."),
     cl::init(0));
 
+static cl::opt<unsigned> ShadowMixWMMAMinVMEM(
+    "amdgpu-shadow-mix-wmma-min-vmem", cl::Hidden,
+    cl::desc("Minimum number of ready VMEM (FLAT/GLOBAL) instructions required "
+             "before scheduling a WMMA instruction. Setting to 0 disables "
+             "VMEM check. VMEM can fill WMMA co-exec slots."),
+    cl::init(0));
+
+static cl::opt<bool> CoexecWindowUseSingularFlavor(
+    "amdgpu-coexec-window-singular-flavor", cl::Hidden,
+    cl::desc("Use singular InstructionFlavor per slot instead of combined "
+             "FlavorMasks. When true, each slot requires exactly one flavor "
+             "type (e.g., DS only). When false (default), slots use bitmasks "
+             "allowing multiple flavor types (e.g., DS|SALU|VMEM)."),
+    cl::init(false));
+
 static cl::opt<unsigned> ShadowMixLookaheadDepth(
     "amdgpu-shadow-mix-lookahead-depth", cl::Hidden,
     cl::desc("Maximum dependency depth to search when looking for pending "
@@ -1063,11 +1078,17 @@ void CandidateHeuristics::calculateHiddenLatency(
 
 
 
-    ShadowMixWMMAMinDSVal = WMMACount ? (DSWMMACoexecution + SALUWMMACoexecution + VMEMCoexecution + WMMACount - 1) / WMMACount : 0;
+    ShadowMixWMMAMinDSVal = CoexecWindowUseSingularFlavor
+        ? (WMMACount ? ((DSWMMACoexecution + WMMACount - 1) / WMMACount) : 0)
+        : (WMMACount ? (DSWMMACoexecution + SALUWMMACoexecution + VMEMCoexecution + WMMACount - 1) / WMMACount : 0);
 
-    //errs() << "ShadowMixWMMAMinDSVal: " << ShadowMixWMMAMinDSVal << "\n";
+    ShadowMixWMMAMinSALUVal = CoexecWindowUseSingularFlavor
+        ? (WMMACount ? ((SALUWMMACoexecution + WMMACount - 1) / WMMACount) : 0)
+        : 0;
 
-    ShadowMixWMMAMinSALUVal = 0;//WMMACount ? SALUWMMACoexecution / WMMACount : 0;
+    ShadowMixWMMAMinVMEMVal = CoexecWindowUseSingularFlavor
+        ? (WMMACount ? ((VMEMCoexecution + WMMACount - 1) / WMMACount) : 0)
+        : 0;
 
     if (SALUCount) {
       unsigned SALUMultiCoexecution = std::min(CoexecWithMultiVALU, SALUCount);
@@ -1254,6 +1275,7 @@ void CandidateHeuristics::setParams() {
   ShadowMixWMMAMinSALUVal = IsPrologue    ? ShadowMixWMMAMinSALUPro.getValue()
                             : !IsEpilogue ? ShadowMixWMMAMinSALU.getValue()
                                           : ShadowMixWMMAMinSALUEpi.getValue();
+  ShadowMixWMMAMinVMEMVal = ShadowMixWMMAMinVMEM.getValue();
 
   ShadowMixRulesVal = IsPrologue    ? ShadowMixRulesPro.getValue()
                       : !IsEpilogue ? ShadowMixRules.getValue()
@@ -1382,7 +1404,8 @@ void CandidateHeuristics::populateCandidateWindow(CoexecWindow &Window,
         // window.
         CandWindows.emplace_back(HWUI.getType(), ShadowMixWMMAMinVALU1cVal,
                                  ShadowMixWMMAMinSALUVal, ShadowMixWMMAMinDSVal,
-                                 MixInfo);
+                                 ShadowMixWMMAMinVMEMVal, MixInfo,
+                                 CoexecWindowUseSingularFlavor);
         if (Flavor == InstructionFlavor::WMMA) {
           Window.copy(CandWindows[CandWindows.size() - 1]);
           return;
@@ -1393,7 +1416,8 @@ void CandidateHeuristics::populateCandidateWindow(CoexecWindow &Window,
                                  /*MinVALU1c*/ ShadowDeferTRANS32.getValue()
                                      ? ShadowMixTRANS32MinVALU1c
                                      : 0,
-                                 /*MinSALU*/ 0, /*MinDS*/ 0, MixInfo);
+                                 /*MinSALU*/ 0, /*MinDS*/ 0, /*MinVMEM*/ 0,
+                                 MixInfo, CoexecWindowUseSingularFlavor);
         if (Flavor == InstructionFlavor::TRANS) {
           Window.copy(CandWindows[CandWindows.size() - 1]);
           return;
@@ -1404,7 +1428,8 @@ void CandidateHeuristics::populateCandidateWindow(CoexecWindow &Window,
       // instructions with different repeat rate
       if (HWUI.getType() == InstructionFlavor::MultiCycleVALU) {
         CandWindows.emplace_back(HWUI.getType(), /*MinVALU1c*/ 0, /*MinSALU*/ 0,
-                                 /*MinDS*/ 0, MixInfo);
+                                 /*MinDS*/ 0, /*MinVMEM*/ 0, MixInfo,
+                                 CoexecWindowUseSingularFlavor);
         if (Flavor == InstructionFlavor::MultiCycleVALU) {
           Window.copy(CandWindows[CandWindows.size() - 1]);
           return;
