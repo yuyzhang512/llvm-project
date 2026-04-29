@@ -1,0 +1,80 @@
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1250 -run-pass=machine-scheduler -amdgpu-sched-strategy=coexec -amdgpu-shadow-mix=1 -debug-only=machine-scheduler 2>&1 %s | FileCheck %s
+# REQUIRES: asserts
+
+# Test that CoexecWindow uses bitmask-based slot requirements instead of individual flavors.
+# The MemCoExec slots should accept DS OR SALU OR VMEM instructions.
+
+# Verify slots are expressed as bitmasks, not individual flavors:
+# - Slot 0 should show Mask=MemCoExec (meaning DS|SALU|VMEM), not just "DS"
+# - This allows any instruction matching the mask to satisfy the slot
+# CHECK: CoexecWindow populated (Producer: WMMA)
+# CHECK-NEXT: Slot 0: Mask=MemCoExec, Required=1
+# CHECK-NEXT: Slot 1: Mask=V, Required=
+# CHECK-NEXT: Slot 2: Mask=W, Required=1
+
+# WMMACoolOff should check slots by mask, not by individual flavor.
+# When a slot can't be satisfied, the debug output shows the mask:
+# CHECK: WMMACoolOff: Can't satisfy slot (Mask=V
+
+--- |
+  define void @test_memcoexec_slot_accepts_ds() #0 { ret void }
+  define void @test_memcoexec_slot_accepts_salu() #0 { ret void }
+  define void @test_memcoexec_slot_accepts_vmem() #0 { ret void }
+
+  attributes #0 = { "amdgpu-waves-per-eu"="1,1" }
+...
+
+---
+# Test 1: WMMA with DS instruction coexecution
+# The MemCoExec slot should accept DS_READ instructions
+name: test_memcoexec_slot_accepts_ds
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:vreg_512_align2 = IMPLICIT_DEF
+    %1:vreg_512_align2 = IMPLICIT_DEF
+    %2:vreg_256_align2 = IMPLICIT_DEF
+    %3:vgpr_32_lo256 = IMPLICIT_DEF
+    %4:vgpr_32_lo256 = IMPLICIT_DEF
+    %5:vgpr_32 = IMPLICIT_DEF
+    %6:vreg_64_align2 = DS_READ_B64_gfx9 %5, 0, 0, implicit $exec
+    %7:vreg_256_align2 = V_WMMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_w32_threeaddr %0, %1, 0, %2, %3, %4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, implicit $exec
+    S_ENDPGM 0, implicit %6, implicit %7
+...
+
+---
+# Test 2: WMMA with SALU instruction coexecution
+# The MemCoExec slot should accept SALU instructions as an alternative to DS
+name: test_memcoexec_slot_accepts_salu
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:vreg_512_align2 = IMPLICIT_DEF
+    %1:vreg_512_align2 = IMPLICIT_DEF
+    %2:vreg_256_align2 = IMPLICIT_DEF
+    %3:vgpr_32_lo256 = IMPLICIT_DEF
+    %4:vgpr_32_lo256 = IMPLICIT_DEF
+    %5:sgpr_32 = IMPLICIT_DEF
+    %6:sgpr_32 = IMPLICIT_DEF
+    %7:sgpr_32 = S_ADD_U32 %5, %6, implicit-def $scc
+    %8:vreg_256_align2 = V_WMMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_w32_threeaddr %0, %1, 0, %2, %3, %4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, implicit $exec
+    S_ENDPGM 0, implicit %7, implicit %8
+...
+
+---
+# Test 3: WMMA with VMEM instruction coexecution
+# The MemCoExec slot should accept VMEM (GLOBAL_LOAD) instructions
+name: test_memcoexec_slot_accepts_vmem
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:vreg_512_align2 = IMPLICIT_DEF
+    %1:vreg_512_align2 = IMPLICIT_DEF
+    %2:vreg_256_align2 = IMPLICIT_DEF
+    %3:vgpr_32_lo256 = IMPLICIT_DEF
+    %4:vgpr_32_lo256 = IMPLICIT_DEF
+    %5:vreg_64_align2 = IMPLICIT_DEF
+    %6:vreg_64_align2 = GLOBAL_LOAD_DWORDX2 %5, 0, 0, implicit $exec
+    %7:vreg_256_align2 = V_WMMA_SCALE_F32_16X16X128_F8F6F4_f8_f8_w32_threeaddr %0, %1, 0, %2, %3, %4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, implicit $exec
+    S_ENDPGM 0, implicit %6, implicit %7
+...

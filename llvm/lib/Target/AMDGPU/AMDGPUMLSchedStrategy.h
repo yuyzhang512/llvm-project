@@ -99,6 +99,76 @@ namespace FlavorGroups {
   }
 }
 
+//===----------------------------------------------------------------------===//
+// FlavorMask - Bitmask representation of InstructionFlavor combinations
+//===----------------------------------------------------------------------===//
+
+/// Bitmask representation of InstructionFlavor combinations.
+/// Each bit corresponds to an InstructionFlavor enum value.
+using FlavorMask = uint16_t;
+
+namespace FlavorMasks {
+constexpr FlavorMask None = 0;
+constexpr FlavorMask WMMA =
+    1 << static_cast<unsigned>(InstructionFlavor::WMMA);
+constexpr FlavorMask VALU1c =
+    1 << static_cast<unsigned>(InstructionFlavor::SingleCycleVALU);
+constexpr FlavorMask TRANS =
+    1 << static_cast<unsigned>(InstructionFlavor::TRANS);
+constexpr FlavorMask CVT =
+    1 << static_cast<unsigned>(InstructionFlavor::MultiCycleVALU);
+constexpr FlavorMask VMEM =
+    1 << static_cast<unsigned>(InstructionFlavor::VMEM);
+constexpr FlavorMask DS = 1 << static_cast<unsigned>(InstructionFlavor::DS);
+constexpr FlavorMask SALU =
+    1 << static_cast<unsigned>(InstructionFlavor::SALU);
+constexpr FlavorMask DMA = 1 << static_cast<unsigned>(InstructionFlavor::DMA);
+constexpr FlavorMask Fence =
+    1 << static_cast<unsigned>(InstructionFlavor::Fence);
+constexpr FlavorMask Other =
+    1 << static_cast<unsigned>(InstructionFlavor::Other);
+constexpr FlavorMask All =
+    (1 << static_cast<unsigned>(InstructionFlavor::NUM_FLAVORS)) - 1;
+
+// WMMA slot combinations (matching GCNHazardRecognizer WMMASlotType)
+// MemCoExec slots: can co-issue VMEM, DS, or SALU
+constexpr FlavorMask MemCoExec = VMEM | DS | SALU;
+// ValuCoExec slots: can co-issue VMEM, DS, SALU, SingleCycleVALU, or TRANS
+constexpr FlavorMask ValuCoExec = VMEM | DS | SALU | VALU1c | TRANS;
+// ValuBlocked slots: can co-issue VMEM, DS, SALU, or next WMMA (no VALU/TRANS)
+constexpr FlavorMask ValuBlocked = VMEM | DS | SALU | WMMA;
+} // namespace FlavorMasks
+
+inline FlavorMask flavorToMask(InstructionFlavor F) {
+  return 1 << static_cast<unsigned>(F);
+}
+
+inline bool maskContainsFlavor(FlavorMask Mask, InstructionFlavor F) {
+  return Mask & flavorToMask(F);
+}
+
+std::string getMaskName(FlavorMask Mask);
+
+//===----------------------------------------------------------------------===//
+// SlotRequirement - Coexecution slot requirement
+//===----------------------------------------------------------------------===//
+
+/// Represents a single coexecution slot requirement.
+/// A slot can be satisfied by any instruction matching the FlavorMask.
+struct SlotRequirement {
+  FlavorMask AcceptedFlavors; // Bitmask of flavors that can fill this slot
+  unsigned RequiredCount;     // Number of instructions needed
+  unsigned ReadyCount;        // Number of ready instructions matching mask
+
+  SlotRequirement(FlavorMask Mask = FlavorMasks::None, unsigned Count = 0)
+      : AcceptedFlavors(Mask), RequiredCount(Count), ReadyCount(0) {}
+
+  bool isSatisfied() const { return ReadyCount >= RequiredCount; }
+  unsigned getDeficit() const {
+    return ReadyCount >= RequiredCount ? 0 : RequiredCount - ReadyCount;
+  }
+};
+
 /// AMDGPU-specific scheduling decision reasons. These provide more granularity
 /// than the generic CandReason enum for debugging purposes.
 enum class AMDGPUSchedReason : uint8_t {
@@ -465,68 +535,65 @@ private:
 public:
   InstructionFlavor WindowProducer = InstructionFlavor::Other;
 
-  // TODO -- should we be using lookahead to more accurately define costs?
   unsigned ReadyCost = 0;
   bool IsPopulated = false;
   bool IsActive = false;
   bool IsReady = false;
   bool ProducerIsReady = false;
-  SmallVector<unsigned, NumFlavors> RequiredCounts;
-  SmallVector<unsigned, NumFlavors> ReadyCounts;
+
+  // Slot-based requirements (indexed by slot number, not flavor).
+  // Each slot has a bitmask of acceptable flavors and a required count.
+  SmallVector<SlotRequirement, 8> Slots;
 
   unsigned StartCycle = 0;
   unsigned EndCycle = 0;
 
   void printStatus() {
-    errs() << "printing status\n";
-    for (unsigned I = 0; I < NumFlavors; I++) {
-      if (RequiredCounts[I]) {
-        InstructionFlavor Flavor = static_cast<InstructionFlavor>(I);
-        errs() << "Flavor: " << getFlavorName(Flavor)
-               << ", Required: " << RequiredCounts[I]
-               << ", Ready: " << ReadyCounts[I] << "\n";
-      }
+    errs() << "CoexecWindow status (Producer: " << getFlavorName(WindowProducer)
+           << ")\n";
+    for (unsigned I = 0; I < Slots.size(); ++I) {
+      errs() << "  Slot " << I << ": Mask=" << getMaskName(Slots[I].AcceptedFlavors)
+             << ", Required=" << Slots[I].RequiredCount
+             << ", Ready=" << Slots[I].ReadyCount
+             << (Slots[I].isSatisfied() ? " [OK]" : " [NEED]") << "\n";
     }
   }
 
+  // New constructor taking slot requirements as bitmasks
+  CoexecWindow(InstructionFlavor ProducerFlavor,
+               ArrayRef<SlotRequirement> SlotReqs, RegionMixInfo &MixInfo)
+      : WindowProducer(ProducerFlavor),
+        Slots(SlotReqs.begin(), SlotReqs.end()) {
+    // Add producer requirement as a slot
+    Slots.push_back(SlotRequirement(flavorToMask(ProducerFlavor), 1));
+    refreshMixInfo(MixInfo);
+    IsPopulated = true;
+  }
+
+  // Legacy constructor for backward compatibility
   CoexecWindow(InstructionFlavor ProducerFlavor, unsigned RequiredVALU1c,
                unsigned RequiredSALU, unsigned RequiredDS,
-               RegionMixInfo MixInfo)
-      : WindowProducer(ProducerFlavor), RequiredCounts(NumFlavors),
-        ReadyCounts(NumFlavors) {
-    ProducerIsReady = true;
-    for (unsigned I = 0; I < NumFlavors; I++) {
-      InstructionFlavor Flavor = static_cast<InstructionFlavor>(I);
-      ReadyCounts[I] = MixInfo.getReadyCount(Flavor);
-      if (Flavor == InstructionFlavor::DS)
-        ReadyCounts[I] += MixInfo.getReadyCount(InstructionFlavor::SALU);
-      RequiredCounts[I] = 0;
-      if (Flavor == InstructionFlavor::SALU) {
-        RequiredCounts[I] = RequiredSALU;
-      }
-      if (Flavor == InstructionFlavor::SingleCycleVALU) {
-        RequiredCounts[I] = RequiredVALU1c;
-      }
-      if (Flavor == InstructionFlavor::DS) {
-        RequiredCounts[I] = RequiredDS;
-      }
-      if (Flavor == WindowProducer) {
-        RequiredCounts[I] = 1;
-      }
+               RegionMixInfo &MixInfo)
+      : WindowProducer(ProducerFlavor) {
+    // Convert legacy parameters to slot requirements
+    // E slots (DS requirement): can hold DS OR SALU OR VMEM
+    if (RequiredDS > 0)
+      Slots.push_back(SlotRequirement(FlavorMasks::MemCoExec, RequiredDS));
+    // SALU slots: SALU only (separate from E slots)
+    if (RequiredSALU > 0)
+      Slots.push_back(SlotRequirement(FlavorMasks::SALU, RequiredSALU));
+    // VALU slots: SingleCycleVALU only
+    if (RequiredVALU1c > 0)
+      Slots.push_back(SlotRequirement(FlavorMasks::VALU1c, RequiredVALU1c));
+    // Producer slot
+    Slots.push_back(SlotRequirement(flavorToMask(ProducerFlavor), 1));
 
-      if (RequiredCounts[I] > ReadyCounts[I]) {
-        if (Flavor == ProducerFlavor)
-          ProducerIsReady = false;
-        ReadyCost += RequiredCounts[I] - ReadyCounts[I];
-      }
-    }
+    refreshMixInfo(MixInfo);
     IsPopulated = true;
-    IsReady = ReadyCost == 0;
   }
 
   void clear() {
-    RequiredCounts.clear();
-    ReadyCounts.clear();
+    Slots.clear();
     ReadyCost = 0;
     IsPopulated = false;
     EndCycle = 0;
@@ -537,8 +604,7 @@ public:
   }
 
   void copy(CoexecWindow &Other) {
-    RequiredCounts = Other.RequiredCounts;
-    ReadyCounts = Other.ReadyCounts;
+    Slots = Other.Slots;
     ReadyCost = Other.ReadyCost;
     IsPopulated = Other.IsPopulated;
     EndCycle = Other.EndCycle;
@@ -550,69 +616,97 @@ public:
 
   CoexecWindow() = default;
 
-  void refreshMixInfo(RegionMixInfo MixInfo) {
-    if (!IsPopulated) {
-      RequiredCounts.resize(NumFlavors);
-      ReadyCounts.resize(NumFlavors);
-    }
+  void refreshMixInfo(RegionMixInfo &MixInfo) {
+    ReadyCost = 0;
     ProducerIsReady = true;
 
-    unsigned ReadyCost = 0;
-    for (unsigned I = 0; I < NumFlavors; I++) {
-      InstructionFlavor Flavor = static_cast<InstructionFlavor>(I);
-      ReadyCounts[I] = MixInfo.getReadyCount(Flavor);
-      if (RequiredCounts[I] > ReadyCounts[I]) {
-        if (Flavor == WindowProducer)
+    for (auto &Slot : Slots) {
+      Slot.ReadyCount = 0;
+      // Sum ready counts for all flavors in the mask
+      for (unsigned I = 0; I < NumFlavors; ++I) {
+        InstructionFlavor F = static_cast<InstructionFlavor>(I);
+        if (maskContainsFlavor(Slot.AcceptedFlavors, F))
+          Slot.ReadyCount += MixInfo.getReadyCount(F);
+      }
+
+      if (!Slot.isSatisfied()) {
+        ReadyCost += Slot.getDeficit();
+        // Check if this is the producer slot
+        if (Slot.AcceptedFlavors == flavorToMask(WindowProducer))
           ProducerIsReady = false;
-        ReadyCost += RequiredCounts[I] - ReadyCounts[I];
       }
     }
-    IsReady = ReadyCost == 0;
+    IsReady = (ReadyCost == 0);
   }
 
-  // TODO -- should we be prioritizing based on some heuruistic?
-  // Currently, using hardcoded order.
+  // Get the first flavor needed to satisfy an unsatisfied slot
   InstructionFlavor getNeededFlavor() {
     if (!ProducerIsReady)
       return WindowProducer;
-    for (auto CandidateFlavor :
-         {InstructionFlavor::SingleCycleVALU, InstructionFlavor::DS,
-          InstructionFlavor::SALU}) {
-      unsigned Index = static_cast<unsigned>(CandidateFlavor);
-      if (RequiredCounts[Index] > ReadyCounts[Index])
-        return CandidateFlavor;
+
+    for (const auto &Slot : Slots) {
+      if (!Slot.isSatisfied()) {
+        // Return first flavor in the mask (prioritize certain flavors)
+        for (auto CandidateFlavor :
+             {InstructionFlavor::SingleCycleVALU, InstructionFlavor::DS,
+              InstructionFlavor::SALU, InstructionFlavor::VMEM}) {
+          if (maskContainsFlavor(Slot.AcceptedFlavors, CandidateFlavor))
+            return CandidateFlavor;
+        }
+      }
     }
     return InstructionFlavor::Other;
   }
 
+  // Get all flavors that could help satisfy unsatisfied slots
   void getNeededFlavors(SmallVectorImpl<InstructionFlavor> &NeededFlavors) {
     if (!ProducerIsReady) {
       NeededFlavors.push_back(WindowProducer);
       return;
     }
 
-    for (auto CandidateFlavor :
-         {InstructionFlavor::SingleCycleVALU, InstructionFlavor::DS,
-          InstructionFlavor::SALU}) {
-      unsigned Index = static_cast<unsigned>(CandidateFlavor);
-      if (RequiredCounts[Index] > ReadyCounts[Index])
-        NeededFlavors.push_back(CandidateFlavor);
+    for (const auto &Slot : Slots) {
+      if (!Slot.isSatisfied()) {
+        for (unsigned I = 0; I < NumFlavors; ++I) {
+          InstructionFlavor F = static_cast<InstructionFlavor>(I);
+          if (maskContainsFlavor(Slot.AcceptedFlavors, F) &&
+              !llvm::is_contained(NeededFlavors, F))
+            NeededFlavors.push_back(F);
+        }
+      }
+    }
+  }
+
+  // Get the bitmask of all flavors that can satisfy any unsatisfied slot
+  FlavorMask getNeededMask() {
+    if (!ProducerIsReady)
+      return flavorToMask(WindowProducer);
+
+    FlavorMask Mask = FlavorMasks::None;
+    for (const auto &Slot : Slots) {
+      if (!Slot.isSatisfied())
+        Mask |= Slot.AcceptedFlavors;
+    }
+    return Mask;
+  }
+
+  // Get unsatisfied slots with their deficits
+  void getUnsatisfiedSlots(
+      SmallVectorImpl<std::pair<FlavorMask, unsigned>> &UnsatisfiedSlots) {
+    for (const auto &Slot : Slots) {
+      if (!Slot.isSatisfied()) {
+        UnsatisfiedSlots.push_back({Slot.AcceptedFlavors, Slot.getDeficit()});
+      }
     }
   }
 
   void schedule(MachineInstr *MI) {
-    /*
-    if (MI == WindowProducer) {
-      assert(!IsActive);
-      WindowProducer = nullptr;
-      IsActive = true;
-      return;
-    }*/
+    // Placeholder for future implementation
   }
 
   bool isReady() {
-    for (unsigned I = 0; I < NumFlavors; I++) {
-      if (RequiredCounts[I] > ReadyCounts[I])
+    for (const auto &Slot : Slots) {
+      if (!Slot.isSatisfied())
         return false;
     }
     return true;

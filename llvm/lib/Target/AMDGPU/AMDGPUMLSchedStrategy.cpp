@@ -106,7 +106,7 @@ static cl::opt<unsigned> ShadowMixMaxBlockingCost(
         "Maximum number of blocking instructions acceptable when searching "
         "for pending co-execution candidates. Targets with higher cost are "
         "ignored as too expensive to reach."),
-    cl::init(10));
+    cl::init(11));
 
 static cl::opt<unsigned> ShadowMixMaxVisited(
   "amdgpu-shadow-mix-max-visited", cl::Hidden,
@@ -671,6 +671,63 @@ findNearestPendingByFlavor(const RegionMixInfo &MixInfo, InstructionFlavor Flavo
   return {BestSU, BestCost};
 }
 
+/// Find pending SUnits matching a FlavorMask and compute blocking costs.
+/// Returns the number of SUnits found within the cost budget.
+/// AlreadyFound is used to avoid double-counting SUnits across multiple calls.
+/// FoundSUs is populated with the SUnits found (for exclusion in future calls).
+static unsigned findPendingByMask(const RegionMixInfo &MixInfo, FlavorMask Mask,
+                                  unsigned RequiredCount, unsigned MaxDepth,
+                                  unsigned MaxCost, unsigned MaxVisited,
+                                  unsigned MaxCandidates,
+                                  DenseSet<SUnit *> &AlreadyFound,
+                                  SmallVectorImpl<SUnit *> *FoundSUs = nullptr) {
+  unsigned NumFlavors = static_cast<unsigned>(InstructionFlavor::NUM_FLAVORS);
+  unsigned Found = 0;
+  unsigned CandidatesChecked = 0;
+
+  // Collect candidate SUnits from all flavors in the mask
+  SmallVector<std::pair<SUnit *, unsigned>, 16> Candidates;
+
+  for (unsigned I = 0; I < NumFlavors && Found < RequiredCount; ++I) {
+    InstructionFlavor F = static_cast<InstructionFlavor>(I);
+    if (!maskContainsFlavor(Mask, F))
+      continue;
+
+    for (SUnit *SU : MixInfo.getSUs(F)) {
+      if (SU->isScheduled || SU->isTopReady())
+        continue;
+      if (AlreadyFound.contains(SU))
+        continue;
+      if (++CandidatesChecked > MaxCandidates)
+        break;
+
+      auto [Cost, Truncated] =
+          computeBoundedBlockingCount(SU, MaxDepth, MaxVisited);
+      if (Truncated || Cost > MaxCost)
+        continue;
+
+      Candidates.push_back({SU, Cost});
+    }
+  }
+
+  // Sort by cost (lowest first)
+  llvm::sort(Candidates,
+             [](const auto &A, const auto &B) { return A.second < B.second; });
+
+  // Take the best candidates up to RequiredCount
+  for (const auto &[SU, Cost] : Candidates) {
+    if (Found >= RequiredCount)
+      break;
+    if (AlreadyFound.insert(SU).second) {
+      ++Found;
+      if (FoundSUs)
+        FoundSUs->push_back(SU);
+    }
+  }
+
+  return Found;
+}
+
 /// Check if scheduling SU would help enable a target SU (is on path to it).
 static bool wouldHelpEnable(SUnit *SU, SUnit *TargetSU,
                             ScheduleDAGInstrs *DAG) {
@@ -726,6 +783,29 @@ InstructionFlavor llvm::classifyFlavor(const MachineInstr *MI,
     return InstructionFlavor::SALU;
 
   return InstructionFlavor::Other;
+}
+
+std::string llvm::getMaskName(FlavorMask Mask) {
+  using namespace FlavorMasks;
+  if (Mask == None)
+    return "None";
+  if (Mask == MemCoExec)
+    return "MemCoExec";
+  if (Mask == ValuCoExec)
+    return "ValuCoExec";
+  if (Mask == ValuBlocked)
+    return "ValuBlocked";
+
+  std::string Result;
+  for (unsigned I = 0;
+       I < static_cast<unsigned>(InstructionFlavor::NUM_FLAVORS); ++I) {
+    if (Mask & (1 << I)) {
+      if (!Result.empty())
+        Result += "|";
+      Result += getFlavorShortName(static_cast<InstructionFlavor>(I)).str();
+    }
+  }
+  return Result;
 }
 
 static unsigned getFlavorCycles(const MachineInstr *MI, InstructionFlavor F,
@@ -894,6 +974,8 @@ void CandidateHeuristics::calculateHiddenLatency(
   unsigned EXPCount = HWUInfo[(int)InstructionFlavor::DS].size();
   unsigned SingleCycleVALUCount =
       HWUInfo[(int)InstructionFlavor::SingleCycleVALU].size();
+    unsigned VMEMCount =
+      HWUInfo[(int)InstructionFlavor::VMEM].size();
 
   // FIXME -- what if we have multiple types of WMMA?
   unsigned ESlotCount = 0;
@@ -974,9 +1056,14 @@ void CandidateHeuristics::calculateHiddenLatency(
 
     unsigned SALUWMMACoexecution = std::min(WMMAESlot, SALUCount);
     SALUCount -= SALUWMMACoexecution;
+    WMMAESlot -= SALUWMMACoexecution;
+
+    unsigned VMEMCoexecution = std::min(WMMAESlot, VMEMCount);
+    VMEMCount -= VMEMCoexecution;
 
 
-    ShadowMixWMMAMinDSVal = WMMACount ? (DSWMMACoexecution + SALUWMMACoexecution) / WMMACount : 0;
+
+    ShadowMixWMMAMinDSVal = WMMACount ? (DSWMMACoexecution + SALUWMMACoexecution + VMEMCoexecution + WMMACount - 1) / WMMACount : 0;
 
     //errs() << "ShadowMixWMMAMinDSVal: " << ShadowMixWMMAMinDSVal << "\n";
 
@@ -1003,7 +1090,7 @@ void CandidateHeuristics::calculateHiddenLatency(
 
     WMMAISlot -= VALUWMMACoexecution;
 
-    ShadowMixWMMAMinVALU1cVal = WMMACount ? (WMMACount * ISlotCount - WMMAISlot) / WMMACount : 0;
+    ShadowMixWMMAMinVALU1cVal = WMMACount ? (WMMACount * ISlotCount - WMMAISlot + WMMACount - 1) / WMMACount : 0;
 
     SingleCycleVALUCount -= VALUWMMACoexecution;
 
@@ -1050,28 +1137,34 @@ bool CandidateHeuristics::tryWMMACoolOff(
   MixInfo.updateReadyCounts();
   TempWindow.refreshMixInfo(MixInfo);
   populateCandidateWindow(TempWindow, InstructionFlavor::WMMA);
-  bool WMMAWindowIsReady = TempWindow.IsReady;
 
   if (!TempWindow.IsReady) {
-    SmallVector<InstructionFlavor, 4> NeededFlavors;
-    TempWindow.getNeededFlavors(NeededFlavors);
-    // Neither candidate directly enables any of the needed flavors, look eahd.
-    for (InstructionFlavor &NeededFlavor : NeededFlavors) {
+    // Get unsatisfied slots with their masks and deficits
+    SmallVector<std::pair<FlavorMask, unsigned>, 4> UnsatisfiedSlots;
+    TempWindow.getUnsatisfiedSlots(UnsatisfiedSlots);
 
-      auto [NearestTarget, Cost] = findNearestPendingByFlavor(
-          MixInfo, NeededFlavor, ShadowMixLookaheadDepthVal,
+    // Track SUnits we've already found to avoid double-counting across slots
+    DenseSet<SUnit *> AlreadyFound;
+
+    // For each unsatisfied slot, check if we can enable enough instructions
+    // from ANY flavor in the slot's mask within acceptable cost
+    for (const auto &[Mask, Deficit] : UnsatisfiedSlots) {
+      unsigned Found = findPendingByMask(
+          MixInfo, Mask, Deficit, ShadowMixLookaheadDepthVal,
           ShadowMixMaxBlockingCostVal, ShadowMixMaxVisitedVal,
-          ShadowMixMaxCandidatesVal);
+          ShadowMixMaxCandidatesVal, AlreadyFound);
 
-      // It is too much effort to try to make the window ready, proceed with the
-      // WMMA
-      if (!NearestTarget) {
+      // If we can't find enough instructions for this slot's mask,
+      // it's too much effort - proceed with WMMA
+      if (Found < Deficit) {
+        LLVM_DEBUG(dbgs() << "  WMMACoolOff: Can't satisfy slot (Mask="
+                          << getMaskName(Mask) << ", need " << Deficit
+                          << ", found " << Found << ")\n");
         return false;
       }
     }
 
-    // The consumers are not available, and it is not much effort to make them
-    // available
+    // All slots can be satisfied within acceptable cost - defer WMMA
     if (TryIsWMMA) {
       if (Cand.Reason > GenericSchedulerBase::RegCritical) {
         Cand.Reason = GenericSchedulerBase::RegCritical;
@@ -1347,6 +1440,17 @@ void CandidateHeuristics::populateCandidateWindow(CoexecWindow &Window,
   });
 
   Window.copy(CandWindows[0]);
+
+  LLVM_DEBUG({
+    dbgs() << "  CoexecWindow populated (Producer: "
+           << getFlavorName(Window.WindowProducer) << ")\n";
+    for (unsigned I = 0; I < Window.Slots.size(); ++I) {
+      dbgs() << "    Slot " << I
+             << ": Mask=" << getMaskName(Window.Slots[I].AcceptedFlavors)
+             << ", Required=" << Window.Slots[I].RequiredCount
+             << ", Ready=" << Window.Slots[I].ReadyCount << "\n";
+    }
+  });
 }
 
 void CandidateHeuristics::collectUse(GCNHazardRecognizer *HazardRec) {
@@ -2049,11 +2153,12 @@ bool CandidateHeuristics::tryVALUCoexecSlot(
 }
 
 bool CandidateHeuristics::coexecWindowIsReady(CoexecWindow *Window,
-                                              SchedBoundary *Zone, unsigned &MaxStall) {
+                                              SchedBoundary *Zone,
+                                              unsigned &MaxStall) {
   if (!Window->IsReady)
     return false;
 
-  unsigned MaxFlavors = static_cast<unsigned>(InstructionFlavor::NUM_FLAVORS);
+  unsigned NumFlavors = static_cast<unsigned>(InstructionFlavor::NUM_FLAVORS);
 
   InstructionFlavor Producer = Window->WindowProducer;
   auto ProducerSUs = MixInfo.getSUs(Producer);
@@ -2066,57 +2171,40 @@ bool CandidateHeuristics::coexecWindowIsReady(CoexecWindow *Window,
       MinStall = SUStall;
   }
 
-  unsigned Add = 1;
-
-  for (unsigned I = 0; I < MaxFlavors; I++) {
-    unsigned RequiredCount = Window->RequiredCounts[I];
-    if (!RequiredCount)
-      continue;
-
-    InstructionFlavor Flavor = static_cast<InstructionFlavor>(I);
-    auto FlavorSUs = MixInfo.getSUs(Flavor);
-
+  // Check each slot can be satisfied with low-stall instructions
+  for (const auto &Slot : Window->Slots) {
     unsigned ReadyCount = 0;
-    for (auto SU : FlavorSUs) {
+    unsigned Add = 1;
+
+    // Check all flavors in the slot's mask
+    for (unsigned I = 0; I < NumFlavors; ++I) {
+      InstructionFlavor F = static_cast<InstructionFlavor>(I);
+      if (!maskContainsFlavor(Slot.AcceptedFlavors, F))
+        continue;
+
+      // For WMMA producer with VALU slots, allow more stall tolerance
       if (Producer == InstructionFlavor::WMMA &&
-          Flavor == InstructionFlavor::SingleCycleVALU) {
+          F == InstructionFlavor::SingleCycleVALU) {
         Add = 3;
       }
-      if (!SU->isScheduled && SU->isTopReady()) {
-        auto Stall = getLatencyStallCycles(SU, Zone);
-        if (Stall > MaxStall)
-          MaxStall = Stall;
-        if (Stall <= MinStall + Add) {
-          ++ReadyCount;
+
+      for (auto *SU : MixInfo.getSUs(F)) {
+        if (!SU->isScheduled && SU->isTopReady()) {
+          auto Stall = getLatencyStallCycles(SU, Zone);
+          if (Stall > MaxStall)
+            MaxStall = Stall;
+          if (Stall <= MinStall + Add) {
+            ++ReadyCount;
+          }
         }
+        if (ReadyCount >= Slot.RequiredCount)
+          break;
       }
-      if (ReadyCount >= RequiredCount)
+      if (ReadyCount >= Slot.RequiredCount)
         break;
     }
 
-    if (Flavor == InstructionFlavor::DS) {
-      auto FlavorSUs = MixInfo.getSUs(InstructionFlavor::SALU);
-    for (auto SU : FlavorSUs) {
-      if (Producer == InstructionFlavor::WMMA &&
-          Flavor == InstructionFlavor::SingleCycleVALU) {
-        Add = 3;
-      }
-      if (!SU->isScheduled && SU->isTopReady()) {
-        auto Stall = getLatencyStallCycles(SU, Zone);
-        if (Stall > MaxStall)
-          MaxStall = Stall;
-        if (Stall <= MinStall + Add) {
-          ++ReadyCount;
-        }
-      }
-      if (ReadyCount >= RequiredCount)
-        break;
-    }
-    }
-
-
-
-    if (ReadyCount < RequiredCount)
+    if (ReadyCount < Slot.RequiredCount)
       return false;
   }
   return true;
