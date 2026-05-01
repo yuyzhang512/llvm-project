@@ -742,7 +742,7 @@ public:
   SmallVector<HardwareUnitInfo, 8> HWUInfo;
 
   SmallVector<SUnit *, 16> SchedTDM;
-
+  SmallVector<SUnit *, 16> SchedDMA;
   SmallVector<SUnit *, 16> SchedEXP;
 
   RegionMixInfo MixInfo;
@@ -855,7 +855,7 @@ protected:
   SmallVector<HardwareUnitInfo, 8> HWUInfo;
 
   SmallVector<SUnit *, 16> SchedTDM;
-
+  SmallVector<SUnit *, 16> SchedDMA;
   SmallVector<SUnit *, 16> SchedEXP;
 
   RegionMixInfo MixInfo;
@@ -906,7 +906,7 @@ protected:
   SmallVector<HardwareUnitInfo, 8> HWUInfo;
 
   SmallVector<SUnit *, 16> SchedTDM;
-
+  SmallVector<SUnit *, 16> SchedDMA;
   SmallVector<SUnit *, 16> SchedEXP;
 
   RegionMixInfo MixInfo;

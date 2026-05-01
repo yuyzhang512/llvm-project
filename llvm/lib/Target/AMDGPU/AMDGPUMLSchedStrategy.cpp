@@ -594,6 +594,12 @@ static cl::opt<unsigned, false, IncomingDSLatencyPercentParser> IncomingLoadLate
     cl::desc(
         "Percent of maximum load latency we should try to cover for loop carried loads"));
 
+static cl::opt<unsigned> TDMPrefetchPad(
+    "amdgpu-tdm-prefetch-pad-cycles", cl::Hidden,
+    cl::desc("How many cycles of padding we want between tdm and prefetch instructions."),
+    cl::init(250));
+
+
 //===----------------------------------------------------------------------===//
 // Shadow Mix Lookahead Helpers
 //===----------------------------------------------------------------------===//
@@ -1381,6 +1387,7 @@ void CandidateHeuristics::initialize(ScheduleDAGMI *SchedDAG,
   SchedDSR.clear();
   SchedMFMA.clear();
   SchedTDM.clear();
+  SchedDMA.clear();
 
   CurrentWindow.clear();
   NextWindow.clear();
@@ -1486,6 +1493,7 @@ void CandidateHeuristics::collectUse(GCNHazardRecognizer *HazardRec) {
   SchedDSR.clear();
   SchedMFMA.clear();
   SchedTDM.clear();
+  SchedDMA.clear();
   SchedEXP.clear();
   MixInfo.reset();
 
@@ -1681,6 +1689,13 @@ unsigned CandidateHeuristics::getLatencyStallCycles(SUnit *SU,
         ReadyCycle = std::max(ReadyCycle, PredSU->TopReadyCycle +
                                               ST.getVDstThreshold(DAG->MF));
       }
+    }
+  }
+
+  else if (MI->getOpcode() == AMDGPU::GLOBAL_PREFETCH_B8) {
+    if (SchedDMA.size()) {
+      SUnit *PrevTDM = SchedDMA[SchedDMA.size() - 1];
+      ReadyCycle = std::max(ReadyCycle, PrevTDM->TopReadyCycle + TDMPrefetchPad);
     }
   }
 
@@ -1881,6 +1896,14 @@ bool CandidateHeuristics::tryAsyncPipe(
         ReadyCycle = std::max(ReadyCycle, DSLatencyForFenceVal);
       }
     }
+
+    else if (MI->getOpcode() == AMDGPU::GLOBAL_PREFETCH_B8) {
+      if (SchedDMA.size()) {
+        SUnit *PrevTDM = SchedDMA[SchedDMA.size() - 1];
+        ReadyCycle = std::max(ReadyCycle, PrevTDM->TopReadyCycle + TDMPrefetchPad);
+      }
+    }
+
     if (ReadyCycle > CurrCycle)
       return ReadyCycle - CurrCycle;
 
@@ -1896,7 +1919,7 @@ bool CandidateHeuristics::tryAsyncPipe(
     return const_cast<SIInstrInfo *>(SII)->isLDSDMA(Opc)||
            Opc == AMDGPU::S_BARRIER_WAIT ||
            Opc == AMDGPU::S_BARRIER_SIGNAL_IMM || Opc == AMDGPU::ATOMIC_FENCE ||
-           Opc == AMDGPU::S_WAIT_TENSORCNT || Opc == AMDGPU::S_WAIT_DSCNT;
+           Opc == AMDGPU::S_WAIT_TENSORCNT || Opc == AMDGPU::S_WAIT_DSCNT || Opc == AMDGPU::GLOBAL_PREFETCH_B8;
   };
 
   bool CandIsAsync = isAsyncPipe(Cand);
@@ -2795,6 +2818,10 @@ void CandidateHeuristics::schedNode(SUnit *SU, GCNHazardRecognizer *HazardRec) {
     auto Opc = MI->getOpcode();
     if (Opc == AMDGPU::ATOMIC_FENCE || Opc == AMDGPU::S_WAIT_ASYNCCNT || Opc == AMDGPU::S_WAIT_TENSORCNT || Opc == AMDGPU::S_WAIT_DSCNT || Opc == AMDGPU::S_BARRIER_WAIT || Opc == AMDGPU::S_BARRIER_SIGNAL_IMM) {
       SchedTDM.push_back(SU);
+    }
+
+    if (SII->isLDSDMA(*MI)) {
+      SchedDMA.push_back(SU);
     }
 
     if (SII->isTRANS(*MI)) {
