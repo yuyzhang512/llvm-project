@@ -248,6 +248,8 @@ public:
 
   bool tryNarrowMathIfNoOverflow(Instruction *I);
 
+  bool foldCoupledPhiPair(PHINode &PN);
+
 public:
   bool visitFDiv(BinaryOperator &I);
 
@@ -1883,7 +1885,122 @@ private:
   SmallDenseMap<std::pair<BasicBlock *, Value *>, Value *> SlicedVals;
 };
 
+// Fuse a pair of coupled i64 phis introduced by InstCombine's struct-phi
+// narrowing, where one phi tracks the full value and the other tracks the
+// high half (with an invariant high bit such as AMDGPU TDM VALID).
+//
+// Pattern:
+//   P1 = phi i64 [init_full, preheader], [next_full, latch]
+//   P2 = phi i64 [init_high, preheader], [next_high, latch]
+//   %low = and i64 P1, 0xFFFFFFFF
+//   %recombined = or i64 %low, P2
+//   ...
+//   next_high = and i64 next_full, 0xFFFFFFFF00000000
+//
+// At iter 1+, P1 == recombined. Only iter 0 disagrees because P1's preheader
+// lacks the invariant high bits that P2 carries. Fix: merge the preheader
+// value so P1 carries the high bits from iter 0, then replace recombined
+// with P1 directly. P2, the AND, and the OR become dead.
+bool AMDGPUCodeGenPrepareImpl::foldCoupledPhiPair(PHINode &PN) {
+  if (!PN.getType()->isIntegerTy(64) || PN.getNumIncomingValues() != 2)
+    return false;
+
+  const APInt LoMask = APInt(64, 0xFFFFFFFFULL);
+  const APInt HiMask = APInt(64, 0xFFFFFFFF00000000ULL);
+
+  // Find a use of PN that is `and PN, 0xFFFFFFFF`.
+  BinaryOperator *AndInst = nullptr;
+  for (User *U : PN.users()) {
+    auto *BO = dyn_cast<BinaryOperator>(U);
+    if (!BO || BO->getOpcode() != Instruction::And)
+      continue;
+    ConstantInt *CI;
+    if (match(BO, m_c_And(m_Specific(&PN), m_ConstantInt(CI))) &&
+        CI->getValue() == LoMask) {
+      AndInst = BO;
+      break;
+    }
+  }
+  if (!AndInst || !AndInst->hasOneUse())
+    return false;
+
+  // All other users of PN must only read the low 32 bits, so that changing
+  // PN's high bits at iter 0 is safe.
+  for (User *U : PN.users()) {
+    if (U == AndInst)
+      continue;
+    if (auto *Trunc = dyn_cast<TruncInst>(U))
+      if (Trunc->getDestTy()->isIntegerTy(32))
+        continue;
+    return false;
+  }
+
+  // The AND must feed an OR with another phi (P2) in the same block.
+  auto *OrInst = dyn_cast<BinaryOperator>(AndInst->user_back());
+  if (!OrInst || OrInst->getOpcode() != Instruction::Or)
+    return false;
+
+  Value *OtherOp = (OrInst->getOperand(0) == AndInst) ? OrInst->getOperand(1)
+                                                       : OrInst->getOperand(0);
+  auto *P2 = dyn_cast<PHINode>(OtherOp);
+  if (!P2 || P2->getParent() != PN.getParent() ||
+      P2->getNumIncomingValues() != 2)
+    return false;
+
+  // Find the latch index: P2's latch value must be `and P1_latch, hi_mask`.
+  for (unsigned I = 0; I < 2; ++I) {
+    Value *P1Latch = PN.getIncomingValue(I);
+    Value *P2Latch = P2->getIncomingValue(I);
+    if (P2->getIncomingBlock(I) != PN.getIncomingBlock(I))
+      continue;
+
+    Value *Inner;
+    ConstantInt *MaskCI;
+    if (!match(P2Latch, m_And(m_Value(Inner), m_ConstantInt(MaskCI))))
+      continue;
+    if (MaskCI->getValue() != HiMask)
+      continue;
+    if (Inner != P1Latch)
+      continue;
+
+    unsigned PreIdx = 1 - I;
+    Value *P1Pre = PN.getIncomingValue(PreIdx);
+    Value *P2Pre = P2->getIncomingValue(PreIdx);
+    BasicBlock *PreBB = PN.getIncomingBlock(PreIdx);
+
+    // Safety: P2's preheader value must have zero low 32 bits, otherwise
+    // trunc-to-i32 users of PN would see wrong values at iteration 0.
+    KnownBits P2PreKB = computeKnownBits(P2Pre, SQ.getWithInstruction(
+                                             PreBB->getTerminator()));
+    if ((P2PreKB.Zero & LoMask) != LoMask)
+      return false;
+
+    // Build merged preheader: (P1Pre & 0xFFFFFFFF) | P2Pre
+    IRBuilder<> Builder(PreBB->getTerminator());
+    Value *LowOfPre = Builder.CreateAnd(
+        P1Pre, ConstantInt::get(PN.getType(), LoMask),
+        PN.getName() + ".initlow");
+    Value *MergedInit = Builder.CreateOr(
+        LowOfPre, P2Pre, PN.getName() + ".initmerged");
+
+    PN.setIncomingValue(PreIdx, MergedInit);
+    OrInst->replaceAllUsesWith(&PN);
+
+    DeadVals.push_back(OrInst);
+    DeadVals.push_back(AndInst);
+    if (P2->use_empty())
+      DeadVals.push_back(P2);
+
+    return true;
+  }
+
+  return false;
+}
+
 bool AMDGPUCodeGenPrepareImpl::visitPHINode(PHINode &I) {
+  if (foldCoupledPhiPair(I))
+    return true;
+
   // Break-up fixed-vector PHIs into smaller pieces.
   // Default threshold is 32, so it breaks up any vector that's >32 bits into
   // its elements, or into 32-bit pieces (for 8/16 bit elts).

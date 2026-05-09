@@ -543,6 +543,9 @@ extern char &SIInsertWaitcntsID;
 void initializeSIFormMemoryClausesLegacyPass(PassRegistry &);
 extern char &SIFormMemoryClausesID;
 
+void initializeSITDMDescHoistLegacyPass(PassRegistry &);
+extern char &SITDMDescHoistLegacyID;
+
 void initializeSIPostRABundlerLegacyPass(PassRegistry &);
 extern char &SIPostRABundlerLegacyID;
 

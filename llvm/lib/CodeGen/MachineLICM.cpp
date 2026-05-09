@@ -589,6 +589,29 @@ void MachineLICMImpl::HoistRegionPostRA(MachineLoop *CurLoop) {
   if (!Preheader)
     return;
 
+  // Pre-pass: split wide physical register COPYs in the loop body into
+  // individual sub-register COPYs. This enables post-RA LICM to hoist
+  // invariant sub-register copies independently when some sub-registers are
+  // loop-variant and others are not.
+  // for (MachineBasicBlock *BB : CurLoop->getBlocks()) {
+  //   for (MachineInstr &MI : make_early_inc_range(*BB)) {
+  //     if (!MI.isCopy())
+  //       continue;
+  //     Register DstReg = MI.getOperand(0).getReg();
+  //     Register SrcReg = MI.getOperand(1).getReg();
+  //     if (!DstReg.isPhysical() || !SrcReg.isPhysical())
+  //       continue;
+  //     const TargetRegisterClass *DstRC = TRI->getMinimalPhysRegClass(DstReg);
+  //     const TargetRegisterClass *SrcRC = TRI->getMinimalPhysRegClass(SrcReg);
+  //     if (TRI->getRegSizeInBits(*DstRC) <= 64 ||
+  //         TRI->getRegSizeInBits(*SrcRC) <= 64)
+  //       continue;
+  //     LLVM_DEBUG(dbgs() << "LICM: Splitting wide COPY for sub-reg hoisting: "
+  //                       << MI);
+  //     TII->lowerCopy(&MI, TRI);
+  //   }
+  // }
+
   unsigned NumRegUnits = TRI->getNumRegUnits();
   BitVector RUDefs(NumRegUnits);     // RUs defined once in the loop.
   BitVector RUClobbers(NumRegUnits); // RUs defined more than once.
@@ -628,10 +651,17 @@ void MachineLICMImpl::HoistRegionPostRA(MachineLoop *CurLoop) {
     // Only treat live-in registers that are also defined within the loop as
     // non-invariant. Live-ins that are solely defined outside the loop are
     // loop-invariant and should not block hoisting.
+    // Respect the lane mask on live-ins: only consider reg units whose lanes
+    // overlap the live-in mask, so that a partial live-in of a super-register
+    // does not falsely mark unrelated sub-registers as loop-defined.
     for (const auto &LI : BB->liveins()) {
-      for (MCRegUnit Unit : TRI->regunits(LI.PhysReg))
-        if (LoopRUDefs.test(static_cast<unsigned>(Unit)))
-          RUDefs.set(static_cast<unsigned>(Unit));
+      for (MCRegUnitMaskIterator RUMI(LI.PhysReg, TRI); RUMI.isValid();
+           ++RUMI) {
+        auto [Unit, UnitMask] = *RUMI;
+        if ((UnitMask & LI.LaneMask).any())
+          if (LoopRUDefs.test(static_cast<unsigned>(Unit)))
+            RUDefs.set(static_cast<unsigned>(Unit));
+      }
     }
 
     // Funclet entry blocks will clobber all registers

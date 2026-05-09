@@ -337,6 +337,78 @@ bool InstCombinerImpl::foldIntegerTypedPHI(PHINode &PN) {
   return true;
 }
 
+Instruction *InstCombinerImpl::foldHighHalfPhiPair(PHINode &PN) {
+  if (!PN.getType()->isIntegerTy(64) || PN.getNumIncomingValues() != 2)
+    return nullptr;
+  BinaryOperator *AndInst = nullptr;
+  for (User *U : PN.users()) {
+    auto *BO = dyn_cast<BinaryOperator>(U);
+    if (!BO || BO->getOpcode() != Instruction::And)
+      continue;
+    ConstantInt *CI = dyn_cast<ConstantInt>(BO->getOperand(1));
+    if (CI && CI->getValue() == APInt(64, 0xFFFFFFFFULL)) {
+      AndInst = BO;
+      break;
+    }
+  }
+  if (!AndInst || !AndInst->hasOneUse())
+    return nullptr;
+  for (User *U : PN.users()) {
+    if (U == AndInst)
+      continue;
+    if (auto *Trunc = dyn_cast<TruncInst>(U))
+      if (Trunc->getDestTy()->isIntegerTy(32))
+        continue;
+    return nullptr;
+  }
+  auto *OrInst = dyn_cast<BinaryOperator>(AndInst->user_back());
+  if (!OrInst || OrInst->getOpcode() != Instruction::Or)
+    return nullptr;
+  Value *OtherOp =
+      (OrInst->getOperand(0) == AndInst) ? OrInst->getOperand(1)
+                                         : OrInst->getOperand(0);
+  auto *P2 = dyn_cast<PHINode>(OtherOp);
+  if (!P2 || P2->getParent() != PN.getParent() ||
+      P2->getNumIncomingValues() != 2)
+    return nullptr;
+  for (unsigned I = 0; I < 2; ++I) {
+    Value *P1Latch = PN.getIncomingValue(I);
+    Value *P2Latch = P2->getIncomingValue(I);
+    BasicBlock *PreBB = PN.getIncomingBlock(1 - I);
+    if (P2->getIncomingBlock(I) != PN.getIncomingBlock(I))
+      continue;
+    Value *Inner;
+    ConstantInt *HighMaskCI;
+    if (!match(P2Latch,
+               m_And(m_Value(Inner), m_ConstantInt(HighMaskCI))))
+      continue;
+    if (HighMaskCI->getValue() != APInt(64, 0xFFFFFFFF00000000ULL))
+      continue;
+    if (Inner != P1Latch)
+      continue;
+    Value *P1Pre = PN.getIncomingValue(1 - I);
+    Value *P2Pre = P2->getIncomingValue(1 - I);
+    IRBuilderBase::InsertPointGuard Guard(Builder);
+    Builder.SetInsertPoint(PreBB->getTerminator());
+    Value *LowOfPre = Builder.CreateAnd(
+        P1Pre, ConstantInt::get(PN.getType(), 0xFFFFFFFFULL),
+        PN.getName() + ".initlow");
+    Value *MergedInit = Builder.CreateOr(
+        LowOfPre, P2Pre, PN.getName() + ".initmerged");
+    PN.setIncomingValue(1 - I, MergedInit);
+    replaceInstUsesWith(*OrInst, &PN);
+    Worklist.pushUsersToWorkList(*OrInst);
+    eraseInstFromFunction(*OrInst);
+    eraseInstFromFunction(*AndInst);
+    if (P2->use_empty())
+      eraseInstFromFunction(*P2);
+    else
+      Worklist.add(P2);
+    return &PN;
+  }
+  return nullptr;
+}
+
 // Remove RoundTrip IntToPtr/PtrToInt Cast on PHI-Operand and
 // fold Phi-operand to bitcast.
 Instruction *InstCombinerImpl::foldPHIArgIntToPtrToPHI(PHINode &PN) {
@@ -1414,6 +1486,9 @@ Instruction *InstCombinerImpl::visitPHINode(PHINode &PN) {
 
   if (Instruction *Result = foldPHIArgIntToPtrToPHI(PN))
     return Result;
+
+  // if (Instruction *Result = foldHighHalfPhiPair(PN))
+  //   return Result;
 
   // If all PHI operands are the same operation, pull them through the PHI,
   // reducing code size.

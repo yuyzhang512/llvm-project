@@ -15000,6 +15000,31 @@ SDValue SITargetLowering::performOrCombine(SDNode *N,
     return SDValue();
   }
 
+  // or (shl (fshl a, b, c), c), (and b, (1<<c)-1) -> b
+  // The shl kills the upper bits from 'a' in the fshl, leaving (b>>c)<<c,
+  // which combined with the masked lower bits of b reconstructs b.
+  // for (unsigned I = 0; I < 2; ++I) {
+  //   SDValue ShlOp = I == 0 ? LHS : RHS;
+  //   SDValue AndOp = I == 0 ? RHS : LHS;
+  //   if (ShlOp.getOpcode() == ISD::SHL && AndOp.getOpcode() == ISD::AND) {
+  //     auto *ShlAmt = dyn_cast<ConstantSDNode>(ShlOp.getOperand(1));
+  //     auto *AndMask = dyn_cast<ConstantSDNode>(AndOp.getOperand(1));
+  //     if (ShlAmt && AndMask) {
+  //       unsigned C = ShlAmt->getZExtValue();
+  //       unsigned Bits = VT.getSizeInBits();
+  //       if (C > 0 && C < Bits &&
+  //           AndMask->getZExtValue() == (1ULL << C) - 1 &&
+  //           ShlOp.getOperand(0).getOpcode() == ISD::FSHL) {
+  //         SDValue Fshl = ShlOp.getOperand(0);
+  //         auto *FshlAmt = dyn_cast<ConstantSDNode>(Fshl.getOperand(2));
+  //         if (FshlAmt && FshlAmt->getZExtValue() == C &&
+  //             Fshl.getOperand(1) == AndOp.getOperand(0))
+  //           return Fshl.getOperand(1);
+  //       }
+  //     }
+  //   }
+  // }
+
   // or (perm x, y, c1), c2 -> perm x, y, permute_mask(c1, c2)
   if (isa<ConstantSDNode>(RHS) && LHS.hasOneUse() &&
       LHS.getOpcode() == AMDGPUISD::PERM &&

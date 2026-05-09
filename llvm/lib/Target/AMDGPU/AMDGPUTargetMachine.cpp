@@ -63,6 +63,7 @@
 #include "SIOptimizeExecMaskingPreRA.h"
 #include "SIOptimizeVGPRLiveRange.h"
 #include "SIPeepholeSDWA.h"
+#include "SITDMDescHoist.h"
 #include "SIPostRABundler.h"
 #include "SIPreAllocateWWMRegs.h"
 #include "SIShrinkInstructions.h"
@@ -719,6 +720,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeSIOptimizeExecMaskingLegacyPass(*PR);
   initializeSIPreAllocateWWMRegsLegacyPass(*PR);
   initializeSIFormMemoryClausesLegacyPass(*PR);
+  initializeSITDMDescHoistLegacyPass(*PR);
   initializeSIPostRABundlerLegacyPass(*PR);
   initializeGCNCreateVOPDLegacyPass(*PR);
   initializeAMDGPUUnifyDivergentExitNodesLegacyPass(*PR);
@@ -1883,6 +1885,8 @@ void GCNPassConfig::addPostRegAlloc() {
   addPass(&SIFixVGPRCopiesID);
   if (getOptLevel() > CodeGenOptLevel::None)
     addPass(&SIOptimizeExecMaskingLegacyID);
+  if (getOptLevel() > CodeGenOptLevel::None)
+    addPass(&SITDMDescHoistLegacyID);
   TargetPassConfig::addPostRegAlloc();
 }
 
@@ -2585,6 +2589,8 @@ void AMDGPUCodeGenPassBuilder::addPostRegAlloc(PassManagerWrapper &PMW) const {
   addMachineFunctionPass(SIFixVGPRCopiesPass(), PMW);
   if (TM.getOptLevel() > CodeGenOptLevel::None)
     addMachineFunctionPass(SIOptimizeExecMaskingPass(), PMW);
+  if (TM.getOptLevel() > CodeGenOptLevel::None)
+    addMachineFunctionPass(SITDMDescHoistPass(), PMW);
   Base::addPostRegAlloc(PMW);
 }
 

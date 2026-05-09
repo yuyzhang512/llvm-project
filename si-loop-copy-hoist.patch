@@ -1,0 +1,388 @@
+diff --git a/llvm/lib/CodeGen/MachineLICM.cpp b/llvm/lib/CodeGen/MachineLICM.cpp
+index 650d03f3b22f..80f5dd0f60f4 100644
+--- a/llvm/lib/CodeGen/MachineLICM.cpp
++++ b/llvm/lib/CodeGen/MachineLICM.cpp
+@@ -628,10 +628,17 @@ void MachineLICMImpl::HoistRegionPostRA(MachineLoop *CurLoop) {
+     // Only treat live-in registers that are also defined within the loop as
+     // non-invariant. Live-ins that are solely defined outside the loop are
+     // loop-invariant and should not block hoisting.
++    // Respect the lane mask on live-ins: only consider reg units whose lanes
++    // overlap the live-in mask, so that a partial live-in of a super-register
++    // does not falsely mark unrelated sub-registers as loop-defined.
+     for (const auto &LI : BB->liveins()) {
+-      for (MCRegUnit Unit : TRI->regunits(LI.PhysReg))
+-        if (LoopRUDefs.test(static_cast<unsigned>(Unit)))
+-          RUDefs.set(static_cast<unsigned>(Unit));
++      for (MCRegUnitMaskIterator RUMI(LI.PhysReg, TRI); RUMI.isValid();
++           ++RUMI) {
++        auto [Unit, UnitMask] = *RUMI;
++        if ((UnitMask & LI.LaneMask).any())
++          if (LoopRUDefs.test(static_cast<unsigned>(Unit)))
++            RUDefs.set(static_cast<unsigned>(Unit));
++      }
+     }
+ 
+     // Funclet entry blocks will clobber all registers
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPU.h b/llvm/lib/Target/AMDGPU/AMDGPU.h
+index 878f37411015..9d6a3f4924d2 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPU.h
++++ b/llvm/lib/Target/AMDGPU/AMDGPU.h
+@@ -535,6 +535,9 @@ extern char &SIInsertWaitcntsID;
+ void initializeSIFormMemoryClausesLegacyPass(PassRegistry &);
+ extern char &SIFormMemoryClausesID;
+ 
++void initializeSILoopCopyHoistLegacyPass(PassRegistry &);
++extern char &SILoopCopyHoistLegacyID;
++
+ void initializeSIPostRABundlerLegacyPass(PassRegistry &);
+ extern char &SIPostRABundlerLegacyID;
+ 
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUPassRegistry.def b/llvm/lib/Target/AMDGPU/AMDGPUPassRegistry.def
+index 8a046e83548c..42ee09b626a8 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUPassRegistry.def
++++ b/llvm/lib/Target/AMDGPU/AMDGPUPassRegistry.def
+@@ -146,6 +146,7 @@ MACHINE_FUNCTION_PASS("si-opt-vgpr-liverange", SIOptimizeVGPRLiveRangePass())
+ MACHINE_FUNCTION_PASS("si-optimize-exec-masking", SIOptimizeExecMaskingPass())
+ MACHINE_FUNCTION_PASS("si-optimize-exec-masking-pre-ra", SIOptimizeExecMaskingPreRAPass())
+ MACHINE_FUNCTION_PASS("si-peephole-sdwa", SIPeepholeSDWAPass())
++MACHINE_FUNCTION_PASS("si-loop-copy-hoist", SILoopCopyHoistPass())
+ MACHINE_FUNCTION_PASS("si-post-ra-bundler", SIPostRABundlerPass())
+ MACHINE_FUNCTION_PASS("si-pre-allocate-wwm-regs", SIPreAllocateWWMRegsPass())
+ MACHINE_FUNCTION_PASS("si-pre-emit-peephole", SIPreEmitPeepholePass())
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp b/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp
+index daa9f933fce5..d473fe5ed962 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPUTargetMachine.cpp
+@@ -62,6 +62,7 @@
+ #include "SIOptimizeExecMaskingPreRA.h"
+ #include "SIOptimizeVGPRLiveRange.h"
+ #include "SIPeepholeSDWA.h"
++#include "SILoopCopyHoist.h"
+ #include "SIPostRABundler.h"
+ #include "SIPreAllocateWWMRegs.h"
+ #include "SIShrinkInstructions.h"
+@@ -710,6 +711,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
+   initializeSIOptimizeExecMaskingLegacyPass(*PR);
+   initializeSIPreAllocateWWMRegsLegacyPass(*PR);
+   initializeSIFormMemoryClausesLegacyPass(*PR);
++  initializeSILoopCopyHoistLegacyPass(*PR);
+   initializeSIPostRABundlerLegacyPass(*PR);
+   initializeGCNCreateVOPDLegacyPass(*PR);
+   initializeAMDGPUUnifyDivergentExitNodesPass(*PR);
+@@ -1875,6 +1877,8 @@ void GCNPassConfig::addPostRegAlloc() {
+   addPass(&SIFixVGPRCopiesID);
+   if (getOptLevel() > CodeGenOptLevel::None)
+     addPass(&SIOptimizeExecMaskingLegacyID);
++  if (getOptLevel() > CodeGenOptLevel::None)
++    addPass(&SILoopCopyHoistLegacyID);
+   TargetPassConfig::addPostRegAlloc();
+ }
+ 
+@@ -2579,6 +2583,8 @@ void AMDGPUCodeGenPassBuilder::addPostRegAlloc(PassManagerWrapper &PMW) const {
+   addMachineFunctionPass(SIFixVGPRCopiesPass(), PMW);
+   if (TM.getOptLevel() > CodeGenOptLevel::None)
+     addMachineFunctionPass(SIOptimizeExecMaskingPass(), PMW);
++  if (TM.getOptLevel() > CodeGenOptLevel::None)
++    addMachineFunctionPass(SILoopCopyHoistPass(), PMW);
+   Base::addPostRegAlloc(PMW);
+ }
+ 
+diff --git a/llvm/lib/Target/AMDGPU/CMakeLists.txt b/llvm/lib/Target/AMDGPU/CMakeLists.txt
+index 2f4883bfc824..dfc2d89cc660 100644
+--- a/llvm/lib/Target/AMDGPU/CMakeLists.txt
++++ b/llvm/lib/Target/AMDGPU/CMakeLists.txt
+@@ -182,6 +182,7 @@ add_llvm_target(AMDGPUCodeGen
+   SIOptimizeExecMaskingPreRA.cpp
+   SIOptimizeVGPRLiveRange.cpp
+   SIPeepholeSDWA.cpp
++  SILoopCopyHoist.cpp
+   SIPostRABundler.cpp
+   SIPreAllocateWWMRegs.cpp
+   SIPreEmitPeephole.cpp
+diff --git a/llvm/lib/Target/AMDGPU/SILoopCopyHoist.h b/llvm/lib/Target/AMDGPU/SILoopCopyHoist.h
+new file mode 100644
+index 000000000000..a85288097b9c
+--- /dev/null
++++ b/llvm/lib/Target/AMDGPU/SILoopCopyHoist.h
+@@ -0,0 +1,22 @@
++//===- SILoopCopyHoist.h ----------------------------------------*- C++ -*===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_AMDGPU_SILOOPCOPY_HOIST_H
++#define LLVM_LIB_TARGET_AMDGPU_SILOOPCOPY_HOIST_H
++
++#include "llvm/CodeGen/MachinePassManager.h"
++
++namespace llvm {
++class SILoopCopyHoistPass : public PassInfoMixin<SILoopCopyHoistPass> {
++public:
++  PreservedAnalyses run(MachineFunction &MF,
++                        MachineFunctionAnalysisManager &MFAM);
++};
++} // namespace llvm
++
++#endif // LLVM_LIB_TARGET_AMDGPU_SILOOPCOPY_HOIST_H
+diff --git a/llvm/lib/Target/AMDGPU/SILoopCopyHoist.cpp b/llvm/lib/Target/AMDGPU/SILoopCopyHoist.cpp
+new file mode 100644
+index 000000000000..55ddaaeafea5
+--- /dev/null
++++ b/llvm/lib/Target/AMDGPU/SILoopCopyHoist.cpp
+@@ -0,0 +1,253 @@
++//===-- SILoopCopyHoist.cpp ------------------------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++/// \file
++/// Post-RA pass that hoists loop-invariant SGPR copy instructions (S_MOV_B32,
++/// S_MOV_B64) from loop bodies to preheaders.
++///
++/// Standard MachineLICM does not hoist physical register copies because
++/// MachineLoop::isLoopInvariant conservatively rejects all physical reg uses.
++/// This pass performs targeted hoisting for SGPR-to-SGPR copies where both
++/// source and destination can be proven loop-invariant.
++///
++//===----------------------------------------------------------------------===//
++
++#include "SILoopCopyHoist.h"
++#include "AMDGPU.h"
++#include "GCNSubtarget.h"
++#include "SIInstrInfo.h"
++#include "SIRegisterInfo.h"
++#include "llvm/CodeGen/MachineDominators.h"
++#include "llvm/CodeGen/MachineFunctionPass.h"
++#include "llvm/CodeGen/MachineLoopInfo.h"
++
++using namespace llvm;
++
++#define DEBUG_TYPE "si-loop-copy-hoist"
++
++namespace {
++
++class SILoopCopyHoistLegacy : public MachineFunctionPass {
++public:
++  static char ID;
++
++  SILoopCopyHoistLegacy() : MachineFunctionPass(ID) {
++    initializeSILoopCopyHoistLegacyPass(*PassRegistry::getPassRegistry());
++  }
++
++  bool runOnMachineFunction(MachineFunction &MF) override;
++
++  StringRef getPassName() const override { return "SI Loop Copy Hoist"; }
++
++  void getAnalysisUsage(AnalysisUsage &AU) const override {
++    AU.addRequired<MachineLoopInfoWrapperPass>();
++    AU.addRequired<MachineDominatorTreeWrapperPass>();
++    AU.addPreserved<MachineLoopInfoWrapperPass>();
++    AU.addPreserved<MachineDominatorTreeWrapperPass>();
++    MachineFunctionPass::getAnalysisUsage(AU);
++  }
++};
++
++class SILoopCopyHoist {
++  const SIInstrInfo *TII;
++  const SIRegisterInfo *TRI;
++  MachineLoopInfo *MLI;
++
++  bool processLoop(MachineLoop *L);
++
++public:
++  bool run(MachineFunction &MF, MachineLoopInfo &MLI);
++};
++
++} // end anonymous namespace
++
++INITIALIZE_PASS_BEGIN(SILoopCopyHoistLegacy, DEBUG_TYPE, "SI Loop Copy Hoist",
++                      false, false)
++INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
++INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
++INITIALIZE_PASS_END(SILoopCopyHoistLegacy, DEBUG_TYPE, "SI Loop Copy Hoist",
++                    false, false)
++
++char SILoopCopyHoistLegacy::ID = 0;
++
++char &llvm::SILoopCopyHoistLegacyID = SILoopCopyHoistLegacy::ID;
++
++bool SILoopCopyHoistLegacy::runOnMachineFunction(MachineFunction &MF) {
++  if (skipFunction(MF.getFunction()))
++    return false;
++  auto &MLI = getAnalysis<MachineLoopInfoWrapperPass>().getLI();
++  SILoopCopyHoist Impl;
++  return Impl.run(MF, MLI);
++}
++
++PreservedAnalyses
++SILoopCopyHoistPass::run(MachineFunction &MF,
++                         MachineFunctionAnalysisManager &MFAM) {
++  auto &MLI = MFAM.getResult<MachineLoopAnalysis>(MF);
++  SILoopCopyHoist Impl;
++  Impl.run(MF, MLI);
++  return PreservedAnalyses::all();
++}
++
++bool SILoopCopyHoist::processLoop(MachineLoop *L) {
++  bool Changed = false;
++
++  // Process inner loops first (innermost-out).
++  for (MachineLoop *Inner : *L)
++    Changed |= processLoop(Inner);
++
++  MachineBasicBlock *Preheader = L->getLoopPreheader();
++  if (!Preheader)
++    return Changed;
++
++  // Phase 1: Build the set of all register units defined anywhere in the loop.
++  // Also build a map from register unit to the set of instructions defining it.
++  DenseMap<MCRegUnit, SmallVector<MachineInstr *, 2>> UnitToDefiners;
++  for (MachineBasicBlock *BB : L->blocks()) {
++    for (MachineInstr &MI : *BB) {
++      for (const MachineOperand &MO : MI.operands()) {
++        if (!MO.isReg() || !MO.isDef())
++          continue;
++        Register Reg = MO.getReg();
++        if (!Reg.isPhysical())
++          continue;
++        for (MCRegUnit Unit : TRI->regunits(Reg.asMCReg()))
++          UnitToDefiners[Unit].push_back(&MI);
++      }
++    }
++  }
++
++  // Phase 2: Collect SGPR copy candidates.
++  SmallVector<MachineInstr *, 8> Candidates;
++  for (MachineBasicBlock *BB : L->blocks()) {
++    for (MachineInstr &MI : *BB) {
++      unsigned Opc = MI.getOpcode();
++      if (Opc != AMDGPU::S_MOV_B32 && Opc != AMDGPU::S_MOV_B64)
++        continue;
++
++      const MachineOperand &Dst = MI.getOperand(0);
++      const MachineOperand &Src = MI.getOperand(1);
++
++      if (!Dst.isReg() || !Src.isReg())
++        continue;
++      if (!Dst.getReg().isPhysical() || !Src.getReg().isPhysical())
++        continue;
++
++      // Both must be SGPRs.
++      if (!TRI->isSGPRPhysReg(Dst.getReg()) ||
++          !TRI->isSGPRPhysReg(Src.getReg()))
++        continue;
++
++      Candidates.push_back(&MI);
++    }
++  }
++
++  if (Candidates.empty())
++    return Changed;
++
++  // Phase 3: Iterative hoistability analysis (fixed-point).
++  //
++  // A candidate is hoistable if:
++  //   (a) All source reg units have no def in the loop except by
++  //       already-hoistable candidates.
++  //   (b) All dest reg units are ONLY defined by this instruction or
++  //       other already-hoistable candidates.
++  //
++  // The fixed-point iteration resolves chains: hoisting one copy removes
++  // its defs from consideration, potentially enabling more copies.
++  DenseSet<MachineInstr *> Hoistable;
++  bool Progress = true;
++  while (Progress) {
++    Progress = false;
++    for (MachineInstr *MI : Candidates) {
++      if (Hoistable.count(MI))
++        continue;
++
++      MCRegister SrcReg = MI->getOperand(1).getReg().asMCReg();
++      MCRegister DstReg = MI->getOperand(0).getReg().asMCReg();
++
++      // Check (a): source must be loop-invariant.
++      bool SrcInvariant = true;
++      for (MCRegUnit Unit : TRI->regunits(SrcReg)) {
++        auto It = UnitToDefiners.find(Unit);
++        if (It == UnitToDefiners.end())
++          continue;
++        for (MachineInstr *Definer : It->second) {
++          if (!Hoistable.count(Definer)) {
++            SrcInvariant = false;
++            break;
++          }
++        }
++        if (!SrcInvariant)
++          break;
++      }
++      if (!SrcInvariant)
++        continue;
++
++      // Check (b): dest reg units only defined by self or hoistable copies.
++      bool DstOK = true;
++      for (MCRegUnit Unit : TRI->regunits(DstReg)) {
++        auto It = UnitToDefiners.find(Unit);
++        if (It == UnitToDefiners.end())
++          continue;
++        for (MachineInstr *Definer : It->second) {
++          if (Definer == MI)
++            continue;
++          if (!Hoistable.count(Definer)) {
++            DstOK = false;
++            break;
++          }
++        }
++        if (!DstOK)
++          break;
++      }
++      if (!DstOK)
++        continue;
++
++      LLVM_DEBUG(dbgs() << "SI-LOOP-COPY-HOIST: Hoistable: " << *MI);
++      Hoistable.insert(MI);
++      Progress = true;
++    }
++  }
++
++  if (Hoistable.empty())
++    return Changed;
++
++  // Phase 4: Hoist in original program order.
++  // Collect hoistable instructions in their original order.
++  SmallVector<MachineInstr *, 8> ToHoist;
++  for (MachineBasicBlock *BB : L->blocks()) {
++    for (MachineInstr &MI : *BB) {
++      if (Hoistable.count(&MI))
++        ToHoist.push_back(&MI);
++    }
++  }
++
++  MachineBasicBlock::iterator InsertPt = Preheader->getFirstTerminator();
++  for (MachineInstr *MI : ToHoist) {
++    LLVM_DEBUG(dbgs() << "SI-LOOP-COPY-HOIST: Moving to preheader: " << *MI);
++    MI->removeFromParent();
++    Preheader->insert(InsertPt, MI);
++  }
++
++  Changed = true;
++  return Changed;
++}
++
++bool SILoopCopyHoist::run(MachineFunction &MF, MachineLoopInfo &LoopInfo) {
++  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
++  TII = ST.getInstrInfo();
++  TRI = ST.getRegisterInfo();
++  MLI = &LoopInfo;
++
++  bool Changed = false;
++  for (MachineLoop *L : *MLI)
++    Changed |= processLoop(L);
++
++  return Changed;
++}

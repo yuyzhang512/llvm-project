@@ -2212,6 +2212,85 @@ bool RegisterCoalescer::joinCopy(
       if (removePartialRedundancy(CP, *CopyMI))
         return true;
 
+    // Try narrowing a full COPY when the source has IMPLICIT_DEF-only lanes.
+    // A full `%dst = COPY %src` where %src has sub-ranges entirely made of
+    // IMPLICIT_DEFs can be narrowed to copy only the defined lanes, e.g.:
+    //   %dst.sub0_sub1 = COPY %src.sub0_sub1, implicit-def %dst
+    // This eliminates false interference from the undefined lanes and lets
+    // a future coalescing attempt succeed.
+    if (!CP.isPartial() && !CP.isPhys()) {
+      // Use the COPY instruction's actual operand registers, not CP's
+      // coalescer-level Src/Dst which may be flipped.
+      Register CopySrcReg = CopyMI->getOperand(1).getReg();
+      Register CopyDstReg = CopyMI->getOperand(0).getReg();
+      LiveInterval &CopySrcLI = LIS->getInterval(CopySrcReg);
+      if (CopySrcLI.hasSubRanges()) {
+        const TargetRegisterClass *CopySrcRC = MRI->getRegClass(CopySrcReg);
+        const TargetRegisterClass *CopyDstRC = MRI->getRegClass(CopyDstReg);
+        LaneBitmask FullMask = CopySrcRC->getLaneMask();
+        // Find lanes where ALL source values are IMPLICIT_DEF.
+        LaneBitmask ImplicitDefLanes = LaneBitmask::getNone();
+        LaneBitmask DefinedLanes = LaneBitmask::getNone();
+        for (auto &SR : CopySrcLI.subranges()) {
+          bool AllImplicitDef = true;
+          for (VNInfo *VNI : SR.valnos) {
+            if (VNI->isUnused())
+              continue;
+            MachineInstr *DefMI = LIS->getInstructionFromIndex(VNI->def);
+            if (!DefMI || !DefMI->isImplicitDef()) {
+              AllImplicitDef = false;
+              break;
+            }
+          }
+          if (AllImplicitDef)
+            ImplicitDefLanes |= SR.LaneMask;
+          else
+            DefinedLanes |= SR.LaneMask;
+        }
+        // Also account for lanes not covered by any sub-range — these may
+        // exist in the register class but have no sub-range at all, meaning
+        // the COPY would propagate undef for them.
+        LaneBitmask CoveredLanes = ImplicitDefLanes | DefinedLanes;
+        LaneBitmask UncoveredLanes = FullMask & ~CoveredLanes;
+        ImplicitDefLanes |= UncoveredLanes;
+
+        if (ImplicitDefLanes.any() && DefinedLanes.any()) {
+          // Try to find a single sub-register index covering exactly the
+          // defined lanes.  Verify it is valid for both src and dst classes.
+          SmallVector<unsigned, 4> SubRegIdxs;
+          if (TRI->getCoveringSubRegIndexes(CopySrcRC, DefinedLanes,
+                                            SubRegIdxs) &&
+              SubRegIdxs.size() == 1) {
+            unsigned SubIdx = SubRegIdxs[0];
+            if (TRI->getSubClassWithSubReg(CopyDstRC, SubIdx)) {
+              LLVM_DEBUG(dbgs() << "\tNarrowing COPY to "
+                                << TRI->getSubRegIndexName(SubIdx)
+                                << " (dropping IMPLICIT_DEF lanes "
+                                << PrintLaneMask(ImplicitDefLanes) << ")\n");
+              // Rewrite: %dst = COPY %src
+              //      --> %dst.subIdx<def,read-undef> = COPY %src.subIdx
+              // The undef flag signals that the other lanes are not read,
+              // starting a new lifetime for the full register.  No
+              // implicit-def is needed for virtual registers.
+              CopyMI->getOperand(0).setSubReg(SubIdx);
+              CopyMI->getOperand(0).setIsUndef(true);
+              CopyMI->getOperand(1).setSubReg(SubIdx);
+              // Recompute live intervals from scratch — the sub-range
+              // structure may have lanes that straddle the narrowed and
+              // dropped portions, making surgical VNInfo edits unsafe.
+              LIS->removeInterval(CopyDstReg);
+              LIS->createAndComputeVirtRegInterval(CopyDstReg);
+              LIS->removeInterval(CopySrcReg);
+              LIS->createAndComputeVirtRegInterval(CopySrcReg);
+              // The narrowed COPY is now a partial copy — retry coalescing.
+              Again = true;
+              return false;
+            }
+          }
+        }
+      }
+    }
+
     // Otherwise, we are unable to join the intervals.
     LLVM_DEBUG(dbgs() << "\tInterference!\n");
     Again = true; // May be possible to coalesce later.
