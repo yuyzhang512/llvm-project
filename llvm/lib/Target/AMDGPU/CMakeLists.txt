@@ -189,6 +189,7 @@ add_llvm_target(AMDGPUCodeGen
   SIProgramInfo.cpp
   SIRegisterInfo.cpp
   SIShrinkInstructions.cpp
+  SITensorDescSink.cpp
   SIWholeQuadMode.cpp
 
   LINK_COMPONENTS
