@@ -2213,6 +2213,89 @@ bool RegisterCoalescer::joinCopy(
       if (removePartialRedundancy(CP, *CopyMI))
         return true;
 
+    // Try narrowing a full COPY when the source has IMPLICIT_DEF-only lanes
+    // or when destination lanes are immediately overwritten (dead defs).
+    // A full `%dst = COPY %src` where %src has sub-ranges entirely made of
+    // IMPLICIT_DEFs can be narrowed to copy only the surviving lanes, e.g.:
+    //   %dst.sub0_sub1 = COPY %src.sub0_sub1
+    // This eliminates false interference from the undefined lanes and lets
+    // a future coalescing attempt succeed.
+    if (!CP.isPartial() && !CP.isPhys()) {
+      Register CopySrcReg = CopyMI->getOperand(1).getReg();
+      Register CopyDstReg = CopyMI->getOperand(0).getReg();
+      LiveInterval &CopySrcLI = LIS->getInterval(CopySrcReg);
+      if (CopySrcLI.hasSubRanges()) {
+        const TargetRegisterClass *CopySrcRC = MRI->getRegClass(CopySrcReg);
+        const TargetRegisterClass *CopyDstRC = MRI->getRegClass(CopyDstReg);
+        LaneBitmask FullMask = CopySrcRC->getLaneMask();
+        LaneBitmask ImplicitDefLanes = LaneBitmask::getNone();
+        LaneBitmask DefinedLanes = LaneBitmask::getNone();
+        for (auto &SR : CopySrcLI.subranges()) {
+          bool AllImplicitDef = true;
+          for (VNInfo *VNI : SR.valnos) {
+            if (VNI->isUnused())
+              continue;
+            MachineInstr *DefMI = LIS->getInstructionFromIndex(VNI->def);
+            if (!DefMI || !DefMI->isImplicitDef()) {
+              AllImplicitDef = false;
+              break;
+            }
+          }
+          if (AllImplicitDef)
+            ImplicitDefLanes |= SR.LaneMask;
+          else
+            DefinedLanes |= SR.LaneMask;
+        }
+        LaneBitmask UncoveredLanes = FullMask & ~(ImplicitDefLanes | DefinedLanes);
+        ImplicitDefLanes |= UncoveredLanes;
+
+        if (ImplicitDefLanes.any() && DefinedLanes.any()) {
+          LaneBitmask SurvivingLanes = DefinedLanes;
+          LiveInterval &CopyDstLI = LIS->getInterval(CopyDstReg);
+          if (CopyDstLI.hasSubRanges()) {
+            SlotIndex CopyIdx =
+                LIS->getInstructionIndex(*CopyMI).getRegSlot();
+            LaneBitmask OverwrittenLanes = LaneBitmask::getNone();
+            for (auto &SR : CopyDstLI.subranges()) {
+              if ((SR.LaneMask & DefinedLanes).none())
+                continue;
+              LiveQueryResult Q = SR.Query(CopyIdx);
+              if (Q.isDeadDef())
+                OverwrittenLanes |= SR.LaneMask;
+            }
+            if (OverwrittenLanes.any()) {
+              SurvivingLanes = DefinedLanes & ~OverwrittenLanes;
+              ImplicitDefLanes |= (DefinedLanes & OverwrittenLanes);
+            }
+          }
+
+          LaneBitmask NarrowMask =
+              SurvivingLanes.any() ? SurvivingLanes : DefinedLanes;
+          SmallVector<unsigned, 4> SubRegIdxs;
+          if (TRI->getCoveringSubRegIndexes(CopySrcRC, NarrowMask,
+                                            SubRegIdxs) &&
+              SubRegIdxs.size() == 1) {
+            unsigned SubIdx = SubRegIdxs[0];
+            if (TRI->getSubClassWithSubReg(CopyDstRC, SubIdx)) {
+              LLVM_DEBUG(dbgs() << "\tNarrowing COPY to "
+                                << TRI->getSubRegIndexName(SubIdx)
+                                << " (dropping lanes "
+                                << PrintLaneMask(ImplicitDefLanes) << ")\n");
+              CopyMI->getOperand(0).setSubReg(SubIdx);
+              CopyMI->getOperand(0).setIsUndef(true);
+              CopyMI->getOperand(1).setSubReg(SubIdx);
+              LIS->removeInterval(CopyDstReg);
+              LIS->createAndComputeVirtRegInterval(CopyDstReg);
+              LIS->removeInterval(CopySrcReg);
+              LIS->createAndComputeVirtRegInterval(CopySrcReg);
+              Again = true;
+              return false;
+            }
+          }
+        }
+      }
+    }
+
     // Otherwise, we are unable to join the intervals.
     LLVM_DEBUG(dbgs() << "\tInterference!\n");
     Again = true; // May be possible to coalesce later.
