@@ -16,6 +16,7 @@
 #include "SIMachineFunctionInfo.h"
 #include "SIRegisterInfo.h"
 #include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineOperand.h"
@@ -2762,6 +2763,118 @@ bool SIFoldOperandsImpl::tryOptimizeAGPRPhis(MachineBasicBlock &MBB) {
   return Changed;
 }
 
+/// Re-root sibling TENSOR_LOAD_TO_LDS descriptor chains so RegisterCoalescer
+/// can merge them. Both chains start from the same REG_SEQUENCE today; this
+/// retargets the second chain's first INSERT_SUBREG to read from the first
+/// chain's final value instead, serializing the live ranges.
+///
+/// Pattern:
+///   %base:sgpr_256 = REG_SEQUENCE ...
+///   %a1 = INSERT_SUBREG %base, _, subX        ; chain 1
+///   ...
+///   %aN = INSERT_SUBREG %aN-1, _, subZ
+///   TENSOR_LOAD_TO_LDS_d2 _, %aN, ...
+///   %b1 = INSERT_SUBREG %base, _, subX'       ; chain 2 (rooted at %base)
+///   ...
+///   TENSOR_LOAD_TO_LDS_d2 _, %bM, ...
+///
+/// Becomes:
+///   ...
+///   %b1 = INSERT_SUBREG %aN, _, subX'         ; chain 2 (rooted at %aN)
+///
+/// Safety: chain 2 must overwrite every sub-register chain 1 writes.
+static bool optimizeSiblingTDMDescriptors(MachineFunction &MF,
+                                          MachineRegisterInfo &MRI) {
+  struct ChainInfo {
+    Register Root;
+    MachineInstr *FirstInsert;
+    SmallSet<unsigned, 8> WrittenSubs;
+  };
+
+  auto walkChain = [&](Register Desc) -> std::optional<ChainInfo> {
+    ChainInfo CI{Register(), nullptr, {}};
+    MachineInstr *Cur = MRI.getVRegDef(Desc);
+    MachineInstr *LastInsert = nullptr;
+    while (Cur && Cur->getOpcode() == TargetOpcode::INSERT_SUBREG) {
+      CI.WrittenSubs.insert(Cur->getOperand(3).getImm());
+      LastInsert = Cur;
+      Register BaseReg = Cur->getOperand(1).getReg();
+      if (!BaseReg.isVirtual())
+        return std::nullopt;
+      Cur = MRI.getVRegDef(BaseReg);
+    }
+    if (!LastInsert || !Cur || Cur->getOpcode() != TargetOpcode::REG_SEQUENCE)
+      return std::nullopt;
+    CI.Root = Cur->getOperand(0).getReg();
+    CI.FirstInsert = LastInsert;
+    return CI;
+  };
+
+  bool Changed = false;
+  for (MachineBasicBlock &MBB : MF) {
+    SmallVector<MachineInstr *, 4> TDMs;
+    for (MachineInstr &MI : MBB) {
+      unsigned Op = MI.getOpcode();
+      if (Op == AMDGPU::TENSOR_LOAD_TO_LDS_d2 ||
+          Op == AMDGPU::TENSOR_LOAD_TO_LDS_d4)
+        TDMs.push_back(&MI);
+    }
+    if (TDMs.size() < 2)
+      continue;
+
+    for (size_t i = 0; i + 1 < TDMs.size(); ++i) {
+      MachineInstr *T1 = TDMs[i];
+      MachineInstr *T2 = TDMs[i + 1];
+      Register Desc1 = T1->getOperand(1).getReg();
+      Register Desc2 = T2->getOperand(1).getReg();
+      if (!Desc1.isVirtual() || !Desc2.isVirtual() || Desc1 == Desc2)
+        continue;
+
+      auto C1 = walkChain(Desc1);
+      auto C2 = walkChain(Desc2);
+      if (!C1 || !C2 || C1->Root != C2->Root)
+        continue;
+
+      // Idempotency: if chain 2 already passes through Desc1, bail.
+      bool AlreadyRerooted = false;
+      MachineInstr *Cur = MRI.getVRegDef(Desc2);
+      while (Cur && Cur->getOpcode() == TargetOpcode::INSERT_SUBREG) {
+        if (Cur == C1->FirstInsert) {
+          AlreadyRerooted = true;
+          break;
+        }
+        Register Base = Cur->getOperand(1).getReg();
+        if (!Base.isVirtual())
+          break;
+        Cur = MRI.getVRegDef(Base);
+      }
+      if (AlreadyRerooted)
+        continue;
+
+      // Safety: subs(C1) must be subset of subs(C2).
+      bool Safe = true;
+      for (unsigned Sub : C1->WrittenSubs) {
+        if (!C2->WrittenSubs.contains(Sub)) {
+          Safe = false;
+          break;
+        }
+      }
+      if (!Safe)
+        continue;
+
+      LLVM_DEBUG(dbgs() << "SIFoldOperands: re-root TDM chain "
+                        << printReg(Desc2, MRI.getTargetRegisterInfo())
+                        << " on "
+                        << printReg(Desc1, MRI.getTargetRegisterInfo())
+                        << "\n");
+      C2->FirstInsert->getOperand(1).setReg(Desc1);
+      MRI.clearKillFlags(Desc1);
+      Changed = true;
+    }
+  }
+  return Changed;
+}
+
 bool SIFoldOperandsImpl::run(MachineFunction &MF) {
   this->MF = &MF;
   MRI = &MF.getRegInfo();
@@ -2770,13 +2883,15 @@ bool SIFoldOperandsImpl::run(MachineFunction &MF) {
   TRI = &TII->getRegisterInfo();
   MFI = MF.getInfo<SIMachineFunctionInfo>();
 
+  bool TDMChanged = optimizeSiblingTDMDescriptors(MF, *MRI);
+
   // omod is ignored by hardware if IEEE bit is enabled. omod also does not
   // correctly handle signed zeros.
   //
   // FIXME: Also need to check strictfp
   bool IsIEEEMode = MFI->getMode().IEEE;
 
-  bool Changed = false;
+  bool Changed = TDMChanged;
   for (MachineBasicBlock *MBB : depth_first(&MF)) {
     MachineOperand *CurrentKnownM0Val = nullptr;
     for (auto &MI : make_early_inc_range(*MBB)) {
