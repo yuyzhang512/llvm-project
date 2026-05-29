@@ -541,6 +541,19 @@ static bool memOpsHaveSameBasePtr(const MachineInstr &MI1,
   return Base1 == Base2;
 }
 
+unsigned SIInstrInfo::getPreferredCopySplitSize(
+    const TargetRegisterClass *RC) const {
+  // Only split SGPR tuples; VGPR copies don't have an analogous wide move
+  // op to preserve. Threshold of >64 bits skips classes that are already
+  // single-instruction-movable (S_MOV_B32/S_MOV_B64).
+  if (!RC || !SIRegisterInfo::isSGPRClass(RC))
+    return 0;
+  if (RI.getRegSizeInBits(*RC) <= 64)
+    return 0;
+  // S_MOV_B64 is the largest natural SGPR move; split at this granularity.
+  return 64;
+}
+
 bool SIInstrInfo::shouldClusterMemOps(ArrayRef<const MachineOperand *> BaseOps1,
                                       int64_t Offset1, bool OffsetIsScalable1,
                                       ArrayRef<const MachineOperand *> BaseOps2,
