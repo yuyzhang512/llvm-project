@@ -1,0 +1,63 @@
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1250 -run-pass=machinelicm -verify-machineinstrs -o - %s | FileCheck %s
+# RUN: llc -mtriple=amdgcn -mcpu=gfx1250 -passes=machinelicm -verify-machineinstrs -o - %s | FileCheck %s
+
+# Test that post-RA MachineLICM splits a full-tuple physical-register COPY in
+# a loop body when some sub-pieces of the source are loop-invariant, and
+# hoists the invariant pieces to the preheader.
+#
+# Setup:
+#   - Source tuple $sgpr16_..._sgpr23 (sgpr_256): only $sgpr17 (sub1) and
+#     $sgpr19 (sub3) are written in the loop. All other sub-registers are
+#     loop-invariant.
+#   - Loop body contains a full-tuple COPY: $sgpr48_..._sgpr55 = COPY of the
+#     source. Two natural 64-bit sub-pieces (sub4_sub5 and sub6_sub7) have
+#     fully loop-invariant sources.
+#
+# Expected after the pass:
+#   - The COPY is split into 4 sgpr_64-pair COPYs.
+#   - The 2 fully-invariant pair COPYs (for sub4_sub5 and sub6_sub7) are
+#     hoisted out of the loop.
+#   - The 2 partially-variant pair COPYs (for sub0_sub1 and sub2_sub3) stay
+#     in the loop.
+
+---
+name: split_invariant_subpieces
+tracksRegLiveness: true
+body: |
+  ; CHECK-LABEL: name: split_invariant_subpieces
+  ; CHECK: bb.0:
+  ; CHECK:   $sgpr52_sgpr53 = COPY $sgpr20_sgpr21
+  ; CHECK:   $sgpr54_sgpr55 = COPY $sgpr22_sgpr23
+  ; CHECK: bb.1:
+  ; CHECK-NOT: $sgpr52_sgpr53 = COPY $sgpr20_sgpr21
+  ; CHECK-NOT: $sgpr54_sgpr55 = COPY $sgpr22_sgpr23
+  ; CHECK:   $sgpr17 = S_MOV_B32 0
+  ; CHECK:   $sgpr19 = S_MOV_B32 0
+  ; CHECK:   $sgpr48_sgpr49 = COPY $sgpr16_sgpr17
+  ; CHECK:   $sgpr50_sgpr51 = COPY $sgpr18_sgpr19
+  ; CHECK:   S_NOP 0, implicit $sgpr48_sgpr49_sgpr50_sgpr51_sgpr52_sgpr53_sgpr54_sgpr55
+
+  bb.0:
+    liveins: $sgpr16, $sgpr17, $sgpr18, $sgpr19, $sgpr20, $sgpr21, $sgpr22, $sgpr23
+    successors: %bb.1
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $sgpr16, $sgpr17, $sgpr18, $sgpr19, $sgpr20, $sgpr21, $sgpr22, $sgpr23
+
+    ; In-loop writes to $sgpr17 (sub1) and $sgpr19 (sub3) make those
+    ; sub-registers loop-variant. All other sub-registers are invariant.
+    $sgpr17 = S_MOV_B32 0, implicit-def $scc
+    $sgpr19 = S_MOV_B32 0, implicit-def $scc
+
+    ; Full-tuple COPY. The pass should split this and hoist sub4_sub5 and
+    ; sub6_sub7 pair COPYs (both fully invariant on the source side).
+    $sgpr48_sgpr49_sgpr50_sgpr51_sgpr52_sgpr53_sgpr54_sgpr55 = COPY $sgpr16_sgpr17_sgpr18_sgpr19_sgpr20_sgpr21_sgpr22_sgpr23
+
+    S_NOP 0, implicit $sgpr48_sgpr49_sgpr50_sgpr51_sgpr52_sgpr53_sgpr54_sgpr55
+    S_CBRANCH_SCC1 %bb.1, implicit undef $scc
+    S_BRANCH %bb.2
+
+  bb.2:
+    S_ENDPGM 0
+...
