@@ -481,6 +481,20 @@ public:
     return true;
   }
 
+  /// Suggest a sub-register pair size (in bits) for splitting a full-tuple
+  /// COPY of \p RC so that loop-invariant sub-pieces can be hoisted by
+  /// MachineLICM independently of variant sub-pieces.
+  ///
+  /// Returning 0 disables splitting (default). Targets should return the
+  /// largest natural single-instruction move size for the class — e.g. 64
+  /// for AMDGPU SGPR tuples, where \c S_MOV_B64 is the largest natural
+  /// scalar move. Splitting finer than that would multiply the number of
+  /// in-loop moves with no gain.
+  virtual unsigned getPreferredCopySplitSize(
+      const TargetRegisterClass *RC) const {
+    return 0;
+  }
+
   /// Re-issue the specified 'original' instruction at the
   /// specific location targeting a new destination register.
   /// The register in Orig->getOperand(0).getReg() will be substituted by

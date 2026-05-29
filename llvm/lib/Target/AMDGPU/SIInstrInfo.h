@@ -292,6 +292,9 @@ public:
                            unsigned ClusterSize,
                            unsigned NumBytes) const override;
 
+  unsigned
+  getPreferredCopySplitSize(const TargetRegisterClass *RC) const override;
+
   bool shouldScheduleLoadsNear(SDNode *Load0, SDNode *Load1, int64_t Offset0,
                                int64_t Offset1, unsigned NumLoads) const override;
 

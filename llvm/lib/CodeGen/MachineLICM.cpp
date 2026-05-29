@@ -582,12 +582,130 @@ void MachineLICMImpl::ProcessMI(MachineInstr *MI, BitVector &RUDefs,
   }
 }
 
+/// Pre-pass for post-RA LICM: if a full-tuple physical-register COPY in the
+/// loop body has some sub-pieces whose source is loop-invariant, split it
+/// into per-sub-piece COPYs at the target's preferred granularity. Normal
+/// hoisting analysis then picks up the invariant pieces independently.
+///
+/// Granularity is chosen by TII::getPreferredCopySplitSize(); finer splits
+/// would multiply in-loop moves with no net win.
+static void splitHoistableTupleCopies(MachineLoop *CurLoop,
+                                      const TargetRegisterInfo *TRI,
+                                      const TargetInstrInfo *TII) {
+  unsigned NumRegUnits = TRI->getNumRegUnits();
+  BitVector LoopRUDefs(NumRegUnits);
+  for (MachineBasicBlock *BB : CurLoop->getBlocks()) {
+    for (MachineInstr &MI : *BB) {
+      for (const MachineOperand &MO : MI.operands()) {
+        if (MO.isRegMask()) {
+          applyBitsNotInRegMaskToRegUnitsMask(*TRI, LoopRUDefs, MO.getRegMask());
+          continue;
+        }
+        if (!MO.isReg() || !MO.isDef()) continue;
+        Register Reg = MO.getReg();
+        if (!Reg) continue;
+        for (MCRegUnit Unit : TRI->regunits(Reg))
+          LoopRUDefs.set(static_cast<unsigned>(Unit));
+      }
+    }
+  }
+
+  auto isSubRegInvariant = [&](Register SuperReg, unsigned SubIdx) -> bool {
+    Register SubReg = TRI->getSubReg(SuperReg, SubIdx);
+    if (!SubReg)
+      return false;
+    for (MCRegUnit Unit : TRI->regunits(SubReg))
+      if (LoopRUDefs.test(static_cast<unsigned>(Unit)))
+        return false;
+    return true;
+  };
+
+  for (MachineBasicBlock *BB : CurLoop->getBlocks()) {
+    for (MachineInstr &MI : make_early_inc_range(*BB)) {
+      if (!MI.isCopy())
+        continue;
+      Register DstReg = MI.getOperand(0).getReg();
+      Register SrcReg = MI.getOperand(1).getReg();
+      if (!DstReg.isPhysical() || !SrcReg.isPhysical())
+        continue;
+      // Only full-register COPYs (no sub-register on either side).
+      if (MI.getOperand(0).getSubReg() || MI.getOperand(1).getSubReg())
+        continue;
+
+      const TargetRegisterClass *DstRC = TRI->getMinimalPhysRegClass(DstReg);
+      unsigned SplitBits = TII->getPreferredCopySplitSize(DstRC);
+      if (!SplitBits)
+        continue;
+      unsigned TotalBits = TRI->getRegSizeInBits(*DstRC);
+      if (SplitBits >= TotalBits || TotalBits % SplitBits != 0)
+        continue;
+
+      // Enumerate sub-register indices that have size == SplitBits AND
+      // tile the parent register exactly (offsets at multiples of SplitBits,
+      // covering [0, TotalBits)). For SReg_256 with SplitBits=64 this picks
+      // sub0_sub1, sub2_sub3, sub4_sub5, sub6_sub7.
+      unsigned NumPieces = TotalBits / SplitBits;
+      SmallVector<unsigned, 8> AllSubIdxs(NumPieces, 0);
+      bool CoversAll = true;
+      for (unsigned SubIdx = 1, E = TRI->getNumSubRegIndices(); SubIdx < E;
+           ++SubIdx) {
+        if (TRI->getSubRegIdxSize(SubIdx) != SplitBits)
+          continue;
+        unsigned Offset = TRI->getSubRegIdxOffset(SubIdx);
+        if (Offset % SplitBits != 0)
+          continue;
+        unsigned Slot = Offset / SplitBits;
+        if (Slot >= NumPieces)
+          continue;
+        Register DstSub = TRI->getSubReg(DstReg, SubIdx);
+        Register SrcSub = TRI->getSubReg(SrcReg, SubIdx);
+        if (!DstSub || !SrcSub)
+          continue;
+        // First match for this slot wins.
+        if (AllSubIdxs[Slot] == 0)
+          AllSubIdxs[Slot] = SubIdx;
+      }
+      for (unsigned Idx : AllSubIdxs)
+        if (Idx == 0) { CoversAll = false; break; }
+      if (!CoversAll)
+        continue;
+
+      // At least one piece must have a loop-invariant source to justify the
+      // split. Otherwise the split is pure churn.
+      bool AnyHoistable = false;
+      for (unsigned SubIdx : AllSubIdxs) {
+        if (isSubRegInvariant(SrcReg, SubIdx)) {
+          AnyHoistable = true;
+          break;
+        }
+      }
+      if (!AnyHoistable)
+        continue;
+
+      // Emit one per-sub-piece COPY for each piece.
+      MachineBasicBlock *MBB = MI.getParent();
+      DebugLoc DL = MI.getDebugLoc();
+      for (unsigned SubIdx : AllSubIdxs) {
+        Register DstSub = TRI->getSubReg(DstReg, SubIdx);
+        Register SrcSub = TRI->getSubReg(SrcReg, SubIdx);
+        BuildMI(*MBB, MI, DL, TII->get(TargetOpcode::COPY), DstSub)
+            .addReg(SrcSub);
+      }
+      LLVM_DEBUG(dbgs() << "LICM: split tuple COPY for sub-reg hoisting: "
+                        << MI);
+      MI.eraseFromParent();
+    }
+  }
+}
+
 /// Walk the specified region of the CFG and hoist loop invariants out to the
 /// preheader.
 void MachineLICMImpl::HoistRegionPostRA(MachineLoop *CurLoop) {
   MachineBasicBlock *Preheader = getOrCreatePreheader(CurLoop);
   if (!Preheader)
     return;
+
+  splitHoistableTupleCopies(CurLoop, TRI, TII);
 
   unsigned NumRegUnits = TRI->getNumRegUnits();
   BitVector RUDefs(NumRegUnits);     // RUs defined once in the loop.
