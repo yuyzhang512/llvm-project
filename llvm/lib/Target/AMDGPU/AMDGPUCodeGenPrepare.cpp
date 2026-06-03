@@ -320,12 +320,16 @@ static bool dependsOnOtherPHINodeInTheSameBB(PHINode &PN) {
 // arithmetic chain on an i32 trip counter. We:
 //
 // 1. Walk the coord-descriptor's insertelement chain to recover the i64
-//    address SSA value (matchTDMAddressFromCoord).
+//    address SSA value (matchTDMAddressFromCoord, matchFlagBitOrOnLane3).
 // 2. Decompose the address's SCEV into a loop-invariant Start plus an
 //    affine AddRec contribution, computing the effective i64 Step
 //    (decomposeAffineAddrSCEV).
 // 3. Emit a single i64 phi `iv = phi [Start, ph], [iv + Step, latch]` and
 //    redirect in-loop uses of the address to the phi (emitAddressIV).
+// 4. Optionally bake the descriptor's architectural flag bit (lane-3
+//    bit 31 = the high bit of the descriptor's `type` field, above the
+//    address bits) into the phi's preheader value so the per-iter `or`
+//    becomes dead (tryBakeValidBitIntoIV).
 //
 // Running before LSR means LSR sees the phi as an existing IV and won't
 // collapse it into a shared scalar IV with per-use multiplications.
@@ -375,8 +379,9 @@ static Value *matchTDMAddressFromCoord(Value *CoordDesc) {
 
   // Lane 3 may be `or i32 trunc(...), <const>` because the descriptor
   // requires an architectural flag bit to be set on top of the address
-  // each iteration. Peel that OR so the trunc-of-lshr decomposition
-  // matches the inner address-derived value.
+  // each iteration. Peel that OR so the trunc-of-lshr decomposition can
+  // match the inner address-derived value; the OR itself is matched
+  // separately by matchFlagBitOrOnLane3.
   Value *HiInner;
   if (match(LaneHi, m_Or(m_Value(HiInner), m_ConstantInt())))
     LaneHi = HiInner;
@@ -388,6 +393,23 @@ static Value *matchTDMAddressFromCoord(Value *CoordDesc) {
   if (!Lo64->getType()->isIntegerTy(64))
     return nullptr;
   return Lo64;
+}
+
+/// If lane 3 wraps its trunc'd hi half in `or i32 hi, (1 << BitPos)`, return
+/// that OR. For TDM this is how Triton sets an architectural flag bit in
+/// the high half of the descriptor's address word each iteration.
+static BinaryOperator *matchFlagBitOrOnLane3(Value *CoordDesc,
+                                             unsigned BitPos) {
+  Value *LaneLo, *LaneHi;
+  if (!collectCoordLane2And3(CoordDesc, LaneLo, LaneHi))
+    return nullptr;
+  auto *BO = dyn_cast<BinaryOperator>(LaneHi);
+  if (!BO || BO->getOpcode() != Instruction::Or)
+    return nullptr;
+  auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1));
+  if (!CI || CI->getValue() != APInt::getOneBitSet(32, BitPos))
+    return nullptr;
+  return BO;
 }
 
 /// Try to decompose an i64 SCEV `S` describing a loop-variant address into
@@ -509,6 +531,45 @@ static PHINode *emitAddressIV(Loop *L, const SCEV *Start, int64_t Step,
   return PN;
 }
 
+/// Bake the architectural flag bit into the phi's preheader incoming value
+/// and replace the per-iter `or i32 hi32, (1<<31)` with its trunc operand
+/// (so the per-iter OR becomes dead). Returns true if applied.
+///
+/// Safety rests on the TDM-intrinsic contract, not on a generic bounds
+/// proof: the descriptor's address field is 57 bits (bits 56:0 of the
+/// 64-bit address word per the ISA encoding), and bit 63 of the i64 is the
+/// high bit of the `type` field — architectural, never part of the address.
+/// OR'ing bit 63 modifies the type field, not the address. The per-iter
+/// `iv + Step` increment touches only the address bits, so once bit 63 is
+/// set in the phi's start value it stays set for every iteration.
+///
+/// This is target+intrinsic-specific knowledge: we only call this for
+/// matched TDM intrinsics whose lane-3 OR is exactly `1 << 31`. Outside
+/// that context the transform would not be safe.
+static bool tryBakeValidBitIntoIV(PHINode *AddrIV,
+                                  BinaryOperator *ValidBitOr) {
+  if (!ValidBitOr)
+    return false;
+  APInt SignBit = APInt::getSignedMinValue(64); // 0x8000_0000_0000_0000
+
+  // OR the flag bit into the preheader incoming value.
+  BasicBlock *Preheader = AddrIV->getIncomingBlock(0) == AddrIV->getParent()
+                              ? AddrIV->getIncomingBlock(1)
+                              : AddrIV->getIncomingBlock(0);
+  unsigned PreIdx = AddrIV->getBasicBlockIndex(Preheader);
+  Value *PreVal = AddrIV->getIncomingValue(PreIdx);
+  IRBuilder<> B(Preheader->getTerminator());
+  Value *PreWithFlag =
+      B.CreateOr(PreVal, ConstantInt::get(AddrIV->getType(), SignBit),
+                 "amdgpu.tdm.addr.iv.valid");
+  AddrIV->setIncomingValue(PreIdx, PreWithFlag);
+
+  // The trunc'd high half of `iv` now already has bit 31 set, so the
+  // per-iter `or i32 hi32, (1<<31)` is redundant.
+  ValidBitOr->replaceAllUsesWith(ValidBitOr->getOperand(0));
+  return true;
+}
+
 /// Try to hoist the i64 address of a single TDM intrinsic into a
 /// per-descriptor phi-IV in its containing loop. Returns true on rewrite.
 static bool tryHoistTensorIntrinAddressIV(IntrinsicInst *II, Loop *L,
@@ -532,6 +593,12 @@ static bool tryHoistTensorIntrinAddressIV(IntrinsicInst *II, Loop *L,
       return L->contains(UI->getParent());
     return false;
   });
+
+  // Architectural type-field bit at lane-3 bit 31 corresponds to bit 63 of
+  // the i64 address. Bake it into the phi if SCEV proves it's safe.
+  if (BinaryOperator *FlagBitOr =
+          matchFlagBitOrOnLane3(CoordDesc, /*BitPos=*/31))
+    tryBakeValidBitIntoIV(IV, FlagBitOr);
 
   return true;
 }
