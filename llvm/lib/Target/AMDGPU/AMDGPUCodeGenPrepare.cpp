@@ -18,6 +18,9 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
@@ -36,6 +39,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/IntegerDivision.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 
 #define DEBUG_TYPE "amdgpu-codegenprepare"
 
@@ -102,6 +106,8 @@ public:
   const AMDGPUTargetMachine &TM;
   const TargetLibraryInfo *TLI;
   const UniformityInfo &UA;
+  ScalarEvolution *SE = nullptr;
+  LoopInfo *LI = nullptr;
   const DataLayout &DL;
   SimplifyQuery SQ;
   const bool HasFP32DenormalFlush;
@@ -114,11 +120,16 @@ public:
 
   AMDGPUCodeGenPrepareImpl(Function &F, const AMDGPUTargetMachine &TM,
                            const TargetLibraryInfo *TLI, AssumptionCache *AC,
-                           const DominatorTree *DT, const UniformityInfo &UA)
+                           const DominatorTree *DT, const UniformityInfo &UA,
+                           ScalarEvolution *SE = nullptr,
+                           LoopInfo *LI = nullptr)
       : F(F), ST(TM.getSubtarget<GCNSubtarget>(F)), TM(TM), TLI(TLI), UA(UA),
+        SE(SE), LI(LI),
         DL(F.getDataLayout()), SQ(DL, TLI, DT, AC),
         HasFP32DenormalFlush(SIModeRegisterDefaults(F, ST).FP32Denormals ==
                              DenormalMode::getPreserveSign()) {}
+
+  bool tryHoistTensorIntrinAddressIVs();
 
   Function *getSqrtF32() const {
     if (SqrtF32)
@@ -275,6 +286,8 @@ public:
     AU.addRequired<AssumptionCacheTracker>();
     AU.addRequired<UniformityInfoWrapperPass>();
     AU.addRequired<TargetLibraryInfoWrapperPass>();
+    AU.addRequired<ScalarEvolutionWrapperPass>();
+    AU.addRequired<LoopInfoWrapperPass>();
 
     // FIXME: Division expansion needs to preserve the dominator tree.
     if (!ExpandDiv64InIR)
@@ -285,7 +298,6 @@ public:
 };
 
 } // end anonymous namespace
-
 
 static bool dependsOnOtherPHINodeInTheSameBB(PHINode &PN) {
   for (const Value *Inc : PN.incoming_values()) {
@@ -298,9 +310,256 @@ static bool dependsOnOtherPHINodeInTheSameBB(PHINode &PN) {
   return false;
 }
 
+// ===-------------------------------------------------------------------=== //
+// TDM coord-descriptor address-IV transform (gfx125x tensor intrinsics).
+//
+// AMDGPU TDM intrinsics (tensor.{load.to.lds,store.from.lds}) take a
+// `<4 x i32>` coord-descriptor whose lanes 2/3 hold an i64 logical address
+// (lo32 in lane 2, hi32 in lane 3, optionally with bit 31 of lane 3 set as
+// a hardware "VALID" flag). Triton emits the address as a per-iter
+// arithmetic chain on an i32 trip counter. We:
+//
+// 1. Walk the coord-descriptor's insertelement chain to recover the i64
+//    address SSA value (matchTDMAddressFromCoord).
+// 2. Decompose the address's SCEV into a loop-invariant Start plus an
+//    affine AddRec contribution, computing the effective i64 Step
+//    (decomposeAffineAddrSCEV).
+// 3. Emit a single i64 phi `iv = phi [Start, ph], [iv + Step, latch]` and
+//    redirect in-loop uses of the address to the phi (emitAddressIV).
+//
+// Running before LSR means LSR sees the phi as an existing IV and won't
+// collapse it into a shared scalar IV with per-use multiplications.
+// ===-------------------------------------------------------------------=== //
+
+namespace {
+
+/// Decomposed view of an i64 address SCEV:
+///   S == Start (loop-invariant) + k * Step
+struct AffineAddrIV {
+  const SCEV *Start;
+  int64_t Step;
+};
+
+} // namespace
+
+/// Walk back through `CoordDesc`'s `insertelement` chain to find the i32
+/// values placed at lanes 2 and 3 — these are the low/high i32 halves of
+/// the descriptor's 64-bit global address. Returns true on success.
+static bool collectCoordLane2And3(Value *CoordDesc, Value *&LaneLo,
+                                  Value *&LaneHi) {
+  LaneLo = LaneHi = nullptr;
+  for (Value *V = CoordDesc; auto *IE = dyn_cast<InsertElementInst>(V);
+       V = IE->getOperand(0)) {
+    auto *IdxC = dyn_cast<ConstantInt>(IE->getOperand(2));
+    if (!IdxC)
+      return false;
+    if (IdxC->getZExtValue() == 2 && !LaneLo)
+      LaneLo = IE->getOperand(1);
+    else if (IdxC->getZExtValue() == 3 && !LaneHi)
+      LaneHi = IE->getOperand(1);
+  }
+  return LaneLo && LaneHi;
+}
+
+/// Match the `<4 x i32>` coord-descriptor passed to a TDM intrinsic and
+/// recover the i64 address split into lanes 2/3 as
+///   lane2 = trunc(addr)            // low 32 bits of the address
+///   lane3 = trunc(lshr(addr, 32))  // high 32 bits of the address;
+///                                  // upper bits of this i32 may also
+///                                  // carry architectural flag bits.
+/// Returns the i64 SSA value, or nullptr if the pattern doesn't fit.
+static Value *matchTDMAddressFromCoord(Value *CoordDesc) {
+  Value *LaneLo, *LaneHi;
+  if (!collectCoordLane2And3(CoordDesc, LaneLo, LaneHi))
+    return nullptr;
+
+  // Lane 3 may be `or i32 trunc(...), <const>` because the descriptor
+  // requires an architectural flag bit to be set on top of the address
+  // each iteration. Peel that OR so the trunc-of-lshr decomposition
+  // matches the inner address-derived value.
+  Value *HiInner;
+  if (match(LaneHi, m_Or(m_Value(HiInner), m_ConstantInt())))
+    LaneHi = HiInner;
+
+  Value *Lo64;
+  if (!match(LaneLo, m_Trunc(m_Value(Lo64))) ||
+      !match(LaneHi, m_Trunc(m_LShr(m_Specific(Lo64), m_SpecificInt(32)))))
+    return nullptr;
+  if (!Lo64->getType()->isIntegerTy(64))
+    return nullptr;
+  return Lo64;
+}
+
+/// Try to decompose an i64 SCEV `S` describing a loop-variant address into
+/// a loop-invariant `Start` SCEV plus an affine recurrence with constant
+/// step. Handles the common Triton shape
+///   S == sum(invariants) + C * (s|z)ext({Start',+,Step'}<L>)
+/// by walking the AddExpr operands, peeling constant multipliers and
+/// extension wrappers around the inner AddRec, then computing the effective
+/// i64 step (and folding the inner AddRec's Start through the same chain to
+/// obtain the loop-entry value).
+///
+/// Returns std::nullopt if the SCEV doesn't fit the pattern, or if the
+/// effective step would overflow i64.
+static std::optional<AffineAddrIV>
+decomposeAffineAddrSCEV(const SCEV *S, const Loop *L, ScalarEvolution &SE) {
+  // Split S = sum(InvariantOps) + ARContribution.
+  SmallVector<const SCEV *, 4> InvariantOps;
+  const SCEV *ARContribution = nullptr;
+  if (auto *Add = dyn_cast<SCEVAddExpr>(S)) {
+    for (const SCEV *Op : Add->operands()) {
+      if (SE.isLoopInvariant(Op, L)) {
+        InvariantOps.push_back(Op);
+      } else if (!ARContribution) {
+        ARContribution = Op;
+      } else {
+        return std::nullopt; // multiple loop-variant operands
+      }
+    }
+  } else if (!SE.isLoopInvariant(S, L)) {
+    ARContribution = S;
+  }
+  if (!ARContribution)
+    return std::nullopt;
+
+  // Peel `(mul C, ...)`, `sext`, `zext` to reach the inner SCEVAddRecExpr.
+  APInt Mul = APInt(64, 1);
+  const SCEV *Inner = ARContribution;
+  while (true) {
+    if (auto *M = dyn_cast<SCEVMulExpr>(Inner); M && M->getNumOperands() == 2)
+      if (auto *MC = dyn_cast<SCEVConstant>(M->getOperand(0))) {
+        bool Overflow = false;
+        Mul = Mul.smul_ov(MC->getAPInt().sextOrTrunc(64), Overflow);
+        if (Overflow)
+          return std::nullopt;
+        Inner = M->getOperand(1);
+        continue;
+      }
+    if (auto *E = dyn_cast<SCEVSignExtendExpr>(Inner)) {
+      Inner = E->getOperand();
+      continue;
+    }
+    if (auto *E = dyn_cast<SCEVZeroExtendExpr>(Inner)) {
+      Inner = E->getOperand();
+      continue;
+    }
+    break;
+  }
+  auto *AR = dyn_cast<SCEVAddRecExpr>(Inner);
+  if (!AR || AR->getLoop() != L || !AR->isAffine())
+    return std::nullopt;
+  auto *StepC = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+  if (!StepC)
+    return std::nullopt;
+  bool Overflow = false;
+  APInt EffStep = Mul.smul_ov(StepC->getAPInt().sextOrTrunc(64), Overflow);
+  if (Overflow)
+    return std::nullopt;
+
+  // Compute ARContribution at iteration 0: rewrite the inner AddRec with
+  // its Start so the wrapping mul/sext/zext chain gets rebuilt around it.
+  struct ReplaceARWithStart : SCEVRewriteVisitor<ReplaceARWithStart> {
+    const Loop *TargetL;
+    ReplaceARWithStart(ScalarEvolution &SE, const Loop *L)
+        : SCEVRewriteVisitor(SE), TargetL(L) {}
+    const SCEV *visitAddRecExpr(const SCEVAddRecExpr *X) {
+      if (X->getLoop() == TargetL)
+        return X->getStart();
+      return SCEVRewriteVisitor::visitAddRecExpr(X);
+    }
+  } Replacer(SE, L);
+  const SCEV *AREntry = Replacer.visit(ARContribution);
+  if (!SE.isLoopInvariant(AREntry, L))
+    return std::nullopt;
+
+  const SCEV *Start = AREntry;
+  for (const SCEV *Inv : InvariantOps)
+    Start = SE.getAddExpr(Start, Inv);
+  if (!SE.isLoopInvariant(Start, L))
+    return std::nullopt;
+
+  return AffineAddrIV{Start, EffStep.getSExtValue()};
+}
+
+/// Emit `iv = phi i64 [Start, preheader], [iv + Step, latch]` into `L`,
+/// using SCEVExpander to materialize Start in the preheader. Returns the
+/// new phi node. The `iv + Step` add is marked `nsw nuw` — safe because
+/// `Start` and the Step were derived from an existing affine SCEV that
+/// LLVM proved is well-defined across the loop's iteration range.
+static PHINode *emitAddressIV(Loop *L, const SCEV *Start, int64_t Step,
+                              Type *I64Ty, ScalarEvolution &SE) {
+  BasicBlock *Preheader = L->getLoopPreheader();
+  BasicBlock *Header = L->getHeader();
+  BasicBlock *Latch = L->getLoopLatch();
+
+  SCEVExpander Expander(SE, "amdgpu-tdm-iv", /*PreserveLCSSA=*/false);
+  Value *StartV =
+      Expander.expandCodeFor(Start, I64Ty, Preheader->getTerminator());
+
+  IRBuilder<> HdrB(&Header->front());
+  PHINode *PN = HdrB.CreatePHI(I64Ty, 2, "amdgpu.tdm.addr.iv");
+
+  IRBuilder<> LatchB(Latch->getTerminator());
+  Value *Next =
+      LatchB.CreateAdd(PN, ConstantInt::get(I64Ty, Step),
+                       "amdgpu.tdm.addr.iv.next", /*HasNUW=*/true,
+                       /*HasNSW=*/true);
+  PN->addIncoming(StartV, Preheader);
+  PN->addIncoming(Next, Latch);
+  return PN;
+}
+
+/// Try to hoist the i64 address of a single TDM intrinsic into a
+/// per-descriptor phi-IV in its containing loop. Returns true on rewrite.
+static bool tryHoistTensorIntrinAddressIV(IntrinsicInst *II, Loop *L,
+                                          ScalarEvolution &SE) {
+  Value *CoordDesc = II->getArgOperand(0);
+  Value *Addr = matchTDMAddressFromCoord(CoordDesc);
+  if (!Addr || !isa<Instruction>(Addr))
+    return false;
+
+  const SCEV *AddrS = SE.getSCEV(Addr);
+  auto Decomp = decomposeAffineAddrSCEV(AddrS, L, SE);
+  if (!Decomp)
+    return false;
+
+  PHINode *IV = emitAddressIV(L, Decomp->Start, Decomp->Step,
+                              Addr->getType(), SE);
+
+  // Redirect in-loop uses of the original address to the new phi.
+  cast<Instruction>(Addr)->replaceUsesWithIf(IV, [L](Use &U) {
+    if (auto *UI = dyn_cast<Instruction>(U.getUser()))
+      return L->contains(UI->getParent());
+    return false;
+  });
+
+  return true;
+}
+
+bool AMDGPUCodeGenPrepareImpl::tryHoistTensorIntrinAddressIVs() {
+  if (!SE || !LI)
+    return false;
+  bool Changed = false;
+  for (BasicBlock &BB : F) {
+    Loop *L = LI->getLoopFor(&BB);
+    if (!L || !L->getLoopPreheader() || !L->getLoopLatch())
+      continue;
+    for (Instruction &I : make_early_inc_range(BB)) {
+      auto *II = dyn_cast<IntrinsicInst>(&I);
+      if (!II)
+        continue;
+      if (II->getIntrinsicID() != Intrinsic::amdgcn_tensor_load_to_lds &&
+          II->getIntrinsicID() != Intrinsic::amdgcn_tensor_store_from_lds)
+        continue;
+      Changed |= tryHoistTensorIntrinAddressIV(II, L, *SE);
+    }
+  }
+  return Changed;
+}
+
 bool AMDGPUCodeGenPrepareImpl::run() {
   BreakPhiNodesCache.clear();
-  bool MadeChange = false;
+  bool MadeChange = tryHoistTensorIntrinAddressIVs();
 
   // Need to use make_early_inc_range because integer division expansion is
   // handled by Transform/Utils, and it can delete instructions such as the
@@ -2293,7 +2552,9 @@ bool AMDGPUCodeGenPrepare::runOnFunction(Function &F) {
   const DominatorTree *DT = DTWP ? &DTWP->getDomTree() : nullptr;
   const UniformityInfo &UA =
       getAnalysis<UniformityInfoWrapperPass>().getUniformityInfo();
-  return AMDGPUCodeGenPrepareImpl(F, TM, TLI, AC, DT, UA).run();
+  ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+  LoopInfo &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+  return AMDGPUCodeGenPrepareImpl(F, TM, TLI, AC, DT, UA, &SE, &LI).run();
 }
 
 PreservedAnalyses AMDGPUCodeGenPreparePass::run(Function &F,
@@ -2303,7 +2564,9 @@ PreservedAnalyses AMDGPUCodeGenPreparePass::run(Function &F,
   AssumptionCache *AC = &FAM.getResult<AssumptionAnalysis>(F);
   const DominatorTree *DT = FAM.getCachedResult<DominatorTreeAnalysis>(F);
   const UniformityInfo &UA = FAM.getResult<UniformityInfoAnalysis>(F);
-  AMDGPUCodeGenPrepareImpl Impl(F, ATM, TLI, AC, DT, UA);
+  ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+  LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
+  AMDGPUCodeGenPrepareImpl Impl(F, ATM, TLI, AC, DT, UA, &SE, &LI);
   if (!Impl.run())
     return PreservedAnalyses::all();
   PreservedAnalyses PA = PreservedAnalyses::none();
