@@ -4198,6 +4198,20 @@ class AMDGPUTensorLoadStore:
 def int_amdgcn_tensor_load_to_lds    : ClangBuiltin<"__builtin_amdgcn_tensor_load_to_lds">, AMDGPUTensorLoadStore;
 def int_amdgcn_tensor_store_from_lds : ClangBuiltin<"__builtin_amdgcn_tensor_store_from_lds">, AMDGPUTensorLoadStore;
 
+// Replace one i32 lane of a TDM descriptor in place. Lowered to a tied
+// pseudo so the register allocator places %dst in the same SReg as %src,
+// then expanded post-RA to a single S_MOV_B32 of the named subreg.
+// Use to chain N descriptors that differ in a single lane (typical TDM
+// gather/scatter pattern), avoiding N-1 full-tuple s_mov_b64 sequences.
+def int_amdgcn_tensor_desc_update_lane :
+  DefaultAttrsIntrinsic<
+    [llvm_anyvector_ty],
+    [LLVMMatchType<0>,   // %src descriptor (<N x i32>)
+     llvm_i32_ty,        // %val new lane value
+     llvm_i32_ty],       // %lane immarg, 0 <= lane < N
+    [IntrNoMem, IntrSpeculatable, ImmArg<ArgIndex<2>>]
+  >;
+
 class AMDGPUClusterLoad<LLVMType ptr_ty>:
   Intrinsic<
     [llvm_any_ty],

@@ -3153,6 +3153,11 @@ void AMDGPURegisterBankInfo::applyMappingImpl(
       constrainOpWithReadfirstlane(B, MI, 3); // Index
       return;
     }
+    case Intrinsic::amdgcn_tensor_desc_update_lane: {
+      constrainOpWithReadfirstlane(B, MI, 2); // src descriptor
+      constrainOpWithReadfirstlane(B, MI, 3); // new lane value
+      return;
+    }
     case Intrinsic::amdgcn_writelane: {
       assert(OpdMapper.getVRegs(0).empty());
       assert(OpdMapper.getVRegs(2).empty());
@@ -5266,6 +5271,20 @@ AMDGPURegisterBankInfo::getInstrMapping(const MachineInstr &MI) const {
       unsigned MaskBank = getRegBankID(MaskReg, MRI, AMDGPU::SGPRRegBankID);
       OpdsMapping[0] = AMDGPU::getValueMapping(AMDGPU::SGPRRegBankID, 64);
       OpdsMapping[2] = AMDGPU::getValueMapping(MaskBank, 32);
+      break;
+    }
+    case Intrinsic::amdgcn_tensor_desc_update_lane: {
+      // Lie and claim everything is in SGPR; applyMapping will insert
+      // readfirstlanes for any VGPR inputs.
+      Register DstReg = MI.getOperand(0).getReg();
+      Register SrcReg = MI.getOperand(2).getReg();
+      Register ValReg = MI.getOperand(3).getReg();
+      OpdsMapping[0] = AMDGPU::getValueMapping(AMDGPU::SGPRRegBankID,
+                                               getSizeInBits(DstReg, MRI, *TRI));
+      OpdsMapping[2] = AMDGPU::getValueMapping(AMDGPU::SGPRRegBankID,
+                                               getSizeInBits(SrcReg, MRI, *TRI));
+      OpdsMapping[3] = AMDGPU::getValueMapping(AMDGPU::SGPRRegBankID,
+                                               getSizeInBits(ValReg, MRI, *TRI));
       break;
     }
     case Intrinsic::amdgcn_wave_shuffle: {

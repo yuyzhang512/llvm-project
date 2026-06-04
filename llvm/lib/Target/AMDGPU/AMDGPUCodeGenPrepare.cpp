@@ -130,6 +130,7 @@ public:
                              DenormalMode::getPreserveSign()) {}
 
   bool tryHoistTensorIntrinAddressIVs();
+  bool chainTensorDescriptorsByLaneUpdate();
 
   Function *getSqrtF32() const {
     if (SqrtF32)
@@ -624,9 +625,160 @@ bool AMDGPUCodeGenPrepareImpl::tryHoistTensorIntrinAddressIVs() {
   return Changed;
 }
 
+// ===---------------- Chain TDM descriptors via update.lane ---------------=== //
+//
+// Triton emits each TDM gather/scatter descriptor as a fresh
+// REG_SEQUENCE-style insertelement chain rooted at a constant initializer.
+// When N consecutive `tensor_load_to_lds` / `tensor_store_from_lds` calls in
+// the same basic block share all but one lane of group0 (lanes 0/2/3 equal,
+// lane 1 = lds_addr differs per call), the optimal codegen reuses a single
+// SReg_128 tuple and rewrites lane 1 in place per call -- but LLVM's
+// register coalescer cannot subreg-coalesce across independent REG_SEQUENCEs.
+//
+// To force that codegen we rewrite the 2nd, 3rd, ... descriptors as
+//   d_i = @llvm.amdgcn.tensor.desc.update.lane(d_{i-1}, new_lane_val, k)
+// which lowers to a pseudo with `Constraints = "$src = $dst"`. The RA must
+// place d_i on the same SReg_128 as d_{i-1}; post-RA expansion is a single
+// S_MOV_B32 on the named subreg. Savings: ~2 instructions per follower
+// descriptor (was full-tuple s_mov_b64 + lane write; becomes one s_mov_b32).
+//
+// Run before LSR so the rewritten chain is visible to selection and the
+// tied-operand pseudo survives.
+
+namespace {
+
+/// Lane-major view of an insertelement chain feeding a `<N x i32>` value.
+/// For each lane that's explicitly set (by an insertelement or by the
+/// constant-vector root), holds the SSA Value placed in that lane.
+struct VectorLaneMap {
+  SmallDenseMap<unsigned, Value *, 4> Lanes;
+  unsigned NumElts = 0;
+};
+
+/// Walk back through `V`'s insertelement chain to enumerate which lanes are
+/// set and by what value. Returns nullopt on a non-`<N x i32>` value, a
+/// non-constant lane index, or a root we can't decode (anything other than a
+/// Constant vector / poison / undef).
+static std::optional<VectorLaneMap> collectVectorLanes(Value *V) {
+  auto *VT = dyn_cast<FixedVectorType>(V->getType());
+  if (!VT || !VT->getElementType()->isIntegerTy(32))
+    return std::nullopt;
+  VectorLaneMap M;
+  M.NumElts = VT->getNumElements();
+  while (auto *IE = dyn_cast<InsertElementInst>(V)) {
+    auto *IdxC = dyn_cast<ConstantInt>(IE->getOperand(2));
+    if (!IdxC || IdxC->getZExtValue() >= M.NumElts)
+      return std::nullopt;
+    unsigned Idx = IdxC->getZExtValue();
+    // Outermost insert for a given lane wins; ignore inner re-inserts that
+    // are dead-overwritten.
+    M.Lanes.try_emplace(Idx, IE->getOperand(1));
+    V = IE->getOperand(0);
+  }
+  // Root must be a constant (incl. poison/undef) so we know the unset lanes.
+  auto *RootC = dyn_cast<Constant>(V);
+  if (!RootC)
+    return std::nullopt;
+  for (unsigned I = 0; I < M.NumElts; ++I) {
+    if (M.Lanes.contains(I))
+      continue;
+    Constant *Elt = RootC->getAggregateElement(I);
+    if (!Elt)
+      return std::nullopt;
+    M.Lanes[I] = Elt;
+  }
+  return M;
+}
+
+/// If `A` and `B` differ in exactly one lane (same NumElts, every other lane
+/// holds the same SSA Value or equal Constant), return that lane index.
+/// Returns nullopt if they're identical or differ in more than one lane.
+static std::optional<unsigned> findSoleDifferingLane(const VectorLaneMap &A,
+                                                     const VectorLaneMap &B) {
+  if (A.NumElts != B.NumElts)
+    return std::nullopt;
+  std::optional<unsigned> Diff;
+  for (unsigned I = 0; I < A.NumElts; ++I) {
+    Value *AV = A.Lanes.lookup(I);
+    Value *BV = B.Lanes.lookup(I);
+    if (!AV || !BV)
+      return std::nullopt;
+    if (AV == BV)
+      continue;
+    if (auto *AC = dyn_cast<Constant>(AV))
+      if (auto *BC = dyn_cast<Constant>(BV))
+        if (AC == BC)
+          continue;
+    if (Diff)
+      return std::nullopt; // more than one lane differs
+    Diff = I;
+  }
+  return Diff;
+}
+
+static bool isTensorLoadStoreIntrin(const IntrinsicInst *II) {
+  Intrinsic::ID ID = II->getIntrinsicID();
+  return ID == Intrinsic::amdgcn_tensor_load_to_lds ||
+         ID == Intrinsic::amdgcn_tensor_store_from_lds;
+}
+
+/// For each pair of TDM intrinsic calls in this BB whose group0 (vaddr0,
+/// operand 0) differs only at one lane, rewrite the second's group0 to
+///   @llvm.amdgcn.tensor.desc.update.lane(first_group0, new_lane_val, lane)
+/// The intrinsic lowers to a tied SI_TENSOR_DESC_UPDATE_LANE_V4 pseudo so the
+/// register allocator places the new descriptor on the same SReg_128.
+static bool chainTensorDescriptorsInBB(BasicBlock &BB) {
+  // Most recent "anchor" we can chain follow-ups from: the LLVM Value used as
+  // group0 by the previous TDM intrinsic in dataflow order.
+  Value *PrevGroup0 = nullptr;
+  std::optional<VectorLaneMap> PrevLanes;
+  bool Changed = false;
+  for (Instruction &I : BB) {
+    auto *II = dyn_cast<IntrinsicInst>(&I);
+    if (!II || !isTensorLoadStoreIntrin(II))
+      continue;
+    Value *G0 = II->getArgOperand(0);
+    auto CurLanes = collectVectorLanes(G0);
+    if (!CurLanes) {
+      PrevGroup0 = nullptr;
+      PrevLanes.reset();
+      continue;
+    }
+    if (PrevGroup0) {
+      if (auto Lane = findSoleDifferingLane(*PrevLanes, *CurLanes)) {
+        Value *NewVal = CurLanes->Lanes.lookup(*Lane);
+        IRBuilder<> B(II);
+        Function *F = Intrinsic::getOrInsertDeclaration(
+            BB.getModule(), Intrinsic::amdgcn_tensor_desc_update_lane,
+            {G0->getType()});
+        Value *Updated =
+            B.CreateCall(F, {PrevGroup0, NewVal, B.getInt32(*Lane)});
+        II->setArgOperand(0, Updated);
+        PrevGroup0 = Updated;
+        PrevLanes = std::move(CurLanes);
+        Changed = true;
+        continue;
+      }
+    }
+    PrevGroup0 = G0;
+    PrevLanes = std::move(CurLanes);
+  }
+  return Changed;
+}
+
+} // namespace
+
+bool AMDGPUCodeGenPrepareImpl::chainTensorDescriptorsByLaneUpdate() {
+  bool Changed = false;
+  for (BasicBlock &BB : F)
+    Changed |= chainTensorDescriptorsInBB(BB);
+  return Changed;
+}
+
 bool AMDGPUCodeGenPrepareImpl::run() {
   BreakPhiNodesCache.clear();
   bool MadeChange = tryHoistTensorIntrinAddressIVs();
+  MadeChange |= chainTensorDescriptorsByLaneUpdate();
 
   // Need to use make_early_inc_range because integer division expansion is
   // handled by Transform/Utils, and it can delete instructions such as the

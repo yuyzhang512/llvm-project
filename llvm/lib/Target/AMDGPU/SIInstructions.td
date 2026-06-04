@@ -1097,6 +1097,34 @@ def S_INDIRECT_REG_WRITE_MOVREL_B64_V4 : S_INDIRECT_REG_WRITE_MOVREL_B64_pseudo<
 def S_INDIRECT_REG_WRITE_MOVREL_B64_V8 : S_INDIRECT_REG_WRITE_MOVREL_B64_pseudo<SReg_512>;
 def S_INDIRECT_REG_WRITE_MOVREL_B64_V16 : S_INDIRECT_REG_WRITE_MOVREL_B64_pseudo<SReg_1024>;
 
+// Tied in-place lane update of a TDM descriptor. Lowered post-RA to a
+// single S_MOV_B32 of the named subreg; the register allocator places
+// $dst on the same SReg as $src so no full-tuple copy is needed.
+class SI_TENSOR_DESC_UPDATE_LANE_pseudo<RegisterClass rc> : SPseudoInstSI <
+  (outs rc:$dst), (ins rc:$src, SSrc_b32:$val, i32imm:$lane)> {
+  let Constraints = "$src = $dst";
+  let hasSideEffects = 0;
+  let mayLoad = 0;
+  let mayStore = 0;
+  let SALU = 1;
+  let SchedRW = [WriteSALU];
+  let Size = 4;
+}
+
+def SI_TENSOR_DESC_UPDATE_LANE_V4 : SI_TENSOR_DESC_UPDATE_LANE_pseudo<SReg_128>;
+def SI_TENSOR_DESC_UPDATE_LANE_V8 : SI_TENSOR_DESC_UPDATE_LANE_pseudo<SReg_256>;
+
+def : GCNPat <
+  (v4i32 (int_amdgcn_tensor_desc_update_lane v4i32:$src, i32:$val,
+                                             (i32 timm:$lane))),
+  (SI_TENSOR_DESC_UPDATE_LANE_V4 SReg_128:$src, SSrc_b32:$val, timm:$lane)
+>;
+def : GCNPat <
+  (v8i32 (int_amdgcn_tensor_desc_update_lane v8i32:$src, i32:$val,
+                                             (i32 timm:$lane))),
+  (SI_TENSOR_DESC_UPDATE_LANE_V8 SReg_256:$src, SSrc_b32:$val, timm:$lane)
+>;
+
 // These variants of V_INDIRECT_REG_READ/WRITE use VGPR indexing. By using these
 // pseudos we avoid spills or copies being inserted within indirect sequences
 // that switch the VGPR indexing mode. Spills to accvgprs could be effected by
