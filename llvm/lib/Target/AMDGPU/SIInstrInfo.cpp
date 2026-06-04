@@ -2177,23 +2177,6 @@ bool SIInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
   case AMDGPU::SI_RESTORE_S32_FROM_VGPR:
     MI.setDesc(get(AMDGPU::V_READLANE_B32));
     break;
-  case AMDGPU::SI_TENSOR_DESC_UPDATE_LANE_V4:
-  case AMDGPU::SI_TENSOR_DESC_UPDATE_LANE_V8: {
-    // Tied $src = $dst, so after RA both name the same physical SReg tuple.
-    // Lower to a single S_MOV_B32 of the lane's subreg, leaving the other
-    // lanes untouched.
-    Register Dst = MI.getOperand(0).getReg();
-    Register Val = MI.getOperand(2).getReg();
-    unsigned Lane = MI.getOperand(3).getImm();
-    static const unsigned LaneSubRegs[] = {
-        AMDGPU::sub0, AMDGPU::sub1, AMDGPU::sub2, AMDGPU::sub3,
-        AMDGPU::sub4, AMDGPU::sub5, AMDGPU::sub6, AMDGPU::sub7};
-    assert(Lane < std::size(LaneSubRegs) && "lane out of range");
-    Register DstSub = RI.getSubReg(Dst, LaneSubRegs[Lane]);
-    BuildMI(MBB, MI, DL, get(AMDGPU::S_MOV_B32), DstSub).addReg(Val);
-    MI.eraseFromParent();
-    break;
-  }
   case AMDGPU::AV_MOV_B32_IMM_PSEUDO: {
     Register Dst = MI.getOperand(0).getReg();
     bool IsAGPR = SIRegisterInfo::isAGPRClass(RI.getPhysRegBaseClass(Dst));

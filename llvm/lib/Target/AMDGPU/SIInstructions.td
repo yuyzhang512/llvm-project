@@ -1097,33 +1097,27 @@ def S_INDIRECT_REG_WRITE_MOVREL_B64_V4 : S_INDIRECT_REG_WRITE_MOVREL_B64_pseudo<
 def S_INDIRECT_REG_WRITE_MOVREL_B64_V8 : S_INDIRECT_REG_WRITE_MOVREL_B64_pseudo<SReg_512>;
 def S_INDIRECT_REG_WRITE_MOVREL_B64_V16 : S_INDIRECT_REG_WRITE_MOVREL_B64_pseudo<SReg_1024>;
 
-// Tied in-place lane update of a TDM descriptor. Lowered post-RA to a
-// single S_MOV_B32 of the named subreg; the register allocator places
-// $dst on the same SReg as $src so no full-tuple copy is needed.
-class SI_TENSOR_DESC_UPDATE_LANE_pseudo<RegisterClass rc> : SPseudoInstSI <
-  (outs rc:$dst), (ins rc:$src, SSrc_b32:$val, i32imm:$lane)> {
-  let Constraints = "$src = $dst";
-  let hasSideEffects = 0;
-  let mayLoad = 0;
-  let mayStore = 0;
-  let SALU = 1;
-  let SchedRW = [WriteSALU];
-  let Size = 4;
+// In-place lane update of a TDM descriptor lowered to a generic
+// INSERT_SUBREG. This gives the register allocator standard subreg
+// semantics (the def writes only the named subreg, the other lanes
+// inherit from $src), which lets MachineLICM track the in-loop
+// clobber set at sub-register granularity -- a tied-def pseudo over
+// the full tuple would mark every lane as in-loop-redefined and
+// block hoisting of invariant per-half preheader-seed COPYs.
+multiclass TensorDescUpdateLanePats<ValueType vt, RegisterClass rc> {
+  foreach lane = !range(vt.nElem) in {
+    def : GCNPat<
+      (vt (int_amdgcn_tensor_desc_update_lane vt:$src, i32:$val, (i32 lane))),
+      (INSERT_SUBREG rc:$src, SSrc_b32:$val,
+                     !cast<SubRegIndex>("sub"#lane))>;
+  }
 }
-
-def SI_TENSOR_DESC_UPDATE_LANE_V4 : SI_TENSOR_DESC_UPDATE_LANE_pseudo<SReg_128>;
-def SI_TENSOR_DESC_UPDATE_LANE_V8 : SI_TENSOR_DESC_UPDATE_LANE_pseudo<SReg_256>;
-
-def : GCNPat <
-  (v4i32 (int_amdgcn_tensor_desc_update_lane v4i32:$src, i32:$val,
-                                             (i32 timm:$lane))),
-  (SI_TENSOR_DESC_UPDATE_LANE_V4 SReg_128:$src, SSrc_b32:$val, timm:$lane)
->;
-def : GCNPat <
-  (v8i32 (int_amdgcn_tensor_desc_update_lane v8i32:$src, i32:$val,
-                                             (i32 timm:$lane))),
-  (SI_TENSOR_DESC_UPDATE_LANE_V8 SReg_256:$src, SSrc_b32:$val, timm:$lane)
->;
+// SDAG-only: GISel cannot import INSERT_SUBREG patterns; it selects this
+// intrinsic via the manual case in AMDGPUInstructionSelector.cpp.
+let GISelShouldIgnore = 1 in {
+  defm : TensorDescUpdateLanePats<v4i32, SReg_128>;
+  defm : TensorDescUpdateLanePats<v8i32, SReg_256>;
+}
 
 // These variants of V_INDIRECT_REG_READ/WRITE use VGPR indexing. By using these
 // pseudos we avoid spills or copies being inserted within indirect sequences

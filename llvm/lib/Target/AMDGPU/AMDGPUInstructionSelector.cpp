@@ -1167,6 +1167,33 @@ bool AMDGPUInstructionSelector::selectG_INTRINSIC(MachineInstr &I) const {
   }
   case Intrinsic::amdgcn_interp_p1_f16:
     return selectInterpP1F16(I);
+  case Intrinsic::amdgcn_tensor_desc_update_lane: {
+    // %dst = update.lane %src, %val, lane  =>  INSERT_SUBREG dst, src, val, subN
+    MachineBasicBlock *BB = I.getParent();
+    Register DstReg = I.getOperand(0).getReg();
+    Register SrcReg = I.getOperand(2).getReg();
+    Register ValReg = I.getOperand(3).getReg();
+    unsigned Lane = I.getOperand(4).getImm();
+    const TargetRegisterClass *TupleRC =
+        MRI->getType(DstReg).getSizeInBits() == 256 ? &AMDGPU::SGPR_256RegClass
+                                                    : &AMDGPU::SGPR_128RegClass;
+    static const unsigned LaneSubRegs[] = {
+        AMDGPU::sub0, AMDGPU::sub1, AMDGPU::sub2, AMDGPU::sub3,
+        AMDGPU::sub4, AMDGPU::sub5, AMDGPU::sub6, AMDGPU::sub7};
+    if (Lane >= std::size(LaneSubRegs))
+      return false;
+    if (!RBI.constrainGenericRegister(DstReg, *TupleRC, *MRI) ||
+        !RBI.constrainGenericRegister(SrcReg, *TupleRC, *MRI) ||
+        !RBI.constrainGenericRegister(ValReg, AMDGPU::SReg_32RegClass, *MRI))
+      return false;
+    BuildMI(*BB, &I, I.getDebugLoc(), TII.get(TargetOpcode::INSERT_SUBREG),
+            DstReg)
+        .addReg(SrcReg)
+        .addReg(ValReg)
+        .addImm(LaneSubRegs[Lane]);
+    I.eraseFromParent();
+    return true;
+  }
   case Intrinsic::amdgcn_wqm:
     return constrainCopyLikeIntrin(I, AMDGPU::WQM);
   case Intrinsic::amdgcn_softwqm:
