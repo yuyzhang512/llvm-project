@@ -690,14 +690,14 @@ static std::optional<VectorLaneMap> collectVectorLanes(Value *V) {
   return M;
 }
 
-/// If `A` and `B` differ in exactly one lane (same NumElts, every other lane
-/// holds the same SSA Value or equal Constant), return that lane index.
-/// Returns nullopt if they're identical or differ in more than one lane.
-static std::optional<unsigned> findSoleDifferingLane(const VectorLaneMap &A,
-                                                     const VectorLaneMap &B) {
+/// Return the set of lane indices where `A` and `B` differ. Returns nullopt if
+/// the two vectors are structurally incompatible (different NumElts) or any
+/// lane is unset. An empty list means the two are bitwise identical.
+static std::optional<SmallVector<unsigned, 4>>
+findDifferingLanes(const VectorLaneMap &A, const VectorLaneMap &B) {
   if (A.NumElts != B.NumElts)
     return std::nullopt;
-  std::optional<unsigned> Diff;
+  SmallVector<unsigned, 4> Diffs;
   for (unsigned I = 0; I < A.NumElts; ++I) {
     Value *AV = A.Lanes.lookup(I);
     Value *BV = B.Lanes.lookup(I);
@@ -709,11 +709,9 @@ static std::optional<unsigned> findSoleDifferingLane(const VectorLaneMap &A,
       if (auto *BC = dyn_cast<Constant>(BV))
         if (AC == BC)
           continue;
-    if (Diff)
-      return std::nullopt; // more than one lane differs
-    Diff = I;
+    Diffs.push_back(I);
   }
-  return Diff;
+  return Diffs;
 }
 
 static bool isTensorLoadStoreIntrin(const IntrinsicInst *II) {
@@ -722,46 +720,136 @@ static bool isTensorLoadStoreIntrin(const IntrinsicInst *II) {
          ID == Intrinsic::amdgcn_tensor_store_from_lds;
 }
 
-/// For each pair of TDM intrinsic calls in this BB whose group0 (vaddr0,
-/// operand 0) differs only at one lane, rewrite the second's group0 to
-///   @llvm.amdgcn.tensor.desc.update.lane(first_group0, new_lane_val, lane)
-/// The intrinsic lowers to a tied SI_TENSOR_DESC_UPDATE_LANE_V4 pseudo so the
-/// register allocator places the new descriptor on the same SReg_128.
-static bool chainTensorDescriptorsInBB(BasicBlock &BB) {
-  // Most recent "anchor" we can chain follow-ups from: the LLVM Value used as
-  // group0 by the previous TDM intrinsic in dataflow order.
-  Value *PrevGroup0 = nullptr;
-  std::optional<VectorLaneMap> PrevLanes;
+/// Set up a loop-header phi that carries the previous-iteration tuple value
+/// across the back-edge so that mutating its lanes mid-iter is safe. We rewire
+/// the bottom of `Source`'s insertelement chain (whose root must currently be
+/// a Constant) to use the phi as its source instead of the constant.
+///
+/// Returns the newly-created phi (caller wires up the back-edge incoming after
+/// emitting the chain), or nullptr if the loop shape is unsuitable or the
+/// chain doesn't bottom out at a Constant.
+///
+/// The point of the phi: without it, the back-edge value of the source tuple
+/// is implicitly the original constant (LLVM optimizes the source as
+/// loop-invariant at MIR level), so the coalescer can't tie chain links that
+/// would mutate lanes which the source's chain doesn't visibly rewrite each
+/// iter. With the phi, the back-edge value is the chain's final mutated
+/// result, which makes lane writes from the existing rebuild IEs non-redundant
+/// (the optimizer can no longer prove "lane already has the right value") --
+/// they survive as per-iter `S_MOV_B32 subN, ...` writes, and mid-iter
+/// mutations from the chain become safe (next iter rebuilds them).
+static PHINode *setupCarrierPhiForChain(Loop *L, Value *Source) {
+  if (!L)
+    return nullptr;
+  BasicBlock *PH = L->getLoopPreheader();
+  BasicBlock *Latch = L->getLoopLatch();
+  BasicBlock *Header = L->getHeader();
+  if (!PH || !Latch || !Header)
+    return nullptr;
+  // Walk back through Source's insertelement chain to the root.
+  Value *Cur = Source;
+  InsertElementInst *BottomIE = nullptr;
+  while (auto *IE = dyn_cast<InsertElementInst>(Cur)) {
+    BottomIE = IE;
+    Cur = IE->getOperand(0);
+  }
+  // Only handle a Constant root for now; rewiring a non-constant root would
+  // require dominance reasoning we don't do here.
+  if (!BottomIE || !isa<Constant>(Cur))
+    return nullptr;
+  // BottomIE must be inside the loop -- otherwise rewiring would change the
+  // value seen outside the loop.
+  if (!L->contains(BottomIE->getParent()))
+    return nullptr;
+  PHINode *Phi = PHINode::Create(Cur->getType(), 2, "tdm.chain.carrier",
+                                 Header->getFirstNonPHIIt());
+  // Preheader incoming = the original root constant. Back-edge incoming is
+  // added by the caller once the chain has been emitted.
+  Phi->addIncoming(Cur, PH);
+  BottomIE->setOperand(0, Phi);
+  return Phi;
+}
+
+/// For each pair of consecutive TDM intrinsic calls in this BB, for each
+/// vector-group operand (group0/1/2/3, indices 0..3), if the operand differs
+/// from the previous call's operand in fewer than NumElts lanes, rewrite the
+/// second call's operand as a chain of
+///   @llvm.amdgcn.tensor.desc.update.lane(prev, new_lane_val, lane)
+/// (one link per differing lane). After ISel each link is a single
+/// INSERT_SUBREG; if the coalescer ties the new tuple to the previous, the
+/// per-iter cost collapses to K x s_mov_b32 of the named subregs instead of
+/// a full-tuple seed copy + K x s_mov_b32.
+///
+/// For multi-lane chains (K >= 2) we additionally set up a carrier-phi at the
+/// containing loop's header so the coalescer is free to tie chain links that
+/// would mutate lanes the source's per-iter rebuild doesn't visibly rewrite.
+/// See setupCarrierPhiForChain for the rationale.
+///
+/// "All lanes differ" is skipped because at that point the chain just rewrites
+/// every lane and the seed (which is now fully dead) is pure overhead -- the
+/// existing fresh-build path is at least as good.
+static bool chainTensorDescriptorsInBB(BasicBlock &BB, LoopInfo *LI) {
+  // Vector-group operands of @llvm.amdgcn.tensor.{load.to.lds,store.from.lds}:
+  //   0: group0 (v4i32),  1: group1 (v8i32),
+  //   2: group2 (v4i32),  3: group3 (v4i32).
+  // Operand 4 (group4, v8i32) is always zeroinitializer per the intrinsic
+  // contract -- skip; operand 5 is cpol (i32).
+  static constexpr unsigned NumVecOperands = 4;
+  std::array<Value *, NumVecOperands> PrevValue = {};
+  std::array<std::optional<VectorLaneMap>, NumVecOperands> PrevLanes;
+  Loop *L = LI ? LI->getLoopFor(&BB) : nullptr;
   bool Changed = false;
   for (Instruction &I : BB) {
     auto *II = dyn_cast<IntrinsicInst>(&I);
     if (!II || !isTensorLoadStoreIntrin(II))
       continue;
-    Value *G0 = II->getArgOperand(0);
-    auto CurLanes = collectVectorLanes(G0);
-    if (!CurLanes) {
-      PrevGroup0 = nullptr;
-      PrevLanes.reset();
-      continue;
-    }
-    if (PrevGroup0) {
-      if (auto Lane = findSoleDifferingLane(*PrevLanes, *CurLanes)) {
-        Value *NewVal = CurLanes->Lanes.lookup(*Lane);
-        IRBuilder<> B(II);
-        Function *F = Intrinsic::getOrInsertDeclaration(
-            BB.getModule(), Intrinsic::amdgcn_tensor_desc_update_lane,
-            {G0->getType()});
-        Value *Updated =
-            B.CreateCall(F, {PrevGroup0, NewVal, B.getInt32(*Lane)});
-        II->setArgOperand(0, Updated);
-        PrevGroup0 = Updated;
-        PrevLanes = std::move(CurLanes);
-        Changed = true;
+    for (unsigned OpIdx = 0; OpIdx < NumVecOperands; ++OpIdx) {
+      Value *V = II->getArgOperand(OpIdx);
+      auto CurLanes = collectVectorLanes(V);
+      if (!CurLanes) {
+        PrevValue[OpIdx] = nullptr;
+        PrevLanes[OpIdx].reset();
         continue;
       }
+      if (PrevValue[OpIdx]) {
+        auto Diffs = findDifferingLanes(*PrevLanes[OpIdx], *CurLanes);
+        if (Diffs && !Diffs->empty() && Diffs->size() < CurLanes->NumElts) {
+          // For K >= 2 we need a carrier-phi to keep mid-iter mutations safe
+          // (see setupCarrierPhiForChain). K == 1 is fine without one: even
+          // when the lane's source subreg looks loop-invariant the coalescer
+          // gracefully falls back to seed-copy + 1 write (== baseline cost).
+          PHINode *Carrier = nullptr;
+          if (Diffs->size() >= 2) {
+            Carrier = setupCarrierPhiForChain(L, PrevValue[OpIdx]);
+            if (!Carrier) {
+              // Can't set up carrier; bail rather than risk the multi-lane
+              // regression that motivated the carrier-phi in the first place.
+              PrevValue[OpIdx] = V;
+              PrevLanes[OpIdx] = std::move(CurLanes);
+              continue;
+            }
+          }
+          IRBuilder<> B(II);
+          Function *F = Intrinsic::getOrInsertDeclaration(
+              BB.getModule(), Intrinsic::amdgcn_tensor_desc_update_lane,
+              {V->getType()});
+          Value *Cur = PrevValue[OpIdx];
+          for (unsigned Lane : *Diffs) {
+            Value *NewVal = CurLanes->Lanes.lookup(Lane);
+            Cur = B.CreateCall(F, {Cur, NewVal, B.getInt32(Lane)});
+          }
+          II->setArgOperand(OpIdx, Cur);
+          if (Carrier)
+            Carrier->addIncoming(Cur, L->getLoopLatch());
+          PrevValue[OpIdx] = Cur;
+          PrevLanes[OpIdx] = std::move(CurLanes);
+          Changed = true;
+          continue;
+        }
+      }
+      PrevValue[OpIdx] = V;
+      PrevLanes[OpIdx] = std::move(CurLanes);
     }
-    PrevGroup0 = G0;
-    PrevLanes = std::move(CurLanes);
   }
   return Changed;
 }
@@ -771,14 +859,13 @@ static bool chainTensorDescriptorsInBB(BasicBlock &BB) {
 bool AMDGPUCodeGenPrepareImpl::chainTensorDescriptorsByLaneUpdate() {
   bool Changed = false;
   for (BasicBlock &BB : F)
-    Changed |= chainTensorDescriptorsInBB(BB);
+    Changed |= chainTensorDescriptorsInBB(BB, LI);
   return Changed;
 }
 
 bool AMDGPUCodeGenPrepareImpl::run() {
   BreakPhiNodesCache.clear();
   bool MadeChange = tryHoistTensorIntrinAddressIVs();
-  MadeChange |= chainTensorDescriptorsByLaneUpdate();
 
   // Need to use make_early_inc_range because integer division expansion is
   // handled by Transform/Utils, and it can delete instructions such as the
@@ -789,6 +876,12 @@ bool AMDGPUCodeGenPrepareImpl::run() {
         MadeChange |= visit(I);
     }
   }
+
+  // Run chain-descriptor-by-lane-update AFTER visit() so the carrier-phis it
+  // creates aren't broken up by visitPHINode's BreakLargePHIs logic (which
+  // targets all >= 32-bit vector PHIs). Carrier-phis are exactly the structure
+  // that lets the post-RA coalescer tie multi-lane chain mutations in place.
+  MadeChange |= chainTensorDescriptorsByLaneUpdate();
 
   while (!DeadVals.empty()) {
     if (auto *I = dyn_cast_or_null<Instruction>(DeadVals.pop_back_val()))
