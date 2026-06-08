@@ -5236,16 +5236,67 @@ InstCombinerImpl::pushFreezeToPreventPoisonFromPropagating(FreezeInst &OrigFI) {
   // If operand is guaranteed not to be poison, there is no need to add freeze
   // to the operand. So we first find the operand that is not guaranteed to be
   // poison.
+  //
+  // Helper: when more than one operand is maybe-poison, look for an existing
+  // freeze of that operand anywhere in the function and substitute it,
+  // hoisting it to dominate `OrigOpInst` if needed.  This avoids a fixpoint
+  // failure where `freezeOtherUses` would migrate the alias-replacement on a
+  // later iteration -- and only THEN would this transform become applicable
+  // (a single maybe-poison operand remaining).  Doing the substitution here
+  // lets the rewrite converge in a single InstCombine iteration without
+  // creating extra freezes.
+  auto reuseExistingFreezeFor = [&](Value *V) -> Value * {
+    for (User *U : V->users()) {
+      auto *FI = dyn_cast<FreezeInst>(U);
+      if (!FI || FI == &OrigFI)
+        continue;
+      if (DT.dominates(FI, OrigOpInst))
+        return FI;
+      // Hoist the freeze to immediately after its operand's def so it
+      // dominates `OrigOpInst`.  Mirror `freezeOtherUses`' move logic.
+      BasicBlock::iterator MoveBefore;
+      if (isa<Argument>(V)) {
+        MoveBefore = OrigOpInst->getFunction()
+                         ->getEntryBlock()
+                         .getFirstNonPHIOrDbgOrAlloca();
+      } else {
+        auto Opt = cast<Instruction>(V)->getInsertionPointAfterDef();
+        if (!Opt)
+          continue;
+        MoveBefore = *Opt;
+      }
+      MoveBefore.setHeadBit(false);
+      if (FI != &*MoveBefore)
+        FI->moveBefore(*MoveBefore->getParent(), MoveBefore);
+      if (DT.dominates(FI, OrigOpInst))
+        return FI;
+    }
+    return nullptr;
+  };
+
   Value *MaybePoisonOperand = nullptr;
-  for (Value *V : OrigOpInst->operands()) {
+  for (Use &U : OrigOpInst->operands()) {
+    Value *V = U.get();
     if (isa<MetadataAsValue>(V) || isGuaranteedNotToBeUndefOrPoison(V) ||
         // Treat identical operands as a single operand.
         (MaybePoisonOperand && MaybePoisonOperand == V))
       continue;
-    if (!MaybePoisonOperand)
+    if (!MaybePoisonOperand) {
       MaybePoisonOperand = V;
-    else
-      return nullptr;
+      continue;
+    }
+    // Two distinct maybe-poison operands.  Try to reuse an existing freeze
+    // on one of them to collapse back to a single maybe-poison operand.
+    if (Value *Existing = reuseExistingFreezeFor(V)) {
+      U.set(Existing);
+      continue;
+    }
+    if (Value *Existing = reuseExistingFreezeFor(MaybePoisonOperand)) {
+      OrigOpInst->replaceUsesOfWith(MaybePoisonOperand, Existing);
+      MaybePoisonOperand = V;
+      continue;
+    }
+    return nullptr;
   }
 
   OrigOpInst->dropPoisonGeneratingAnnotations();

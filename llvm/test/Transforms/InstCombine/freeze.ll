@@ -1733,6 +1733,31 @@ define float @freeze_fabs_nofpclass(float %a) {
   ret float %x.fr
 }
 
+; A single-use binop has two maybe-poison operands, but one of them
+; (%b) already has a freeze in the function (%fb).  The freeze-into-binop
+; transform reuses %fb (hoisting it past %b's def in the entry block so
+; it dominates %m), substitutes it in %m, and falls through to the
+; single-maybe-poison-operand path which freezes %a and removes %fm.
+; This must converge in one InstCombine iteration (regression test for
+; the freeze-binop fixpoint failure).
+define i1 @reuse_existing_freeze_binop(i32 %a, i32 %b) {
+; CHECK-LABEL: define i1 @reuse_existing_freeze_binop(
+; CHECK-SAME: i32 [[A:%.*]], i32 [[B:%.*]]) {
+; CHECK-NEXT:    [[FB:%.*]] = freeze i32 [[B]]
+; CHECK-NEXT:    [[A_FR:%.*]] = freeze i32 [[A]]
+; CHECK-NEXT:    [[M:%.*]] = mul i32 [[A_FR]], [[FB]]
+; CHECK-NEXT:    [[P:%.*]] = mul i32 [[M]], [[FB]]
+; CHECK-NEXT:    [[R:%.*]] = icmp eq i32 [[P]], 0
+; CHECK-NEXT:    ret i1 [[R]]
+;
+  %m  = mul i32 %a, %b
+  %fm = freeze i32 %m
+  %fb = freeze i32 %b
+  %p  = mul i32 %fm, %fb
+  %r  = icmp eq i32 %p, 0
+  ret i1 %r
+}
+
 !0 = !{}
 !1 = !{i64 4}
 !2 = !{i32 0, i32 100}
