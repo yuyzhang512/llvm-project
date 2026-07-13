@@ -4094,6 +4094,32 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
 
   std::pair<unsigned, Register> Hint = MRI.getRegAllocationHint(VirtReg);
 
+  // Append AMDGPUVGPRMSBAffinity MSB-group hints after any case-specific hints,
+  // so the bias applies regardless of the hint kind. The bias is soft: a few
+  // preferred same-group registers from Order.
+  auto appendMSBHints = [&]() {
+    const SIMachineFunctionInfo *MFI = MF.getInfo<SIMachineFunctionInfo>();
+    if (!MFI->hasVGPRMSBAffinities())
+      return;
+    int MSB = MFI->getVGPRMSBAffinity(VirtReg);
+    if (MSB < 0)
+      return;
+    SmallDenseSet<MCPhysReg, 32> Existing(Hints.begin(), Hints.end());
+    // Cap the count so we don't scan all ~256 same-group physregs per query.
+    constexpr unsigned SoftHintCap = 8;
+    unsigned Added = 0;
+    for (MCPhysReg PhysReg : Order) {
+      if (Added >= SoftHintCap)
+        break;
+      if (static_cast<int>(getHWRegIndex(PhysReg) >> 8) != MSB)
+        continue;
+      if (Existing.insert(PhysReg).second) {
+        Hints.push_back(PhysReg);
+        ++Added;
+      }
+    }
+  };
+
   switch (Hint.first) {
   case AMDGPURI::Size32: {
     Register Paired = Hint.second;
@@ -4112,6 +4138,7 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
       // isLo(Paired) is implicitly true here from the API of
       // getMatchingSuperReg.
       Hints.push_back(PairedPhys);
+    appendMSBHints();
     return false;
   }
   case AMDGPURI::Size16: {
@@ -4141,11 +4168,17 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
           Hints.push_back(PhysReg);
       }
     }
+    appendMSBHints();
     return false;
   }
-  default:
-    return TargetRegisterInfo::getRegAllocationHints(VirtReg, Order, Hints, MF,
-                                                     VRM);
+  default: {
+    // Copy hints from the base hook keep priority; MSB-group candidates are
+    // appended after them, before the rest of the order. The bias is soft.
+    bool Ret = TargetRegisterInfo::getRegAllocationHints(VirtReg, Order, Hints,
+                                                         MF, VRM);
+    appendMSBHints();
+    return Ret;
+  }
   }
 }
 

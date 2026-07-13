@@ -703,6 +703,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeSIAnnotateControlFlowLegacyPass(*PR);
   initializeAMDGPUInsertDelayAluLegacyPass(*PR);
   initializeAMDGPULowerVGPREncodingLegacyPass(*PR);
+  initializeAMDGPUVGPRMSBAffinityLegacyPass(*PR);
   initializeSIInsertHardClausesLegacyPass(*PR);
   initializeSIInsertWaitcntsLegacyPass(*PR);
   initializeSIModeRegisterLegacyPass(*PR);
@@ -1831,6 +1832,10 @@ bool GCNPassConfig::addRegAssignAndRewriteFast() {
 
   addPass(&GCNPreRALongBranchRegID);
 
+  // Record desired VGPR MSB groups before any register allocation (the pre-RA
+  // scheduler has already fixed the instruction order) to bias VGPR allocation.
+  addPass(createAMDGPUVGPRMSBAffinityLegacyPass());
+
   addPass(createSGPRAllocPass(false));
 
   // Equivalent of PEI for SGPRs.
@@ -1856,6 +1861,10 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
     reportFatalUsageError(RegAllocOptNotSupportedMessage);
 
   addPass(&GCNPreRALongBranchRegID);
+
+  // Record desired VGPR MSB groups before any register allocation (the pre-RA
+  // scheduler has already fixed the instruction order) to bias VGPR allocation.
+  addPass(createAMDGPUVGPRMSBAffinityLegacyPass());
 
   addPass(createSGPRAllocPass(true));
 
