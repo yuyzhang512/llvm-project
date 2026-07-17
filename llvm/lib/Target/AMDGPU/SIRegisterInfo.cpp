@@ -40,6 +40,10 @@ static cl::opt<bool> EnableSpillCFISavedRegs(
     cl::desc("Enable spilling the registers required for CFI emission"),
     cl::ReallyHidden, cl::init(false), cl::ZeroOrMore);
 
+static cl::opt<bool> VGPRMSBAffinityHardHints(
+    "amdgpu-vgpr-msb-affinity-hard-hints", cl::Hidden, cl::init(false),
+    cl::desc("Make AMDGPUVGPRMSBAffinity MSB-group hints a hard constraint"));
+
 std::array<std::vector<int16_t>, 32> SIRegisterInfo::RegSplitParts;
 std::array<std::array<uint16_t, 32>, 9> SIRegisterInfo::SubRegFromChannelTable;
 
@@ -4094,22 +4098,25 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
 
   std::pair<unsigned, Register> Hint = MRI.getRegAllocationHint(VirtReg);
 
-  // Append AMDGPUVGPRMSBAffinity MSB-group hints after any case-specific hints,
-  // so the bias applies regardless of the hint kind. The bias is soft: a few
-  // preferred same-group registers from Order.
-  auto appendMSBHints = [&]() {
+  // Append AMDGPUVGPRMSBAffinity MSB-group hints to whatever case-specific hints
+  // were already added, so the bias applies regardless of the (Size16/Size32/
+  // default) hint kind. Same-group candidates from Order are appended after the
+  // existing hints. Returns true when the MSB group should be a hard constraint.
+  auto appendMSBHints = [&]() -> bool {
     const SIMachineFunctionInfo *MFI = MF.getInfo<SIMachineFunctionInfo>();
     if (!MFI->hasVGPRMSBAffinities())
-      return;
+      return false;
     int MSB = MFI->getVGPRMSBAffinity(VirtReg);
     if (MSB < 0)
-      return;
+      return false;
     SmallDenseSet<MCPhysReg, 32> Existing(Hints.begin(), Hints.end());
-    // Cap the count so we don't scan all ~256 same-group physregs per query.
+    // A soft bias only needs a few preferred registers; cap it so we don't push
+    // (and scan for) all ~256 same-group physregs on every allocation query. Hard
+    // hints must list every candidate (they are exclusive), so are uncapped.
     constexpr unsigned SoftHintCap = 8;
     unsigned Added = 0;
     for (MCPhysReg PhysReg : Order) {
-      if (Added >= SoftHintCap)
+      if (!VGPRMSBAffinityHardHints && Added >= SoftHintCap)
         break;
       if (static_cast<int>(getHWRegIndex(PhysReg) >> 8) != MSB)
         continue;
@@ -4118,6 +4125,7 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
         ++Added;
       }
     }
+    return VGPRMSBAffinityHardHints && !Hints.empty();
   };
 
   switch (Hint.first) {
@@ -4138,8 +4146,7 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
       // isLo(Paired) is implicitly true here from the API of
       // getMatchingSuperReg.
       Hints.push_back(PairedPhys);
-    appendMSBHints();
-    return false;
+    return appendMSBHints();
   }
   case AMDGPURI::Size16: {
     Register Paired = Hint.second;
@@ -4168,16 +4175,15 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
           Hints.push_back(PhysReg);
       }
     }
-    appendMSBHints();
-    return false;
+    return appendMSBHints();
   }
   default: {
-    // Copy hints from the base hook keep priority; MSB-group candidates are
-    // appended after them, before the rest of the order. The bias is soft.
+    // Copy hints (added by the base hook) keep priority; bank-affinity
+    // candidates are appended after them, before falling back to the rest of
+    // the order. The bias is soft unless hard hints are requested.
     bool Ret = TargetRegisterInfo::getRegAllocationHints(VirtReg, Order, Hints,
                                                          MF, VRM);
-    appendMSBHints();
-    return Ret;
+    return appendMSBHints() || Ret;
   }
   }
 }
