@@ -141,6 +141,16 @@ static cl::opt<unsigned>
                cl::init(1),
                cl::desc("Max changed slots at which the src0 boost applies"));
 
+// Skip when the naive baseline switch weight is below this. A small baseline means
+// the loop is already near-coherent (real RA keeps each slot in one group); there
+// the linear-scan baseline over-estimates and the plan's predicted win does not
+// survive real allocation, so committing would regress. Only ever skips, so it
+// cannot add a regression.
+static cl::opt<unsigned>
+    MinBaseSwitch("amdgpu-vgpr-msb-affinity-min-base-switch", cl::Hidden,
+                  cl::init(500),
+                  cl::desc("Skip when naive baseline switch weight is below this"));
+
 namespace {
 
 constexpr unsigned MSBGroupSize = 256;
@@ -1184,6 +1194,12 @@ void AMDGPUVGPRMSBAffinity::processRegion(ArrayRef<MachineBasicBlock *> Blocks,
     // overflow on a huge function where the freq-weighted sums are large.
     NoBenefit = (unsigned __int128)PlanSw * 100 >=
                 (unsigned __int128)BaseSw * BenefitPct;
+    // Require a minimum absolute baseline cost. A small baseline means the loop is
+    // already near-coherent; the predictor over-estimates its few switches and the
+    // plan's "win" does not survive real allocation, so committing regresses (e.g.
+    // an already-coherent occ-1 GEMM loop). Leave those to the allocator.
+    if (MinBaseSwitch && BaseSw < MinBaseSwitch)
+      NoBenefit = true;
   }
 
   unsigned NumAssigned = 0;
