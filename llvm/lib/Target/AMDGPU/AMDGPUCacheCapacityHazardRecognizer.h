@@ -15,6 +15,7 @@
 #define LLVM_LIB_TARGET_AMDGPU_AMDGPUCACHECAPACITYHAZARDRECOGNIZER_H
 
 #include "llvm/CodeGen/ScheduleHazardRecognizer.h"
+#include "llvm/TargetParser/AMDGPUTargetParser.h"
 #include "llvm/TargetParser/TargetParser.h"
 
 #include <utility>

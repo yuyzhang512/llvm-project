@@ -66,11 +66,11 @@ static cl::opt<bool> Fix16BitCopies(
   cl::ReallyHidden);
 
 static cl::opt<bool>
-    L1Hazard("amdgpu-l1-hazard", cl::init(false),
+    L1Hazard("amdgpu-l1-hazard", cl::init(true),
              cl::desc("Enable hazard recognizer for L1 data cache."));
 
 static cl::opt<unsigned>
-    L1Bytes("amdgpu-l1-bytes", cl::init(32),
+    L1Bytes("amdgpu-l1-bytes", cl::init(128),
             cl::desc("Per thread effective byte size of L1 data cache."));
 namespace {
 
@@ -103,7 +103,7 @@ static cl::opt<std::pair<unsigned, unsigned>, false, L1SpeedParser>
             cl::desc("Per thread effective bytes per cycle of L1 data cache "
                      "(integer N or fraction N/D)."));
 static cl::opt<unsigned>
-    L1Latency("amdgpu-l1-latency", cl::init(0),
+    L1Latency("amdgpu-l1-latency", cl::init(256),
               cl::desc("Minimum cycles before an instruction's L1 data cache "
                        "space can be freed."));
 
@@ -10152,11 +10152,9 @@ SIInstrInfo::CreateTargetMIHazardRecognizer(const InstrItineraryData *II,
     return maybeCombineL1Hazard(std::make_unique<GCNHazardRecognizer>(DAG->MF),
                                 ST)
         .release();
-  return maybeCombineL1Hazard(
-             std::unique_ptr<ScheduleHazardRecognizer>(
-                 TargetInstrInfo::CreateTargetMIHazardRecognizer(II, DAG)),
-             ST)
-      .release();
+  // The L1 cache-capacity recognizer only models top-down issue, but pre-RA
+  // MISched schedules bottom-up (RecedeCycle), so do not attach it here.
+  return TargetInstrInfo::CreateTargetMIHazardRecognizer(II, DAG);
 }
 
 std::pair<unsigned, unsigned>

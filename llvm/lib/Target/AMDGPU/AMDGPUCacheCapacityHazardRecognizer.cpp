@@ -14,6 +14,8 @@
 #include "AMDGPUCacheCapacityHazardRecognizer.h"
 #include "AMDGPUWaitcntUtils.h"
 #include "SIInstrInfo.h"
+#include "llvm/CodeGen/ScheduleDAG.h"
+#include "llvm/Support/AMDGPUAddrSpace.h"
 #include "llvm/Support/Debug.h"
 
 #include <algorithm>

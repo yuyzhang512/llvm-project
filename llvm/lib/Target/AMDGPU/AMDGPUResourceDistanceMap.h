@@ -18,6 +18,7 @@
 #define LLVM_LIB_TARGET_AMDGPU_AMDGPURESOURCEDISTANCEMAP_H
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/CodeGen/ScheduleDAG.h"
 
 #include <functional>
 #include <limits>
