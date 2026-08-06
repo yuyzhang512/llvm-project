@@ -1832,8 +1832,8 @@ bool GCNPassConfig::addRegAssignAndRewriteFast() {
 
   addPass(&GCNPreRALongBranchRegID);
 
-  // Record desired VGPR MSB groups before any register allocation (the pre-RA
-  // scheduler has already fixed the instruction order) to bias VGPR allocation.
+  // Bias VGPR allocation into MSB groups (after the scheduler fixes the order,
+  // before RA).
   addPass(createAMDGPUVGPRMSBAffinityLegacyPass());
 
   addPass(createSGPRAllocPass(false));
@@ -1862,8 +1862,8 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
 
   addPass(&GCNPreRALongBranchRegID);
 
-  // Record desired VGPR MSB groups before any register allocation (the pre-RA
-  // scheduler has already fixed the instruction order) to bias VGPR allocation.
+  // Bias VGPR allocation into MSB groups (after the scheduler fixes the order,
+  // before RA).
   addPass(createAMDGPUVGPRMSBAffinityLegacyPass());
 
   addPass(createSGPRAllocPass(true));

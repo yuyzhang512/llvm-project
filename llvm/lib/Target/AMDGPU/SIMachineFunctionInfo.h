@@ -653,12 +653,8 @@ public:
     return MaskForVGPRBlockOps.inBounds(RegisterBlock);
   }
 
-  // Desired VGPR MSB group (high bits of the HW register index, i.e. index >>
-  // 8) for a virtual register, computed before VGPR allocation. Used by
-  // SIRegisterInfo::getRegAllocationHints to bias allocation so that operands
-  // that feed the same instruction-slot land in the same 256-VGPR MSB group,
-  // which minimizes S_SET_VGPR_MSB insertions on targets with 1024 addressable
-  // VGPRs.
+  // Desired VGPR MSB group (HW index >> 8) for a vreg, set by
+  // AMDGPUVGPRMSBAffinity and consumed by getRegAllocationHints below.
   void setVGPRMSBAffinity(Register Reg, unsigned MSB) {
     VGPRMSBAffinity[Reg] = static_cast<uint8_t>(MSB);
   }

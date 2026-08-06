@@ -4098,11 +4098,10 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
 
   std::pair<unsigned, Register> Hint = MRI.getRegAllocationHint(VirtReg);
 
-  // Append AMDGPUVGPRMSBAffinity MSB-group hints to whatever case-specific hints
-  // were already added, so the bias applies regardless of the (Size16/Size32/
-  // default) hint kind. Same-group candidates from Order are appended after the
-  // existing hints. Returns true when the MSB group should be a hard constraint.
-  auto appendMSBHints = [&]() -> bool {
+  // Append AMDGPUVGPRMSBAffinity's same-MSB-group candidates after any
+  // case-specific hints, so the bias applies for every hint kind. Returns true
+  // when the group should be a hard (exclusive) constraint.
+  auto AppendMSBHints = [&]() -> bool {
     const SIMachineFunctionInfo *MFI = MF.getInfo<SIMachineFunctionInfo>();
     if (!MFI->hasVGPRMSBAffinities())
       return false;
@@ -4110,9 +4109,8 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
     if (MSB < 0)
       return false;
     SmallDenseSet<MCPhysReg, 32> Existing(Hints.begin(), Hints.end());
-    // A soft bias only needs a few preferred registers; cap it so we don't push
-    // (and scan for) all ~256 same-group physregs on every allocation query. Hard
-    // hints must list every candidate (they are exclusive), so are uncapped.
+    // A soft bias needs only a few preferred regs; cap it. Hard hints are
+    // exclusive so must list every candidate, hence uncapped.
     constexpr unsigned SoftHintCap = 8;
     unsigned Added = 0;
     for (MCPhysReg PhysReg : Order) {
@@ -4146,7 +4144,7 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
       // isLo(Paired) is implicitly true here from the API of
       // getMatchingSuperReg.
       Hints.push_back(PairedPhys);
-    return appendMSBHints();
+    return AppendMSBHints();
   }
   case AMDGPURI::Size16: {
     Register Paired = Hint.second;
@@ -4175,15 +4173,14 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
           Hints.push_back(PhysReg);
       }
     }
-    return appendMSBHints();
+    return AppendMSBHints();
   }
   default: {
-    // Copy hints (added by the base hook) keep priority; bank-affinity
-    // candidates are appended after them, before falling back to the rest of
-    // the order. The bias is soft unless hard hints are requested.
+    // Keep the base hook's copy hints first, then append the MSB-group
+    // candidates.
     bool Ret = TargetRegisterInfo::getRegAllocationHints(VirtReg, Order, Hints,
                                                          MF, VRM);
-    return appendMSBHints() || Ret;
+    return AppendMSBHints() || Ret;
   }
   }
 }
