@@ -412,17 +412,14 @@ private:
         Events.emplace_back(CurE, -Sz);
       };
       for (auto &[S, E] : Segs) {
-        if (!Open) {
+        if (Open && S <= CurE) {
+          CurE = std::max(CurE, E); // overlaps: extend the open interval
+        } else {
+          if (Open) // gap: close the previous interval
+            Flush();
           CurS = S;
           CurE = E;
           Open = true;
-        } else if (S <= CurE) {
-          if (CurE < E)
-            CurE = E;
-        } else {
-          Flush();
-          CurS = S;
-          CurE = E;
         }
       }
       if (Open)
