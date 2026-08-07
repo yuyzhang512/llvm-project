@@ -1,0 +1,93 @@
+diff --git a/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp b/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp
+index c8bd41991..5da0f17a7 100644
+--- a/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp
++++ b/llvm/lib/Target/AMDGPU/SIInstrInfo.cpp
+@@ -10105,17 +10105,56 @@ SIInstrInfo::getSerializableTargetIndices() const {
+ 
+ static std::unique_ptr<ScheduleHazardRecognizer>
+ maybeCombineL1Hazard(std::unique_ptr<ScheduleHazardRecognizer> HazRec,
+-                     const GCNSubtarget &ST) {
++                     const GCNSubtarget &ST, const MachineFunction &MF) {
+   if (!L1Hazard)
+     return HazRec;
+   auto Res = std::make_unique<MultiHazardRecognizer>();
+   Res->AddHazardRecognizer(std::move(HazRec));
++
++  // Scale the modelled cache geometry with the occupancy this function was
++  // scheduled for, instead of relying on the cl::init defaults: those are
++  // tuned for a single target and are not even materialized when LLVM is
++  // driven as a library (the custom-parsed L1Speed then arrives as 0/0).
++  //
++  //   bytes      = 128 * occupancy
++  //   drain rate = occupancy bytes per compiler cycle
++  //   latency    = 256 compiler cycles (1024 hw cycles / 4)
++  constexpr unsigned BytesPerWave = 128;
++  constexpr unsigned LatencyCompilerCycles = 256;
++
++  // SIMachineFunctionInfo::Occupancy already tracks what the function ends up
++  // achieving (it is seeded from the workgroup sizes and clamped down by the
++  // scheduler), and matches the occupancy the AsmPrinter reports.
++  const SIMachineFunctionInfo *MFI = MF.getInfo<SIMachineFunctionInfo>();
++  unsigned Occupancy = MFI->getOccupancy();
++  if (Occupancy == 0)
++    Occupancy = 1;
++
++  unsigned Bytes = L1Bytes.getNumOccurrences() ? L1Bytes.getValue()
++                                               : BytesPerWave * Occupancy;
++  unsigned SpeedNum = Occupancy;
++  unsigned SpeedDen = 1;
++  if (L1Speed.getNumOccurrences()) {
++    SpeedNum = L1Speed.getValue().first;
++    SpeedDen = L1Speed.getValue().second;
++  }
++  if (SpeedNum == 0)
++    SpeedNum = 1;
++  if (SpeedDen == 0)
++    SpeedDen = 1;
++  unsigned Latency = L1Latency.getNumOccurrences() ? L1Latency.getValue()
++                                                   : LatencyCompilerCycles;
++
++  if (::getenv("AMDGPU_L1_DEBUG"))
++    errs() << "L1Hazard " << MF.getName() << ": occ=" << Occupancy
++
++           << " bytes=" << Bytes << " speed=" << SpeedNum << "/" << SpeedDen
++           << " latency=" << Latency << "\n";
++
+   Res->AddHazardRecognizer(
+       std::make_unique<AMDGPU::CacheCapacityHazardRecognizer>(
+-          L1Bytes,
+-          AMDGPU::BytesPerCycle{L1Speed.getValue().first,
+-                                L1Speed.getValue().second},
+-          L1Latency, AMDGPU::getIsaVersion(ST.getCPU())));
++          Bytes, AMDGPU::BytesPerCycle{SpeedNum, SpeedDen}, Latency,
++          AMDGPU::getIsaVersion(ST.getCPU())));
+   return Res;
+ }
+ 
+@@ -10125,7 +10164,7 @@ ScheduleHazardRecognizer *
+ SIInstrInfo::CreateTargetPostRAHazardRecognizer(const InstrItineraryData *II,
+                                             const ScheduleDAG *DAG) const {
+   return maybeCombineL1Hazard(std::make_unique<GCNHazardRecognizer>(DAG->MF),
+-                              ST)
++                              ST, DAG->MF)
+       .release();
+ }
+ 
+@@ -10135,7 +10174,7 @@ ScheduleHazardRecognizer *
+ SIInstrInfo::CreateTargetPostRAHazardRecognizer(const MachineFunction &MF,
+                                                 MachineLoopInfo *MLI) const {
+   return maybeCombineL1Hazard(std::make_unique<GCNHazardRecognizer>(MF, MLI),
+-                              ST)
++                              ST, MF)
+       .release();
+ }
+ 
+@@ -10150,7 +10189,7 @@ SIInstrInfo::CreateTargetMIHazardRecognizer(const InstrItineraryData *II,
+   // track VRegLiveness.
+   if (!DAG->hasVRegLiveness())
+     return maybeCombineL1Hazard(std::make_unique<GCNHazardRecognizer>(DAG->MF),
+-                                ST)
++                                ST, DAG->MF)
+         .release();
+   // The L1 cache-capacity recognizer only models top-down issue, but pre-RA
+   // MISched schedules bottom-up (RecedeCycle), so do not attach it here.
