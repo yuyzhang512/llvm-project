@@ -55,23 +55,10 @@ static cl::opt<bool> RegionDataFlow(
     "amdgpu-vgpr-msb-affinity-region-dataflow", cl::Hidden, cl::init(false),
     cl::desc("Structural region + data_bank GEMM planner (experimental)"));
 
-static cl::opt<unsigned>
-    HotClusterDiv("amdgpu-vgpr-msb-affinity-hot-div", cl::Hidden, cl::init(4),
-                  cl::desc("Hint clusters heavier than max weight / this divisor"));
-
-static cl::opt<unsigned>
-    TupleWeight("amdgpu-vgpr-msb-affinity-tuple-weight", cl::Hidden, cl::init(8),
-                cl::desc("Cap for edge width-weighting (0/1 = off)"));
-
 static cl::opt<unsigned> BenefitPct(
     "amdgpu-vgpr-msb-affinity-benefit-pct", cl::Hidden, cl::init(75),
     cl::desc("Commit only if predicted plan switches < this % of the no-hint "
              "switches (self-benefit gate; 0 disables it)"));
-
-static cl::opt<unsigned>
-    Src0DsWeight("amdgpu-vgpr-msb-affinity-ds-src0-weight", cl::Hidden,
-                 cl::init(2),
-                 cl::desc("Cap for the dst-length src0 boost at a ds_read"));
 
 static cl::opt<unsigned>
     MinBaseSwitch("amdgpu-vgpr-msb-affinity-min-base-switch", cl::Hidden,
@@ -714,18 +701,15 @@ AffinityGraph AMDGPUVGPRMSBAffinity::buildAffinityGraph(
     ArrayRef<MachineBasicBlock *> Blocks) const {
   AffinityGraph Graph;
 
-  // Add the edge (A, B), scaling its weight by the operand width (capped by
-  // TupleWeight) so a wide value -- e.g. the WMMA accumulator -- that alternates
-  // in a slot outweighs a scalar doing the same. TupleWeight <= 1 keeps the
-  // width-independent weight.
+  // Add the edge (A, B), scaling its weight by the operand width (capped at 8) so
+  // a wide value -- e.g. the WMMA accumulator -- that alternates in a slot
+  // outweighs a scalar doing the same.
   auto AddScaledEdge = [&](Register A, Register B, uint64_t Weight,
                            unsigned Ordinal) {
     if (A.virtRegIndex() == B.virtRegIndex())
       return;
-    if (TupleWeight > 1) {
-      unsigned Width = std::min({dwords(A), dwords(B), TupleWeight.getValue()});
-      Weight *= std::max(1u, Width);
-    }
+    unsigned Width = std::min({dwords(A), dwords(B), 8u});
+    Weight *= std::max(1u, Width);
     Graph.addEdge(A.virtRegIndex(), B.virtRegIndex(), Weight, Ordinal);
   };
 
@@ -804,9 +788,8 @@ AffinityGraph AMDGPUVGPRMSBAffinity::buildAffinityGraph(
       if (!Changed.empty()) {
         uint64_t BoundaryWeight = (Freq * 144) / Changed.size();
         bool DsBoundary = PrevDsRead || ThisDsRead;
-        // Boost factor for the src0 edge at a ds_read boundary: the width of the
-        // ds_read's dst tuple ("boost to dst len"), capped by Src0DsWeight so it
-        // matches the tuple-weighting the wide operand already gets.
+        // Boost factor for the src0 edge at a ds_read boundary: the ds_read's dst
+        // tuple width ("boost to dst len").
         unsigned DstLen = ThisDsRead ? ThisDstLen : PrevDsDstLen;
         // Isolation count for the src0 gate excludes the dst slot: a ds_read
         // writes a fresh tile in the dst slot, so a WMMA->ds_read boundary looks
@@ -822,10 +805,10 @@ AffinityGraph AMDGPUVGPRMSBAffinity::buildAffinityGraph(
           uint64_t SlotWeight = BoundaryWeight;
           // Only boost src0 when it is the sole non-dst changer at the boundary:
           // co-locating the address removes a switch only then; on a boundary
-          // where src1/src2 also change, the switch is paid anyway.
-          if (Slot == 0 && DsBoundary && Src0DsWeight > 1 && ChangedNonDst <= 1)
-            SlotWeight *=
-                std::max(1u, std::min(DstLen, Src0DsWeight.getValue()));
+          // where src1/src2 also change, the switch is paid anyway. Boost by the
+          // ds_read dst width, capped at 2.
+          if (Slot == 0 && DsBoundary && ChangedNonDst <= 1)
+            SlotWeight *= std::max(1u, std::min(DstLen, 2u));
           AddScaledEdge(LhsReg, RhsReg, SlotWeight, Ordinal);
         }
       }
@@ -856,7 +839,7 @@ AMDGPUVGPRMSBAffinity::collectHotRoots(ClusterForest &Forest,
   uint64_t MaxWeight = 0;
   for (auto &Entry : ClusterWeight)
     MaxWeight = std::max(MaxWeight, Entry.second);
-  uint64_t WeightCutoff = HotClusterDiv ? MaxWeight / HotClusterDiv : 0;
+  uint64_t WeightCutoff = MaxWeight / 4;
 
   SmallVector<unsigned, 0> Roots;
   const unsigned N = MRI->getNumVirtRegs();
