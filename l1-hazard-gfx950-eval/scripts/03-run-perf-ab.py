@@ -22,11 +22,11 @@ import os
 import subprocess
 import sys
 
-AITER = os.environ.get("AITER", "/home/yuyzhang/aiter")
+AITER = os.environ.get("AITER", os.path.expanduser("~/aiter"))
 sys.path.insert(0, AITER)
 import run_all_benchmarks as R  # noqa: E402
 
-WORK = os.environ.get("WORK", "/raid/yuyzhang_llvm")
+WORK = os.environ.get("WORK", os.path.expanduser("~/l1-hazard-eval"))
 CONFIGS = [
     ("l1off", f"{WORK}/triton_l1off"),
     ("l1on", f"{WORK}/triton_l1on"),

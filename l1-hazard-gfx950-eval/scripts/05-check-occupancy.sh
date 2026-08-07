@@ -10,8 +10,8 @@
 # Usage: bash 05-check-occupancy.sh [<bench>] [<workdir>]
 set -eu
 BENCH=${1:-bench_gemm_a16w8_blockscale}
-WORK=${2:-/raid/yuyzhang_llvm}
-AITER=${AITER:-/home/yuyzhang/aiter}
+WORK=${2:-${WORK:-$HOME/l1-hazard-eval}}
+AITER=${AITER:-$HOME/aiter}
 GPU=${GPU:-7}
 
 rm -rf /tmp/l1occ_cache /tmp/l1occ_dump

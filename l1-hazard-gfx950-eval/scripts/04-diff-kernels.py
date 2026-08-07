@@ -17,8 +17,9 @@ import subprocess
 import sys
 
 BENCH = sys.argv[1] if len(sys.argv) > 1 else "bench_gemm_a16w8_blockscale"
-WORK = sys.argv[2] if len(sys.argv) > 2 else "/raid/yuyzhang_llvm"
-AITER = os.environ.get("AITER", "/home/yuyzhang/aiter")
+WORK = sys.argv[2] if len(sys.argv) > 2 else os.environ.get(
+    "WORK", os.path.expanduser("~/l1-hazard-eval"))
+AITER = os.environ.get("AITER", os.path.expanduser("~/aiter"))
 GPU = os.environ.get("GPU", "7")
 
 

@@ -116,7 +116,7 @@ sequence takes roughly 4 hours, most of it in the two LLVM builds and the
 benchmark repeats.
 
 ```bash
-export WORK=/raid/yuyzhang_llvm
+export WORK=$HOME/l1-hazard-eval
 export AITER=$HOME/aiter
 export GPU=7                            # a gfx950 device
 

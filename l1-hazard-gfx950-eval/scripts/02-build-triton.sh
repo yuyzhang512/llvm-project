@@ -9,7 +9,7 @@
 #
 # Usage: bash 02-build-triton.sh [<workdir>]
 set -eu
-WORK=${1:-/raid/yuyzhang_llvm}
+WORK=${1:-${WORK:-$HOME/l1-hazard-eval}}
 TRITON_COMMIT=bf64a5db1b
 JOBS=${JOBS:-128}
 

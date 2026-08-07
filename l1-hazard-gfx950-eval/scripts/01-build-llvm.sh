@@ -12,7 +12,7 @@
 #
 # Usage: bash 01-build-llvm.sh [<workdir>]
 set -eu
-WORK=${1:-/raid/yuyzhang_llvm}
+WORK=${1:-${WORK:-$HOME/l1-hazard-eval}}
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SRC=$WORK/llvm-src
 BUILD=$WORK/build_l1ab
