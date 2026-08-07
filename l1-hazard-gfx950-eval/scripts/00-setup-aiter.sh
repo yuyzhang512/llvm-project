@@ -26,6 +26,12 @@ git fetch origin "$BRANCH" || git fetch "$FORK" "$BRANCH"
 git checkout -f "$COMMIT"
 git submodule update --init --recursive
 
+# run_all_benchmarks.py is not part of aiter, so it is vendored here. It derives
+# its benchmark directory from its own location, so it has to sit in the aiter
+# root.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cp "$SCRIPT_DIR/../vendor/run_all_benchmarks.py" "$AITER/run_all_benchmarks.py"
+
 # Reporting and test deps used by run_all_benchmarks.py.
 pip install -q pytest openpyxl psutil llnl-hatchet
 

@@ -144,11 +144,15 @@ recognizer uses against the occupancy the emitted code achieves.
 
 Notes:
 
+- The benchmark scripts that get run are listed in `CASES.md`. 50 are launched,
+  each sweeping its own shapes, which is where the 795 data points come from.
+- `run_all_benchmarks.py` supplies the benchmark list, the runner and the
+  workbook. It is not part of aiter, so a copy is kept in `vendor/` and
+  `00-setup-aiter.sh` installs it into the aiter root, which is where it expects
+  to live (it locates the benchmarks relative to its own path).
 - `03-run-perf-ab.py` swaps between the two Triton builds with editable installs
   rather than wheels: both builds are the same Triton commit, so their wheels
-  would carry the same version label and their logs would collide. It reuses
-  AITER's `run_all_benchmarks.py` for the benchmark list, the runner and the
-  report.
+  would carry the same version label and their logs would collide.
 - Use `ROCR_VISIBLE_DEVICES` to pick the GPU. `HIP_VISIBLE_DEVICES` breaks
   Proton on AMD.
 - `--repeat 3` matters. With single runs the same suite reported 52 improvements
