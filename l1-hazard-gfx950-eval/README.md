@@ -111,29 +111,53 @@ pass actually changes; deltas on the others are variance.
 
 ## Reproduction
 
+Runs end to end from a clean machine. `$WORK` needs about 200 GB, and the whole
+sequence takes roughly 4 hours, most of it in the two LLVM builds and the
+benchmark repeats.
+
 ```bash
-WORK=/raid/yuyzhang_llvm          # needs ~200 GB
-bash scripts/01-build-llvm.sh   $WORK   # base and base+pass, ~40 min
-bash scripts/02-build-triton.sh $WORK   # same Triton commit against each, ~30 min
-GPU=7 python3 scripts/03-run-perf-ab.py --repeat 3 \
-     --output $WORK/l1_hazard_perf.xlsx        # ~2 h
+export WORK=/raid/yuyzhang_llvm
+export AITER=$HOME/aiter
+export GPU=7                            # a gfx950 device
+
+bash scripts/00-setup-aiter.sh  $AITER  # aiter 8e1308d3 + native ops, ~20 min
+bash scripts/01-build-llvm.sh   $WORK   # base and base+pass LLVM,    ~40 min
+bash scripts/02-build-triton.sh $WORK   # one Triton commit per LLVM, ~30 min
+python3 scripts/03-run-perf-ab.py --repeat 3 \
+        --output $WORK/l1_hazard_perf.xlsx      # 50 benchmarks x 2 x 3, ~2 h
 ```
 
-Supporting checks:
+The workbook lands at `$WORK/l1_hazard_perf.xlsx`, with per-category sheets and
+a Summary sheet whose final table is the improvement/regression count quoted
+above. Per-run logs are under `$WORK/bench_logs_l1ab/rerun_{l1off,l1on}/`.
+
+Supporting checks, both on a single benchmark:
 
 ```bash
 python3 scripts/04-diff-kernels.py bench_gemm_a16w8_blockscale
 bash    scripts/05-check-occupancy.sh bench_gemm_a16w8_blockscale
 ```
 
-`03-run-perf-ab.py` switches between the two Triton builds with editable
-installs rather than wheels, because both builds are the same Triton commit and
-would otherwise collide on the wheel version label. It reuses AITER's
-`run_all_benchmarks.py` for the benchmark list, the runner and the report.
+`04` prints which kernels the pass actually changes, which is what shows that
+deltas on the untouched ones are noise. `05` cross-checks the occupancy the
+recognizer uses against the occupancy the emitted code achieves.
 
-Requirements: AITER checkout with its ops built (`AITER=/path/to/aiter`), a
-gfx950 GPU selected with `ROCR_VISIBLE_DEVICES` (not `HIP_VISIBLE_DEVICES`), and
-`nanobind==2.10.2` for the Triton build.
+Notes:
+
+- `03-run-perf-ab.py` swaps between the two Triton builds with editable installs
+  rather than wheels: both builds are the same Triton commit, so their wheels
+  would carry the same version label and their logs would collide. It reuses
+  AITER's `run_all_benchmarks.py` for the benchmark list, the runner and the
+  report.
+- Use `ROCR_VISIBLE_DEVICES` to pick the GPU. `HIP_VISIBLE_DEVICES` breaks
+  Proton on AMD.
+- `--repeat 3` matters. With single runs the same suite reported 52 improvements
+  against 53 regressions; medians give 35 against 71.
+- To rerun only one side after a rebuild, pass `--only l1on`, which keeps the
+  existing logs for the other configuration.
+- Pinned versions: aiter `8e1308d3`, Triton `bf64a5db1b`, LLVM base `850a2b1b`.
+  `nanobind==2.10.2` is required to build this Triton and is installed by
+  `02-build-triton.sh`.
 
 ## Suggested follow-ups for the pass
 
