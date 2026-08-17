@@ -32,11 +32,9 @@
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
-#include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/SlotIndexes.h"
-#include "llvm/IR/InlineAsm.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -50,10 +48,6 @@ static cl::opt<bool> EnableVGPRMSBAffinity(
     "amdgpu-vgpr-msb-affinity", cl::Hidden, cl::init(false),
     cl::desc("Bias VGPR allocation into 256-VGPR MSB groups to reduce "
              "S_SET_VGPR_MSB insertions (gfx1250)"));
-
-static cl::opt<bool> RegionDataFlow(
-    "amdgpu-vgpr-msb-affinity-region-dataflow", cl::Hidden, cl::init(false),
-    cl::desc("Structural region + data_bank GEMM planner (experimental)"));
 
 static cl::opt<unsigned> BenefitPct(
     "amdgpu-vgpr-msb-affinity-benefit-pct", cl::Hidden, cl::init(75),
@@ -251,20 +245,6 @@ private:
   // in-loop (recurring) switches.
   enum class GateScope { WholeFunction, LoopOnly };
 
-  // Experimental structural GEMM planner (see RegionDataFlow). Reconstructs
-  // regions from the (LLIR-scheduled) order and hints banks by role. Returns true
-  // if it committed any hint (so run() knows the structural path handled the fn).
-  bool planDataFlowRegions(MachineFunction &MF, unsigned EffMSBGroups,
-                           SIMachineFunctionInfo *MFI);
-
-  // Parse the region index N from an LLIR ";; Region N" inline-asm marker.
-  // Returns -1 if MI is not such a marker (e.g. ";; Epilogue Region").
-  static int parseRegionMarker(const MachineInstr &MI);
-  // The MSB-slot-S operand of MI, or its second-table fallback. slotVReg returns
-  // it only when it is a virtual VGPR; slotMO returns the raw operand pointer.
-  Register slotVReg(const MachineInstr &MI, unsigned Slot) const;
-  MachineOperand *slotMO(MachineInstr &MI, unsigned Slot) const;
-
   // Build the affinity graph, cluster, pack into MSB groups and commit hints for one
   // region (a set of blocks). Vregs already in \p Assigned (hinted by a hotter
   // region) are skipped; newly hinted vregs are added to it.
@@ -396,7 +376,7 @@ private:
       if (!LIS->hasInterval(Reg))
         continue;
       unsigned G = vgFind(Reg.virtRegIndex());
-      GroupSize[G] = dwords(Reg);
+      GroupSize[G] = std::max<int>(GroupSize[G], dwords(Reg));
       auto &Segs = ByGroup[G];
       for (const LiveRange::Segment &S : LIS->getInterval(Reg))
         Segs.emplace_back(S.start, S.end);
@@ -588,11 +568,7 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<LiveIntervalsWrapperPass>();
     AU.addRequired<MachineLoopInfoWrapperPass>();
-    // The default path only adds allocation hints (no IR change). The
-    // experimental region-dataflow path may insert preheader COPYs to split
-    // shared addresses, so it cannot preserve analyses.
-    if (!RegionDataFlow)
-      AU.setPreservesAll();
+    AU.setPreservesAll();
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 };
@@ -666,10 +642,6 @@ bool AMDGPUVGPRMSBAffinity::run(MachineFunction &MF, LiveIntervals *LISIn,
                     << " VGPRBudget=" << VGPRBudget << "\n");
 
   SIMachineFunctionInfo *MFI = MF.getInfo<SIMachineFunctionInfo>();
-
-  // Experimental structural GEMM path (default off) replaces the affinity path.
-  if (RegionDataFlow)
-    return planDataFlowRegions(MF, EffMSBGroups, MFI);
 
   DenseSet<unsigned> Assigned;
   SmallVector<MachineBasicBlock *, 16> Blocks;
@@ -1030,179 +1002,6 @@ void AMDGPUVGPRMSBAffinity::processRegion(ArrayRef<MachineBasicBlock *> Blocks,
       dbgs() << " [" << Group << "]=" << MSBLoad[Group];
     dbgs() << "\n";
   });
-}
-
-// The LLIR scheduler emits region boundaries as inline-asm markers of the form
-//   INLINEASM &";; Region N: ..."
-// Parse N as the ground-truth region index -- this is what makes each region's
-// src slot uniform, since the scheduler groups a region's ds_loads and WMMAs
-// together. Returns -1 if MI is not a loop (non-epilogue) region marker.
-int AMDGPUVGPRMSBAffinity::parseRegionMarker(const MachineInstr &MI) {
-  if (!MI.isInlineAsm())
-    return -1;
-  const MachineOperand &MO = MI.getOperand(InlineAsm::MIOp_AsmString);
-  if (!MO.isSymbol())
-    return -1;
-  StringRef Text(MO.getSymbolName());
-  StringRef Key = ";; Region ";
-  size_t Pos = Text.find(Key);
-  if (Pos == StringRef::npos)
-    return -1; // ";; Epilogue Region" and others are excluded.
-  int Region = -1;
-  if (Text.substr(Pos + Key.size()).consumeInteger(10, Region))
-    return -1;
-  return Region;
-}
-
-MachineOperand *AMDGPUVGPRMSBAffinity::slotMO(MachineInstr &MI,
-                                              unsigned Slot) const {
-  auto Ops = AMDGPU::getVGPRLoweringOperandTables(MI.getDesc());
-  if (!Ops.first)
-    return nullptr;
-  MachineOperand *MO = TII->getNamedOperand(MI, Ops.first[Slot]);
-  if ((!MO || !MO->isReg() || !MO->getReg()) && Ops.second)
-    MO = TII->getNamedOperand(MI, Ops.second[Slot]);
-  return MO;
-}
-
-Register AMDGPUVGPRMSBAffinity::slotVReg(const MachineInstr &MI,
-                                         unsigned Slot) const {
-  MachineOperand *MO = slotMO(const_cast<MachineInstr &>(MI), Slot);
-  if (MO && MO->isReg() && MO->getReg() && isVGPRVirtReg(MO->getReg()))
-    return MO->getReg();
-  return Register();
-}
-
-// Experimental structural GEMM planner (region-dataflow, LLIR-scheduled order).
-// Reads ";; Region N" markers and hints banks by role so each region tends toward
-// one bank-context:
-//   - WMMA accumulator (tied dst==src2) -> region % groups;
-//   - ds_load tile (its dst)            -> its loading region's bank;
-//   - ds_load address (its src0)        -> its region's src0 bank.
-// First assignment of a vreg wins. Soft hints only.
-bool AMDGPUVGPRMSBAffinity::planDataFlowRegions(MachineFunction &MF,
-                                                unsigned EffMSBGroups,
-                                                SIMachineFunctionInfo *MFI) {
-  DenseSet<unsigned> Assigned;
-  auto Hint = [&](Register R, int Bank) {
-    if (R && Assigned.insert(R.virtRegIndex()).second)
-      recordMSB(MFI, R,
-                static_cast<unsigned>(Bank % static_cast<int>(EffMSBGroups)));
-  };
-  auto IsWMMA = [&](const MachineInstr &MI) {
-    return SIInstrInfo::isWMMA(MI) || SIInstrInfo::isSWMMAC(MI);
-  };
-  auto IsDSLoad = [&](const MachineInstr &MI) {
-    return TII->isDS(MI) && MI.mayLoad();
-  };
-  bool Committed = false;
-  bool Modified = false;
-  for (MachineBasicBlock &MBB : MF) {
-    if (!MLI || MLI->getLoopDepth(&MBB) == 0)
-      continue; // only loop bodies have per-iteration regions
-    // Pass 1: label each instruction with the region index of the most recent
-    // ";; Region N" marker above it.
-    DenseMap<const MachineInstr *, int> RegionOf;
-    int Region = 0;
-    for (MachineInstr &MI : MBB) {
-      int M = parseRegionMarker(MI);
-      if (M >= 0)
-        Region = M;
-      RegionOf[&MI] = Region;
-    }
-    // Pass 2a: assign the data_bank roles. The tile is
-    // colored by its *loading* region -- not its consumer: a GEMM weight is
-    // reused across many consuming bursts (different banks) but has one loading
-    // region, so loading-region coloring keeps it single-banked. A WMMA reads the
-    // tile vreg directly, so this also fixes the WMMA's src bank.
-    DenseMap<unsigned, int> BankOf;
-    auto Assign = [&](Register R, int Bank) {
-      if (R)
-        BankOf[R.virtRegIndex()] = Bank % static_cast<int>(EffMSBGroups);
-    };
-    for (MachineInstr &MI : MBB) {
-      Register Dst = slotVReg(MI, 3), Src2 = slotVReg(MI, 2);
-      if (IsWMMA(MI) && Dst && Src2 && Dst == Src2)
-        Assign(Dst, RegionOf[&MI]); // accumulator -> its region bank
-      else if (IsDSLoad(MI))
-        Assign(slotVReg(MI, 3), RegionOf[&MI]); // tile -> loading-region bank
-    }
-    // Pass 2b: per-region src0/src1 bank = the bank of the tiles this region's
-    // WMMAs read (already fixed in 2a). This is what the region's MSB context
-    // carries in the src0/src1 slots.
-    DenseMap<int, int> RegionSrc0, RegionSrc1;
-    auto Lookup = [&](Register R) -> int {
-      auto It = R ? BankOf.find(R.virtRegIndex()) : BankOf.end();
-      return It == BankOf.end() ? -1 : It->second;
-    };
-    for (MachineInstr &MI : MBB) {
-      if (!IsWMMA(MI))
-        continue;
-      int R = RegionOf[&MI];
-      if (int B0 = Lookup(slotVReg(MI, 0)); B0 >= 0)
-        RegionSrc0.try_emplace(R, B0);
-      if (int B1 = Lookup(slotVReg(MI, 1)); B1 >= 0)
-        RegionSrc1.try_emplace(R, B1);
-    }
-    // Pass 2c: a ds_load address gets its region's src0 bank so the load rides the
-    // WMMA MSB context (dst=acc, src0=addr) instead of resetting to the acc bank.
-    // A loop-invariant address shared by regions needing different src0 banks can't
-    // serve them all, so duplicate it: keep the original for the first region and
-    // hoist a fresh preheader COPY per other required bank (kept live together, so
-    // the coalescer won't merge them back).
-    MachineLoop *L = MLI->getLoopFor(&MBB);
-    MachineBasicBlock *Preheader = L ? L->getLoopPreheader() : nullptr;
-    DenseMap<unsigned, int> AddrHome;       // addr vreg idx -> home (kept) bank
-    DenseMap<uint64_t, Register> AddrSplit; // (addr idx, bank) -> copy vreg
-    for (MachineInstr &MI : MBB) {
-      if (!IsDSLoad(MI))
-        continue;
-      auto It = RegionSrc0.find(RegionOf[&MI]);
-      if (It == RegionSrc0.end())
-        continue;
-      int Want = It->second;
-      MachineOperand *MO = slotMO(MI, 0);
-      Register Addr =
-          (MO && MO->isReg() && isVGPRVirtReg(MO->getReg())) ? MO->getReg()
-                                                             : Register();
-      if (!Addr)
-        continue;
-      auto Home = AddrHome.try_emplace(Addr.virtRegIndex(), Want);
-      if (Home.first->second == Want) {
-        Assign(Addr, Want); // home region (or all users agree): keep original
-        continue;
-      }
-      // A different bank is needed. Only duplicate loop-invariant addresses (def
-      // outside the loop), so the copy can live for free in the preheader;
-      // loop-variant addresses are left at their home bank.
-      MachineInstr *Def = MRI->getVRegDef(Addr);
-      if (!Preheader || !Def || (L && L->contains(Def->getParent())))
-        continue;
-      uint64_t K = (static_cast<uint64_t>(Addr.virtRegIndex()) << 8) |
-                   static_cast<unsigned>(Want);
-      Register Copy = AddrSplit.lookup(K);
-      if (!Copy) {
-        Copy = MRI->createVirtualRegister(MRI->getRegClass(Addr));
-        BuildMI(*Preheader, Preheader->getFirstTerminator(), DebugLoc(),
-                TII->get(TargetOpcode::COPY), Copy)
-            .addReg(Addr);
-        AddrSplit[K] = Copy;
-        Assign(Copy, Want);
-        Modified = true;
-      }
-      MO->setReg(Copy); // rewrite this region's ds_load to the private address
-    }
-    // Pass 2d: commit all assigned banks as allocation hints.
-    for (auto &KV : BankOf) {
-      Hint(Register::index2VirtReg(KV.first), KV.second);
-      Committed = true;
-    }
-  }
-  LLVM_DEBUG(dbgs() << "  region-dataflow: hinted " << Assigned.size()
-                    << " vregs, committed=" << Committed
-                    << ", modified=" << Modified << "\n");
-  (void)Committed;
-  return Modified;
 }
 
 char AMDGPUVGPRMSBAffinityLegacy::ID = 0;
