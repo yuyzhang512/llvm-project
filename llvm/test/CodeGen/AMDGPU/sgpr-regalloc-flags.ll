@@ -56,7 +56,6 @@
 
 ; BASIC-DEFAULT: Debug Variable Analysis
 ; BASIC-DEFAULT-NEXT: Live Stack Slot Analysis
-; BASIC-DEFAULT-NEXT: Machine Natural Loop Construction
 ; BASIC-DEFAULT-NEXT: Machine Block Frequency Analysis
 ; BASIC-DEFAULT-NEXT: Virtual Register Map
 ; BASIC-DEFAULT-NEXT: Live Register Matrix
@@ -114,7 +113,6 @@
 
 ; BASIC-BASIC: Debug Variable Analysis
 ; BASIC-BASIC-NEXT: Live Stack Slot Analysis
-; BASIC-BASIC-NEXT: Machine Natural Loop Construction
 ; BASIC-BASIC-NEXT: Machine Block Frequency Analysis
 ; BASIC-BASIC-NEXT: Virtual Register Map
 ; BASIC-BASIC-NEXT: Live Register Matrix

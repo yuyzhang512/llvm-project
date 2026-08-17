@@ -42,7 +42,7 @@
 
 using namespace llvm;
 
-#define DEBUG_TYPE "amdgpu-vgpr-msb-affinity"
+#define DEBUG_TYPE "amdgpu-vgpr-msb-affinity-hints"
 
 static cl::opt<bool> EnableVGPRMSBAffinity(
     "amdgpu-vgpr-msb-affinity", cl::Hidden, cl::init(false),

@@ -117,6 +117,8 @@
 ; GCN-O0-NEXT:        Live Interval Analysis
 ; GCN-O0-NEXT:        SI Whole Quad Mode
 ; GCN-O0-NEXT:        AMDGPU Pre-RA Long Branch Reg
+; GCN-O0-NEXT:        Machine Natural Loop Construction
+; GCN-O0-NEXT:        AMDGPU VGPR MSB Affinity
 ; GCN-O0-NEXT:        Fast Register Allocator
 ; GCN-O0-NEXT:        Machine Cycle Info Analysis
 ; GCN-O0-NEXT:        SI lower SGPR spill instructions
@@ -366,6 +368,7 @@
 ; GCN-O1-NEXT:        SI optimize exec mask operations pre-RA
 ; GCN-O1-NEXT:        AMDGPU Pre-RA Long Branch Reg
 ; GCN-O1-NEXT:        Machine Natural Loop Construction
+; GCN-O1-NEXT:        AMDGPU VGPR MSB Affinity
 ; GCN-O1-NEXT:        Machine Block Frequency Analysis
 ; GCN-O1-NEXT:        Debug Variable Analysis
 ; GCN-O1-NEXT:        Live Stack Slot Analysis
@@ -684,6 +687,7 @@
 ; GCN-O1-OPTS-NEXT:        SI optimize exec mask operations pre-RA
 ; GCN-O1-OPTS-NEXT:        AMDGPU Pre-RA Long Branch Reg
 ; GCN-O1-OPTS-NEXT:        Machine Natural Loop Construction
+; GCN-O1-OPTS-NEXT:        AMDGPU VGPR MSB Affinity
 ; GCN-O1-OPTS-NEXT:        Machine Block Frequency Analysis
 ; GCN-O1-OPTS-NEXT:        Debug Variable Analysis
 ; GCN-O1-OPTS-NEXT:        Live Stack Slot Analysis
@@ -1007,6 +1011,7 @@
 ; GCN-O2-NEXT:        SI Form memory clauses
 ; GCN-O2-NEXT:        AMDGPU Pre-RA Long Branch Reg
 ; GCN-O2-NEXT:        Machine Natural Loop Construction
+; GCN-O2-NEXT:        AMDGPU VGPR MSB Affinity
 ; GCN-O2-NEXT:        Machine Block Frequency Analysis
 ; GCN-O2-NEXT:        Debug Variable Analysis
 ; GCN-O2-NEXT:        Live Stack Slot Analysis
@@ -1343,6 +1348,7 @@
 ; GCN-O3-NEXT:        SI Form memory clauses
 ; GCN-O3-NEXT:        AMDGPU Pre-RA Long Branch Reg
 ; GCN-O3-NEXT:        Machine Natural Loop Construction
+; GCN-O3-NEXT:        AMDGPU VGPR MSB Affinity
 ; GCN-O3-NEXT:        Machine Block Frequency Analysis
 ; GCN-O3-NEXT:        Debug Variable Analysis
 ; GCN-O3-NEXT:        Live Stack Slot Analysis
