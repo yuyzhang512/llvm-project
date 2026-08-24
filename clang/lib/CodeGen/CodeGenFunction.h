@@ -1555,6 +1555,24 @@ private:
   /// decls.
   DeclMapTy LocalDeclMap;
 
+  /// Local variables carrying an amdgpu_pin_{vgpr,agpr} attribute, keyed by the
+  /// variable's storage pointer. Maps to (isAGPR, startRegNo). Every value
+  /// stored to such a variable has !amdgpu.pin.* metadata attached to its
+  /// defining instruction. \sa emitAMDGPUPinnedValue
+  llvm::DenseMap<llvm::Value *, std::pair<bool, unsigned>> AMDGPUPinnedLocals;
+
+  /// If \p Addr is a pinned local's storage, tag \p V's defining instruction
+  /// with the appropriate !amdgpu.pin.* metadata and return \p V unchanged;
+  /// otherwise return \p V unchanged.
+  llvm::Value *emitAMDGPUPinnedValue(llvm::Value *V, llvm::Value *Addr);
+
+  /// Record \p LV's storage as pinned storage when \p VD carries an
+  /// amdgpu_pin_{vgpr,agpr} attribute. The variable's own declaration registers
+  /// its alloca (\sa EmitAutoVarAlloca), but a by-reference capture reaches it
+  /// through the capture field of a different function, so the store address
+  /// never matches the alloca and the pin would be silently dropped.
+  void tryTrackAMDGPUPinnedCapture(const VarDecl *VD, const LValue &LV);
+
   // Keep track of the cleanups for callee-destructed parameters pushed to the
   // cleanup stack so that they can be deactivated later.
   llvm::DenseMap<const ParmVarDecl *, EHScopeStack::stable_iterator>

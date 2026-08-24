@@ -45,6 +45,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicsAMDGPU.h"
 #include "llvm/IR/IntrinsicsWebAssembly.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/MDBuilder.h"
@@ -3048,7 +3049,54 @@ void CodeGenFunction::EmitStoreThroughLValue(RValue Src, LValue Dst,
   }
 
   assert(Src.isScalar() && "Can't emit an agg store with this method");
-  EmitStoreOfScalar(Src.getScalarVal(), Dst, isInit);
+  llvm::Value *SV = Src.getScalarVal();
+  if (Dst.isSimple() && !AMDGPUPinnedLocals.empty())
+    SV = emitAMDGPUPinnedValue(SV, Dst.getPointer(*this));
+  EmitStoreOfScalar(SV, Dst, isInit);
+}
+
+void CodeGenFunction::tryTrackAMDGPUPinnedCapture(const VarDecl *VD,
+                                                  const LValue &LV) {
+  bool IsAGPR = VD->hasAttr<AMDGPUPinAGPRAttr>();
+  if (!IsAGPR && !VD->hasAttr<AMDGPUPinVGPRAttr>())
+    return;
+  if (!getTarget().getTriple().isAMDGCN() || !LV.isSimple())
+    return;
+  const Expr *RegE = IsAGPR ? VD->getAttr<AMDGPUPinAGPRAttr>()->getReg()
+                            : VD->getAttr<AMDGPUPinVGPRAttr>()->getReg();
+  unsigned Reg = RegE->EvaluateKnownConstInt(getContext()).getZExtValue();
+  AMDGPUPinnedLocals[LV.getPointer(*this)] = {IsAGPR, Reg};
+}
+
+llvm::Value *CodeGenFunction::emitAMDGPUPinnedValue(llvm::Value *V,
+                                                    llvm::Value *Addr) {
+  auto It = AMDGPUPinnedLocals.find(Addr);
+  if (It == AMDGPUPinnedLocals.end())
+    return V;
+  // The pin is an AMDGCN codegen concept; ignore the attribute elsewhere.
+  if (!getTarget().getTriple().isAMDGCN())
+    return V;
+
+  unsigned Bits = CGM.getDataLayout().getTypeSizeInBits(V->getType());
+  if (Bits == 0 || (Bits % 32) != 0)
+    return V; // Only whole-dword values occupy a register tuple.
+
+  // Tag the instruction that produces the value, not the store: the store to
+  // this local is removed by SROA/mem2reg, while the defining instruction
+  // survives into the SSA value the register allocator sees. A value that is
+  // not an instruction (constant, argument) has no def to tag, so it is left
+  // unpinned rather than silently mis-annotated.
+  auto *Def = dyn_cast<llvm::Instruction>(V);
+  if (!Def)
+    return V;
+
+  bool IsAGPR = It->second.first;
+  unsigned Reg = It->second.second;
+  llvm::MDNode *MD = llvm::MDNode::get(
+      getLLVMContext(),
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(Int32Ty, Reg)));
+  Def->setMetadata(IsAGPR ? "amdgpu.pin.agpr" : "amdgpu.pin.vgpr", MD);
+  return V;
 }
 
 void CodeGenFunction::EmitStoreThroughBitfieldLValue(RValue Src, LValue Dst,
@@ -3668,8 +3716,11 @@ LValue CodeGenFunction::EmitDeclRefLValue(const DeclRefExpr *E) {
     // Check for captured variables.
     if (E->refersToEnclosingVariableOrCapture()) {
       VD = VD->getCanonicalDecl();
-      if (auto *FD = LambdaCaptureFields.lookup(VD))
-        return EmitCapturedFieldLValue(*this, FD, CXXABIThisValue);
+      if (auto *FD = LambdaCaptureFields.lookup(VD)) {
+        LValue CapLVal = EmitCapturedFieldLValue(*this, FD, CXXABIThisValue);
+        tryTrackAMDGPUPinnedCapture(VD, CapLVal);
+        return CapLVal;
+      }
       if (CapturedStmtInfo) {
         auto I = LocalDeclMap.find(VD);
         if (I != LocalDeclMap.end()) {

@@ -2569,6 +2569,20 @@ multiclass AMDGPUWaveReduceOps {
 
 defm int_amdgcn_wave_reduce_ : AMDGPUWaveReduceOps;
 
+// Register-pinning carrier. Internal to codegen: AMDGPUCodeGenPrepare creates
+// these from !amdgpu.pin.{vgpr,agpr} metadata and AMDGPUPrepareAGPRAlloc
+// consumes them pre-RA, turning each into a soft allocation hint toward the
+// VGPR/AGPR tuple starting at the immediate operand. The value is returned
+// unchanged, so dropping the call is always semantically valid.
+def int_amdgcn_pin_vgpr :
+  Intrinsic<[llvm_any_ty], [LLVMMatchType<0>, llvm_i32_ty],
+            [IntrNoMem, IntrWillReturn, IntrNoCallback, IntrNoFree,
+             ImmArg<ArgIndex<1>>]>;
+def int_amdgcn_pin_agpr :
+  Intrinsic<[llvm_any_ty], [LLVMMatchType<0>, llvm_i32_ty],
+            [IntrNoMem, IntrWillReturn, IntrNoCallback, IntrNoFree,
+             ImmArg<ArgIndex<1>>]>;
+
 def int_amdgcn_readfirstlane :
   Intrinsic<[llvm_any_ty], [LLVMMatchType<0>],
             [IntrNoMem, IntrConvergent, IntrWillReturn, IntrNoCallback, IntrNoFree, IntrNoCreateUndefOrPoison]>;

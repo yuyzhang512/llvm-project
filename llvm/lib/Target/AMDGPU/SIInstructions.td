@@ -422,6 +422,33 @@ foreach Op = Operations in {
                                                       Op.VT, Op.RetReg, Op.Reg>;
 }
 
+// Register-pin carrier pseudos, one per width. Lowered to an allocation hint by
+// AMDGPUPrepareAGPRAlloc pre-RA; they never reach the emitter.
+class PinPseudo<RegisterClass DstRC, RegisterClass SrcRC> :
+  VPseudoInstSI <(outs DstRC:$vdst), (ins SrcRC:$src, i32imm:$regno), []> {
+  let hasSideEffects = 0;
+  let mayLoad = 0;
+  let mayStore = 0;
+}
+
+foreach w = [32,64,96,128,160,192,224,256,288,320,352,384,512,1024] in {
+  defvar VRC = !cast<RegisterClass>(!if(!eq(w,32), "VGPR_32", "VReg_"#w));
+  defvar ARC = !cast<RegisterClass>(!if(!eq(w,32), "AGPR_32", "AReg_"#w));
+  defvar AVRC = !cast<RegisterClass>(!if(!eq(w,32), "AV_32", "AV_"#w));
+  def PIN_VGPR_B#w : PinPseudo<VRC, VRC>;
+  def PIN_AGPR_B#w : PinPseudo<ARC, AVRC>;
+}
+
+// Wider or non-i32 values are decomposed into these widths by
+// AMDGPUCodeGenPrepare, so an unlisted type never reaches ISel.
+foreach vt = [i32, f32, v2i32, v4i32, v4f32, v8f16,
+              v8i32, v8f32, v16i32, v16f32] in {
+  def : GCNPat<(vt (int_amdgcn_pin_vgpr vt:$s, (i32 timm:$r))),
+               (!cast<Instruction>("PIN_VGPR_B"#vt.Size) $s, $r)>;
+  def : GCNPat<(vt (int_amdgcn_pin_agpr vt:$s, (i32 timm:$r))),
+               (!cast<Instruction>("PIN_AGPR_B"#vt.Size) $s, $r)>;
+}
+
 let usesCustomInserter = 1, Defs = [VCC] in {
 def V_ADD_U64_PSEUDO : VPseudoInstSI <
   (outs VReg_64_AlignTarget:$vdst), (ins VSrc_b64:$src0, VSrc_b64:$src1),

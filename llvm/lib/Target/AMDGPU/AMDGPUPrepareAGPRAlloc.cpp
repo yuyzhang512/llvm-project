@@ -16,11 +16,13 @@
 
 #include "AMDGPUPrepareAGPRAlloc.h"
 #include "AMDGPU.h"
+#include "SIInstrInfo.h"
 #include "GCNSubtarget.h"
 #include "SIMachineFunctionInfo.h"
 #include "SIRegisterInfo.h"
 #include "llvm/CodeGen/LiveIntervals.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/InitializePasses.h"
 
 using namespace llvm;
@@ -66,6 +68,8 @@ char AMDGPUPrepareAGPRAllocLegacy::ID = 0;
 
 char &llvm::AMDGPUPrepareAGPRAllocLegacyID = AMDGPUPrepareAGPRAllocLegacy::ID;
 
+static bool recordPinHints(MachineFunction &MF);
+
 bool AMDGPUPrepareAGPRAllocLegacy::runOnMachineFunction(MachineFunction &MF) {
   if (skipFunction(MF.getFunction()))
     return false;
@@ -87,13 +91,14 @@ bool AMDGPUPrepareAGPRAllocImpl::isAV64Imm(const MachineOperand &MO) const {
 }
 
 bool AMDGPUPrepareAGPRAllocImpl::run(MachineFunction &MF) {
+  // Before the bail-out below: no-AGPR targets are where VGPR pinning matters.
+  bool Changed = recordPinHints(MF);
+
   if (MRI.isReserved(AMDGPU::AGPR0))
-    return false;
+    return Changed;
 
   const MCInstrDesc &AVImmPseudo32 = TII.get(AMDGPU::AV_MOV_B32_IMM_PSEUDO);
   const MCInstrDesc &AVImmPseudo64 = TII.get(AMDGPU::AV_MOV_B64_IMM_PSEUDO);
-
-  bool Changed = false;
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : MBB) {
       if ((MI.getOpcode() == AMDGPU::V_MOV_B32_e32 &&
@@ -118,4 +123,66 @@ bool AMDGPUPrepareAGPRAllocImpl::run(MachineFunction &MF) {
   }
 
   return Changed;
+}
+
+//===----------------------------------------------------------------------===//
+// Metadata-driven register pinning: carrier -> allocation hint.
+//
+// Must run pre-RA, in SSA form: coalescing merges the pinned value into wider
+// live ranges later, and a hint recorded now rides along with it.
+//===----------------------------------------------------------------------===//
+
+// True for the PIN_{VGPR,AGPR}_B* carrier pseudos.
+static bool isPinPseudo(const SIInstrInfo *TII, const MachineInstr &MI) {
+  StringRef N = TII->getName(MI.getOpcode());
+  return N.starts_with("PIN_VGPR_B") || N.starts_with("PIN_AGPR_B");
+}
+
+// The tuple a pin targets, or 0 if RegNo is not a legal member of RC.
+static MCRegister pinPhysReg(const SIRegisterInfo *TRI,
+                             const TargetRegisterClass *RC, bool WantAGPR,
+                             unsigned RegNo) {
+  unsigned First = (WantAGPR ? AMDGPU::AGPR0 : AMDGPU::VGPR0) + RegNo;
+  MCRegister PR = TRI->getRegSizeInBits(*RC) == 32
+                      ? MCRegister(First)
+                      : TRI->getMatchingSuperReg(First, AMDGPU::sub0, RC);
+  if (PR && RC->contains(PR))
+    return PR;
+  return MCRegister();
+}
+
+static bool recordPinHints(MachineFunction &MF) {
+  const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
+  const SIInstrInfo *TII = ST.getInstrInfo();
+  const SIRegisterInfo *TRI = ST.getRegisterInfo();
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+
+  SmallVector<MachineInstr *, 8> Pins;
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : MBB)
+      if (isPinPseudo(TII, MI))
+        Pins.push_back(&MI);
+
+  for (MachineInstr *Pin : Pins) {
+    Register Dst = Pin->getOperand(0).getReg();
+    Register Src = Pin->getOperand(1).getReg();
+    unsigned RegNo = Pin->getOperand(2).getImm();
+    const TargetRegisterClass *RC = MRI.getRegClass(Dst);
+
+    // Exact placement, not just the right 256-VGPR group: the win is fewer full
+    // VALU drains (s_wait_alu depctr_va_vdst(0)) at the WMMA window.
+    if (MCRegister PR =
+            pinPhysReg(TRI, RC, TRI->isAGPRClass(RC), RegNo)) {
+      MRI.setSimpleHint(Dst, PR);
+      if (Src.isVirtual())
+        MRI.setSimpleHint(Src, PR);
+    }
+
+    // The carrier is an identity; forward it and drop it.
+    BuildMI(*Pin->getParent(), Pin, Pin->getDebugLoc(),
+            TII->get(TargetOpcode::COPY), Dst)
+        .addReg(Src, RegState::NoFlags, Pin->getOperand(1).getSubReg());
+    Pin->eraseFromParent();
+  }
+  return !Pins.empty();
 }
