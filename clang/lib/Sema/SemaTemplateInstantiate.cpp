@@ -1586,6 +1586,10 @@ namespace {
     TransformStmtAlwaysInlineAttr(const Stmt *OrigS, const Stmt *InstS,
                                   const AlwaysInlineAttr *A);
     const CodeAlignAttr *TransformCodeAlignAttr(const CodeAlignAttr *CA);
+    const AMDGPUPinVGPRAttr *
+    TransformAMDGPUPinVGPRAttr(const AMDGPUPinVGPRAttr *A);
+    const AMDGPUPinAGPRAttr *
+    TransformAMDGPUPinAGPRAttr(const AMDGPUPinAGPRAttr *A);
     const OpenACCRoutineDeclAttr *
     TransformOpenACCRoutineDeclAttr(const OpenACCRoutineDeclAttr *A);
     ExprResult TransformPredefinedExpr(PredefinedExpr *E);
@@ -2359,6 +2363,35 @@ TemplateInstantiator::TransformCodeAlignAttr(const CodeAlignAttr *CA) {
   Expr *TransformedExpr = getDerived().TransformExpr(CA->getAlignment()).get();
   return getSema().BuildCodeAlignAttr(*CA, TransformedExpr);
 }
+// The register number can be computed from the enclosing template, which is how
+// one source-level operation names a different register in each instantiation.
+template <typename AttrT>
+static const AttrT *
+substPinReg(Sema &S, TreeTransform<TemplateInstantiator> &TT, const AttrT *A) {
+  ExprResult Reg = TT.TransformExpr(A->getReg());
+  if (Reg.isInvalid())
+    return A;
+  Expr *E = Reg.get();
+  if (!E->isValueDependent()) {
+    llvm::APSInt Val;
+    ExprResult R = S.VerifyIntegerConstantExpression(E, &Val);
+    if (R.isInvalid() || Val.isNegative())
+      return A;
+    E = R.get();
+  }
+  return ::new (S.Context) AttrT(S.Context, *A, E);
+}
+
+const AMDGPUPinVGPRAttr *
+TemplateInstantiator::TransformAMDGPUPinVGPRAttr(const AMDGPUPinVGPRAttr *A) {
+  return substPinReg(getSema(), *this, A);
+}
+
+const AMDGPUPinAGPRAttr *
+TemplateInstantiator::TransformAMDGPUPinAGPRAttr(const AMDGPUPinAGPRAttr *A) {
+  return substPinReg(getSema(), *this, A);
+}
+
 const OpenACCRoutineDeclAttr *
 TemplateInstantiator::TransformOpenACCRoutineDeclAttr(
     const OpenACCRoutineDeclAttr *A) {

@@ -654,6 +654,27 @@ CheckForIncompatibleAttributes(Sema &S,
   }
 }
 
+// amdgpu_pin_{vgpr,agpr}(N) on a statement: the register the operation's result
+// should be placed in. A dependent argument is left for instantiation to check.
+template <typename AttrT>
+static Attr *handleAMDGPUPinAttr(Sema &S, Stmt *St, const ParsedAttr &A,
+                                 SourceRange Range) {
+  Expr *E = A.getArgAsExpr(0);
+  if (!E->isValueDependent()) {
+    llvm::APSInt Val;
+    ExprResult R = S.VerifyIntegerConstantExpression(E, &Val);
+    if (R.isInvalid())
+      return nullptr;
+    if (Val.isNegative()) {
+      S.Diag(E->getExprLoc(), diag::err_attribute_requires_positive_integer)
+          << A << /*non-negative*/ 1;
+      return nullptr;
+    }
+    E = R.get();
+  }
+  return ::new (S.Context) AttrT(S.Context, A, E);
+}
+
 static Attr *handleOpenCLUnrollHint(Sema &S, Stmt *St, const ParsedAttr &A,
                                     SourceRange Range) {
   // Although the feature was introduced only in OpenCL C v2.0 s6.11.5, it's
@@ -792,6 +813,10 @@ static Attr *ProcessStmtAttribute(Sema &S, Stmt *St, const ParsedAttr &A,
     return handleHLSLControlFlowHint(S, St, A, Range);
   case ParsedAttr::AT_OpenCLUnrollHint:
     return handleOpenCLUnrollHint(S, St, A, Range);
+  case ParsedAttr::AT_AMDGPUPinVGPR:
+    return handleAMDGPUPinAttr<AMDGPUPinVGPRAttr>(S, St, A, Range);
+  case ParsedAttr::AT_AMDGPUPinAGPR:
+    return handleAMDGPUPinAttr<AMDGPUPinAGPRAttr>(S, St, A, Range);
   case ParsedAttr::AT_Suppress:
     return handleSuppressAttr(S, St, A, Range);
   case ParsedAttr::AT_NoMerge:

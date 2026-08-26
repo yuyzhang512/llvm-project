@@ -1023,6 +1023,15 @@ void AMDGPUTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
         return false;
       });
 
+  // Before the optimizer runs: the instruction clang attached the request to
+  // need not survive it.
+  PB.registerPipelineStartEPCallback(
+      [this](ModulePassManager &PM, OptimizationLevel) {
+        if (getTargetTriple().isAMDGCN())
+          PM.addPass(
+              createModuleToFunctionPassAdaptor(AMDGPULowerPinMetadataPass()));
+      });
+
   PB.registerScalarOptimizerLateEPCallback(
       [](FunctionPassManager &FPM, OptimizationLevel Level) {
         if (Level == OptimizationLevel::O0)

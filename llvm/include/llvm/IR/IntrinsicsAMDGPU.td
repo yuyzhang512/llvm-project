@@ -2569,6 +2569,17 @@ multiclass AMDGPUWaveReduceOps {
 
 defm int_amdgcn_wave_reduce_ : AMDGPUWaveReduceOps;
 
+// Requests that the value be allocated to the VGPR/AGPR tuple starting at the
+// immediate operand, and returns it unchanged.
+def int_amdgcn_pin_vgpr :
+  Intrinsic<[llvm_any_ty], [LLVMMatchType<0>, llvm_i32_ty],
+            [IntrNoMem, IntrWillReturn, IntrNoCallback, IntrNoFree,
+             ImmArg<ArgIndex<1>>]>;
+def int_amdgcn_pin_agpr :
+  Intrinsic<[llvm_any_ty], [LLVMMatchType<0>, llvm_i32_ty],
+            [IntrNoMem, IntrWillReturn, IntrNoCallback, IntrNoFree,
+             ImmArg<ArgIndex<1>>]>;
+
 def int_amdgcn_readfirstlane :
   Intrinsic<[llvm_any_ty], [LLVMMatchType<0>],
             [IntrNoMem, IntrConvergent, IntrWillReturn, IntrNoCallback, IntrNoFree, IntrNoCreateUndefOrPoison]>;

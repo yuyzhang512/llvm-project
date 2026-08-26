@@ -3501,6 +3501,32 @@ An error will be given if:
   }];
 }
 
+def AMDGPUPinRegDocs : Documentation {
+  let Category = DocCatStmt;
+  let Content = [{
+``amdgpu_pin_vgpr`` and ``amdgpu_pin_agpr`` ask the register allocator to place
+the result of one operation in a particular register:
+
+.. code-block:: c++
+
+  // this WMMA's result goes in v[264:271]
+  [[clang::amdgpu_pin_vgpr(264)]]
+  acc = __builtin_amdgcn_wmma_f32_16x16x32_bf16(false, a, false, b, 0, acc,
+                                                false, false);
+
+The argument is the first register of the tuple; how many registers are taken
+follows from the type. Pin an operand by pinning the operation that produces it.
+
+The request is attached to the instruction the statement performs, not to the
+variable assigned to. A variable's storage is removed by SROA, so a request
+anchored there does not survive optimization, while the operation that computes
+the value is still present when the allocator runs.
+
+This is a hint. Allocation still succeeds when the requested register is
+unavailable, so an unsatisfiable request costs performance, not correctness.
+  }];
+}
+
 def AMDGPUWavesPerEUDocs : Documentation {
   let Category = DocCatAMDGPUAttributes;
   let Content = [{
@@ -10670,3 +10696,4 @@ void example2() {
 ```
   }];
 }
+

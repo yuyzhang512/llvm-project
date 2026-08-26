@@ -781,12 +781,28 @@ void CodeGenFunction::EmitLabelStmt(const LabelStmt &S) {
   EmitStmt(S.getSubStmt());
 }
 
+// Name the register for \p I's result, per amdgpu_pin_{vgpr,agpr}.
+static void setAMDGPUPinnedReg(CodeGenFunction &CGF, llvm::Instruction *I,
+                               bool IsAGPR, const Expr *RegE) {
+  std::optional<llvm::APSInt> Reg =
+      RegE->getIntegerConstantExpr(CGF.getContext());
+  if (!Reg)
+    return;
+
+  llvm::LLVMContext &Ctx = CGF.getLLVMContext();
+  llvm::Metadata *MD = llvm::ConstantAsMetadata::get(
+      llvm::ConstantInt::get(CGF.Int32Ty, Reg->getZExtValue()));
+  I->setMetadata(IsAGPR ? "amdgpu.pin.agpr" : "amdgpu.pin.vgpr",
+                 llvm::MDNode::get(Ctx, MD));
+}
+
 void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
   bool nomerge = InNoMergeAttributedStmt;
   bool noinline = InNoInlineAttributedStmt;
   bool alwaysinline = InAlwaysInlineAttributedStmt;
   bool noconvergent = InNoConvergentAttributedStmt;
   StringRef amdgpuAVMode = AMDGPUAvailableVisibleMode;
+  std::optional<std::pair<bool, const Expr *>> amdgpuPin;
   HLSLControlFlowHintAttr::Spelling flattenOrBranch = HLSLControlFlowAttr;
   const CallExpr *musttail = MustTailCall;
   const AtomicAttr *AA = nullptr;
@@ -828,6 +844,12 @@ void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
     case attr::AMDGPUAvailableVisible:
       amdgpuAVMode = cast<AMDGPUAvailableVisibleAttr>(A)->getMode();
       break;
+    case attr::AMDGPUPinVGPR:
+      amdgpuPin = {false, cast<AMDGPUPinVGPRAttr>(A)->getReg()};
+      break;
+    case attr::AMDGPUPinAGPR:
+      amdgpuPin = {true, cast<AMDGPUPinAGPRAttr>(A)->getReg()};
+      break;
     case attr::HLSLControlFlowHint: {
       flattenOrBranch = cast<HLSLControlFlowHintAttr>(A)->getSemanticSpelling();
     } break;
@@ -845,6 +867,22 @@ void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
   SaveAndRestore save_musttail(MustTailCall, musttail);
   SaveAndRestore save_flattenOrBranch(HLSLControlFlowAttr, flattenOrBranch);
   CGAtomicOptionsRAII AORAII(CGM, AA);
+
+  // A register request names the operation the statement performs, and it is
+  // the instruction computing that value which carries it. EmitStmt evaluates
+  // an expression statement only for its side effects and drops the value, so
+  // emit it here instead and keep what it produced.
+  const auto *PinnedExpr = dyn_cast<Expr>(S.getSubStmt());
+  if (amdgpuPin && PinnedExpr && HaveInsertPoint() &&
+      hasScalarEvaluationKind(PinnedExpr->getType())) {
+    PGO->setCurrentStmt(PinnedExpr);
+    EmitStopPoint(PinnedExpr);
+    llvm::Value *V = EmitAnyExpr(PinnedExpr).getScalarVal();
+    if (auto *I = dyn_cast<llvm::Instruction>(V))
+      setAMDGPUPinnedReg(*this, I, amdgpuPin->first, amdgpuPin->second);
+    return;
+  }
+
   EmitStmt(S.getSubStmt(), S.getAttrs());
 }
 

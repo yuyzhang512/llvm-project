@@ -15,7 +15,9 @@
 #include "AMDGPU.h"
 #include "AMDGPUMemoryUtils.h"
 #include "AMDGPUTargetMachine.h"
+#include "GCNSubtarget.h"
 #include "SIModeRegisterDefaults.h"
+#include "SIRegisterInfo.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/ConstantFolding.h"
@@ -23,15 +25,21 @@
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstVisitor.h"
 #include "llvm/IR/IntrinsicsAMDGPU.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/KnownBits.h"
 #include "llvm/Support/KnownFPClass.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -293,9 +301,11 @@ public:
 
 } // end anonymous namespace
 
+static bool lowerPinMetadata(Function &F);
+
 bool AMDGPUCodeGenPrepareImpl::run() {
   BreakPhiNodesCache.clear();
-  bool MadeChange = false;
+  bool MadeChange = lowerPinMetadata(F);
 
   // Need to use make_early_inc_range because integer division expansion is
   // handled by Transform/Utils, and it can delete instructions such as the
@@ -2550,4 +2560,110 @@ char AMDGPUCodeGenPrepare::ID = 0;
 
 FunctionPass *llvm::createAMDGPUCodeGenPreparePass() {
   return new AMDGPUCodeGenPrepare();
+}
+//===----------------------------------------------------------------------===//
+// Metadata-driven register pinning
+//
+//   %v = load <2 x i32>, ptr %p, !amdgpu.pin.vgpr !0   ; !0 = !{i32 256}
+//
+// asks the allocator to keep %v in the VGPR (or AGPR) tuple starting at 256.
+// Metadata does not survive ISel, so the request is rewritten here into the
+// internal llvm.amdgcn.pin.* carrier, which does: it is an instruction, so no
+// later pass silently drops it. AMDGPUPrepareAGPRAlloc turns it into a soft
+// allocation hint pre-RA and erases it.
+//===----------------------------------------------------------------------===//
+
+// Wrap V in the carrier, one call per supported width. Patterns exist for
+// i32-based widths 1/2/4/8/16 lanes only, so a wider value is bitcast to
+// <N x i32> and split into those (12 -> 8 + 4).
+static Value *buildPinChain(IRBuilder<> &B, Value *V, unsigned Reg,
+                            Intrinsic::ID IID) {
+  Module *M = B.GetInsertBlock()->getModule();
+  Type *Ty = V->getType();
+  Type *I32 = B.getInt32Ty();
+  unsigned Lanes = M->getDataLayout().getTypeSizeInBits(Ty) / 32;
+  auto *VecTy = FixedVectorType::get(I32, Lanes);
+  Value *Vec = B.CreateBitCast(V, VecTy);
+
+  auto pin = [&](Value *Chunk, unsigned RegNo) {
+    Function *Fn =
+        Intrinsic::getOrInsertDeclaration(M, IID, {Chunk->getType()});
+    return B.CreateCall(Fn, {Chunk, B.getInt32(RegNo)});
+  };
+  auto widthAt = [](unsigned L) -> unsigned {
+    for (unsigned W : {16u, 8u, 4u, 2u})
+      if (L >= W)
+        return W;
+    return 1;
+  };
+
+  for (unsigned Off = 0; Off < Lanes;) {
+    unsigned W = widthAt(Lanes - Off);
+    if (W == 1) {
+      Value *Idx = B.getInt32(Off);
+      Vec = B.CreateInsertElement(
+          Vec, pin(B.CreateExtractElement(Vec, Idx), Reg + Off), Idx);
+    } else {
+      Value *Sub = B.CreateExtractVector(FixedVectorType::get(I32, W), Vec,
+                                         B.getInt64(Off));
+      Vec = B.CreateInsertVector(VecTy, Vec, pin(Sub, Reg + Off),
+                                 B.getInt64(Off));
+    }
+    Off += W;
+  }
+  return B.CreateBitCast(Vec, Ty);
+}
+
+static bool pinValue(Instruction &I, StringRef MDName, Intrinsic::ID IID) {
+  MDNode *MD = I.getMetadata(MDName);
+  if (!MD)
+    return false;
+  I.setMetadata(MDName, nullptr);
+  if (MD->getNumOperands() != 1)
+    return false;
+  auto *CI = mdconst::dyn_extract<ConstantInt>(MD->getOperand(0));
+  if (!CI)
+    return false;
+  unsigned Reg = CI->getZExtValue();
+
+  Value *V = &I;
+  Type *Ty = V->getType();
+  const DataLayout &DL = I.getModule()->getDataLayout();
+  if (!Ty->isSized())
+    return false;
+  unsigned Bits = DL.getTypeSizeInBits(Ty);
+  if (Bits == 0 || Bits % 32)
+    return false; // Only whole-dword values occupy a register tuple.
+  std::optional<BasicBlock::iterator> IP = I.getInsertionPointAfterDef();
+  if (!IP)
+    return false;
+
+  SmallVector<Use *, 8> OldUses;
+  for (Use &U : I.uses())
+    OldUses.push_back(&U);
+
+  IRBuilder<> B(&**IP);
+  Value *Pinned = buildPinChain(B, V, Reg, IID);
+  for (Use *U : OldUses)
+    U->set(Pinned);
+  return true;
+}
+
+// Plain IR rewrite, so it rides in this pass rather than getting its own.
+static bool lowerPinMetadata(Function &F) {
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    Changed |= pinValue(I, "amdgpu.pin.vgpr", Intrinsic::amdgcn_pin_vgpr);
+    Changed |= pinValue(I, "amdgpu.pin.agpr", Intrinsic::amdgcn_pin_agpr);
+  }
+  return Changed;
+}
+
+PreservedAnalyses AMDGPULowerPinMetadataPass::run(Function &F,
+                                                  FunctionAnalysisManager &) {
+  if (!lowerPinMetadata(F))
+    return PreservedAnalyses::all();
+  PreservedAnalyses PA;
+  PA.preserveSet<CFGAnalyses>();
+  return PA;
 }

@@ -360,6 +360,19 @@ public:
   PreservedAnalyses run(Function &, FunctionAnalysisManager &);
 };
 
+// Rewrites !amdgpu.pin.{vgpr,agpr} into the llvm.amdgcn.pin.* carrier. Runs at
+// the start of the optimization pipeline, because the request is attached to
+// whatever clang emitted for the operation and that instruction may not last:
+// an inlinable wrapper call is removed by the inliner, and a value handed
+// through a parameter arrives as a load from a stack slot that SROA deletes.
+// The carrier takes the value as an operand, so it survives both, and inlining
+// rewrites the operand to whatever ends up producing the value.
+class AMDGPULowerPinMetadataPass
+    : public RequiredPassInfoMixin<AMDGPULowerPinMetadataPass> {
+public:
+  PreservedAnalyses run(Function &, FunctionAnalysisManager &);
+};
+
 class AMDGPULowerKernelArgumentsPass
     : public RequiredPassInfoMixin<AMDGPULowerKernelArgumentsPass> {
 private:

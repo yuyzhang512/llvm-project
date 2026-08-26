@@ -4106,6 +4106,21 @@ const int *SIRegisterInfo::getRegUnitPressureSets(MCRegUnit RegUnit) const {
   return AMDGPUGenRegisterInfo::getRegUnitPressureSets(RegUnit);
 }
 
+void SIRegisterInfo::updateRegAllocHint(Register Reg, Register NewReg,
+                                        MachineFunction &MF) const {
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+
+  // Reg has been coalesced into NewReg, so a request to place Reg's value in a
+  // particular register now describes NewReg. Without this the request is lost
+  // for any value whose live range is merged with another, which is the normal
+  // outcome for something accumulated across a loop.
+  std::pair<unsigned, Register> Hint = MRI.getRegAllocationHint(Reg);
+  if (Hint.first != AMDGPURI::PinnedReg || !NewReg.isVirtual())
+    return;
+  if (MRI.getRegAllocationHint(NewReg).first != AMDGPURI::PinnedReg)
+    MRI.setRegAllocationHint(NewReg, AMDGPURI::PinnedReg, Hint.second);
+}
+
 bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
                                            ArrayRef<MCPhysReg> Order,
                                            SmallVectorImpl<MCPhysReg> &Hints,
@@ -4136,6 +4151,13 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
       // isLo(Paired) is implicitly true here from the API of
       // getMatchingSuperReg.
       Hints.push_back(PairedPhys);
+    return false;
+  }
+  case AMDGPURI::PinnedReg: {
+    // An exact request; offer it and let the allocator fall back to the normal
+    // order when it is unavailable.
+    if (Hint.second.isPhysical() && is_contained(Order, Hint.second.asMCReg()))
+      Hints.push_back(Hint.second.asMCReg());
     return false;
   }
   case AMDGPURI::Size16: {
