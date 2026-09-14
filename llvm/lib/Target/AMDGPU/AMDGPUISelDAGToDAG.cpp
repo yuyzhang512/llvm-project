@@ -3482,9 +3482,19 @@ void AMDGPUDAGToDAGISel::SelectWRITE_REGISTER(SDNode *N) {
     return;
   }
 
+  SDLoc SL(N);
+  // A named VGPR or AGPR holds a value per lane, so the value is copied as it
+  // is.
+  const SIRegisterInfo *TRI = Subtarget->getRegisterInfo();
+  if (TRI->hasVectorRegisters(TRI->getPhysRegBaseClass(Reg))) {
+    SDValue CopyToReg =
+        CurDAG->getCopyToReg(N->getOperand(0), SL, Reg, SrcVal);
+    CurDAG->ReplaceAllUsesOfValueWith(SDValue(N, 0), CopyToReg);
+    return;
+  }
+
   // Speculatively insert a readfirstlane in case the source value ends up in a
   // VGPR, which hopefully will fold away if not.
-  SDLoc SL(N);
   SDValue CopyVal;
   if (isa<ConstantSDNode>(SrcVal)) {
     CopyVal = SrcVal;
