@@ -3593,6 +3593,33 @@ recent declaration that specifies them are used; a definition without
   }];
 }
 
+def AMDGPUPinRegDocs : Documentation {
+  let Category = DocCatAMDGPUAttributes;
+  let Content = [{
+``amdgpu_pin_vgpr`` and ``amdgpu_pin_agpr`` place a local variable in a
+particular register:
+
+.. code-block:: c++
+
+  // acc occupies v[256:259] for its whole lifetime
+  __attribute__((amdgpu_pin_vgpr(256))) float4 acc;
+
+The argument is the first register of the tuple; how many registers are taken
+follows from the type, so a four-dword value pinned to 256 occupies
+``v[256:259]``. The variable has no stack storage: every read and write of it
+becomes a read from or a write to that register.
+
+Only an automatic local can be placed this way, and only one whose type is a
+whole number of 32-bit registers; the attribute is ignored elsewhere. An
+``amdgpu_pin_agpr`` request additionally selects the form of an MFMA that writes
+its result to the AGPR file, so that an accumulator kept there needs no moves
+between the two files.
+
+This is a placement request. Allocation still succeeds when the register is
+unavailable, so an unsatisfiable request costs performance, not correctness.
+  }];
+}
+
 def AMDGPUNumSGPRNumVGPRDocs : Documentation {
   let Category = DocCatAMDGPUAttributes;
   let Content = [{

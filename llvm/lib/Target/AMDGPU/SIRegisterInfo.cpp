@@ -774,6 +774,12 @@ BitVector SIRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   for (MCPhysReg Reg : MFI->getVGPRSpillAGPRs())
     reserveRegisterTuples(Reserved, Reg);
 
+  // Registers named by llvm.{read,write}_register that are live-in rather than
+  // written first; the machine verifier rejects a use of an undefined physical
+  // register unless it is reserved.
+  for (MCPhysReg Reg : MFI->getReservedNamedRegs())
+    reserveRegisterTuples(Reserved, Reg);
+
   return Reserved;
 }
 

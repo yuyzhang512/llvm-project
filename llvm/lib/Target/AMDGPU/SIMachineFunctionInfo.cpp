@@ -47,6 +47,57 @@ const GCNTargetMachine &getTM(const GCNSubtarget *STI) {
 
 bool SIMachineFunctionInfo::MFMAVGPRForm = false;
 
+// The register named by an llvm.{read,write}_register call, or an empty string.
+static StringRef getNamedReg(const Instruction &I) {
+  const auto *CI = dyn_cast<CallInst>(&I);
+  if (!CI)
+    return StringRef();
+  Intrinsic::ID IID = CI->getIntrinsicID();
+  if (IID != Intrinsic::read_register && IID != Intrinsic::write_register)
+    return StringRef();
+  const auto *MD =
+      cast<MDNode>(cast<MetadataAsValue>(CI->getArgOperand(0))->getMetadata());
+  return cast<MDString>(MD->getOperand(0))->getString();
+}
+
+// Collect what naming a VGPR or AGPR through llvm.{read,write}_register implies
+// for \p F: one past the highest AGPR named, and the registers that have to be
+// reserved.
+//
+// A read of a named register lowers to a use of that physical register. If a
+// write precedes it in the same block, liveness already protects the value, and
+// reserving would only shrink the allocatable set. Otherwise the read is
+// live-in and the verifier rejects it as an undefined physical register unless
+// the register is reserved, so reserve only those.
+static void scanNamedRegs(const Function &F, unsigned &HighestAGPR,
+                          SmallVectorImpl<MCPhysReg> &ToReserve) {
+  SmallDenseSet<StringRef, 8> NeedsReserve;
+  for (const BasicBlock &BB : F) {
+    SmallDenseSet<StringRef, 8> WrittenHere;
+    for (const Instruction &I : BB) {
+      StringRef Name = getNamedReg(I);
+      if (Name.empty())
+        continue;
+      auto [Kind, Idx, Width] = AMDGPU::parseAsmPhysRegName(Name);
+      if (Kind != 'v' && Kind != 'a')
+        continue;
+      if (Kind == 'a')
+        HighestAGPR = std::max(HighestAGPR, Idx + Width);
+      if (cast<CallInst>(I).getIntrinsicID() == Intrinsic::write_register)
+        WrittenHere.insert(Name);
+      else if (!WrittenHere.contains(Name))
+        NeedsReserve.insert(Name);
+    }
+  }
+
+  for (StringRef Name : NeedsReserve) {
+    auto [Kind, Idx, Width] = AMDGPU::parseAsmPhysRegName(Name);
+    MCRegister First = (Kind == 'a' ? AMDGPU::AGPR0 : AMDGPU::VGPR0) + Idx;
+    for (unsigned I = 0; I != Width; ++I)
+      ToReserve.push_back(First + I);
+  }
+}
+
 SIMachineFunctionInfo::SIMachineFunctionInfo(const Function &F,
                                              const GCNSubtarget *STI)
     : AMDGPUMachineFunctionInfo(F, *STI), Mode(F, *STI),
@@ -87,6 +138,16 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const Function &F,
                                         /*OnlyFirstRequired=*/true);
     MinNumAGPRs = MinNumAGPRAttr;
   }
+
+  // Scanned once here rather than from getReservedRegs, which the verifier
+  // calls after every pass until the reserved set is frozen. An AGPR name also
+  // asks for the value to live in that file, so record the window: an MFMA that
+  // fits it selects the AGPR form, and the registers are counted in the AGPR
+  // budget.
+  scanNamedRegs(F, NamedAGPRs, ReservedNamedRegs);
+  if (NamedAGPRs && ST.hasGFX90AInsts())
+    MinNumAGPRs =
+        MinNumAGPRs == ~0u ? NamedAGPRs : std::max(MinNumAGPRs, NamedAGPRs);
 
   if (!isEntryFunction()) {
     if (CC != CallingConv::AMDGPU_Gfx &&

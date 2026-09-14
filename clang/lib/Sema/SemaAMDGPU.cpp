@@ -730,6 +730,52 @@ void SemaAMDGPU::handleAMDGPUNumVGPRAttr(Decl *D, const ParsedAttr &AL) {
                  AMDGPUNumVGPRAttr(getASTContext(), AL, NumVGPR));
 }
 
+void SemaAMDGPU::addAMDGPUPinRegAttr(Decl *D, const AttributeCommonInfo &CI,
+                                     Expr *E, bool IsAGPR) {
+  // Only an automatic local can live in a register for its whole lifetime.
+  const auto *VD = dyn_cast<VarDecl>(D);
+  if (!VD || !VD->isLocalVarDecl() || VD->isStaticLocal()) {
+    Diag(CI.getLoc(), diag::warn_attribute_ignored) << CI;
+    return;
+  }
+
+  // The value has to fill whole registers.
+  QualType T = VD->getType();
+  if (!T->isDependentType()) {
+    uint64_t Bits = getASTContext().getTypeSize(T);
+    if (Bits == 0 || Bits % 32) {
+      Diag(CI.getLoc(), diag::warn_attribute_ignored) << CI;
+      return;
+    }
+  }
+
+  // A dependent argument is checked when the template is instantiated.
+  if (!E->isValueDependent()) {
+    llvm::APSInt Val;
+    ExprResult R = SemaRef.VerifyIntegerConstantExpression(E, &Val);
+    if (R.isInvalid())
+      return;
+    if (Val.isNegative()) {
+      Diag(E->getExprLoc(), diag::err_attribute_requires_positive_integer)
+          << CI << /*non-negative*/ 1;
+      return;
+    }
+    E = R.get();
+  }
+
+  if (IsAGPR)
+    D->addAttr(::new (getASTContext())
+                   AMDGPUPinAGPRAttr(getASTContext(), CI, E));
+  else
+    D->addAttr(::new (getASTContext())
+                   AMDGPUPinVGPRAttr(getASTContext(), CI, E));
+}
+
+void SemaAMDGPU::handleAMDGPUPinRegAttr(Decl *D, const ParsedAttr &AL,
+                                        bool IsAGPR) {
+  addAMDGPUPinRegAttr(D, AL, AL.getArgAsExpr(0), IsAGPR);
+}
+
 static bool
 checkAMDGPUMaxNumWorkGroupsArguments(Sema &S, Expr *XExpr, Expr *YExpr,
                                      Expr *ZExpr,
