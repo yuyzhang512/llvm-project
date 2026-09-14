@@ -1354,6 +1354,15 @@ static llvm::Constant *replaceUndef(CodeGenModule &CGM, IsPattern isPattern,
 /// variable declaration with auto, register, or no storage class specifier.
 /// These turn into simple stack objects, or GlobalValues depending on target.
 void CodeGenFunction::EmitAutoVarDecl(const VarDecl &D) {
+  // A local pinned to a register has no storage: it lives in the register for
+  // its whole lifetime, so there is no alloca to allocate, initialize in
+  // memory, or clean up. An initializer is written straight to the register.
+  if (D.hasAttr<AMDGPUPinVGPRAttr>() || D.hasAttr<AMDGPUPinAGPRAttr>()) {
+    if (const Expr *Init = D.getInit())
+      EmitStoreThroughLValue(EmitAnyExpr(Init), EmitAMDGPUPinnedRegister(&D));
+    return;
+  }
+
   AutoVarEmission emission = EmitAutoVarAlloca(D);
   EmitAutoVarInit(emission);
   EmitAutoVarCleanups(emission);

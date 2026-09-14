@@ -2765,18 +2765,32 @@ Address CodeGenFunction::EmitExtVectorElementLValue(LValue LV) {
   return VectorBasePtrPlusIx;
 }
 
+/// The integer type a value of \p Ty travels as through
+/// llvm.{read,write}_register, which is declared only over integers: one 32-bit
+/// lane per register the value occupies, as a scalar when it is a single one.
+static llvm::Type *getRegisterLaneType(llvm::Type *Ty) {
+  llvm::Type *I32 = llvm::Type::getInt32Ty(Ty->getContext());
+  uint64_t Bits = Ty->getPrimitiveSizeInBits();
+  assert(Bits && Bits % 32 == 0 && "not a whole number of registers");
+  if (Bits == 32)
+    return I32;
+  return llvm::FixedVectorType::get(I32, Bits / 32);
+}
+
 /// Load of global named registers are always calls to intrinsics.
 RValue CodeGenFunction::EmitLoadOfGlobalRegLValue(LValue LV) {
-  assert((LV.getType()->isIntegerType() || LV.getType()->isPointerType()) &&
-         "Bad type for register variable");
   llvm::MDNode *RegName = cast<llvm::MDNode>(
       cast<llvm::MetadataAsValue>(LV.getGlobalReg())->getMetadata());
 
-  // We accept integer and pointer types only
+  // The intrinsic is declared over integers, so a pointer travels as an
+  // integer of the same width, and any other type (a vector held in a register
+  // tuple, say) as a vector of 32-bit lanes covering it.
   llvm::Type *OrigTy = CGM.getTypes().ConvertType(LV.getType());
   llvm::Type *Ty = OrigTy;
   if (OrigTy->isPointerTy())
     Ty = CGM.getTypes().getDataLayout().getIntPtrType(OrigTy);
+  else if (!OrigTy->isIntegerTy())
+    Ty = getRegisterLaneType(OrigTy);
   llvm::Type *Types[] = { Ty };
 
   llvm::Function *F = CGM.getIntrinsic(llvm::Intrinsic::read_register, Types);
@@ -2784,6 +2798,8 @@ RValue CodeGenFunction::EmitLoadOfGlobalRegLValue(LValue LV) {
       F, llvm::MetadataAsValue::get(Ty->getContext(), RegName));
   if (OrigTy->isPointerTy())
     Call = Builder.CreateIntToPtr(Call, OrigTy);
+  else if (Ty != OrigTy)
+    Call = Builder.CreateBitCast(Call, OrigTy);
   return RValue::get(Call);
 }
 
@@ -3241,23 +3257,25 @@ void CodeGenFunction::EmitStoreThroughExtVectorComponentLValue(RValue Src,
 
 /// Store of global named registers are always calls to intrinsics.
 void CodeGenFunction::EmitStoreThroughGlobalRegLValue(RValue Src, LValue Dst) {
-  assert((Dst.getType()->isIntegerType() || Dst.getType()->isPointerType()) &&
-         "Bad type for register variable");
   llvm::MDNode *RegName = cast<llvm::MDNode>(
       cast<llvm::MetadataAsValue>(Dst.getGlobalReg())->getMetadata());
   assert(RegName && "Register LValue is not metadata");
 
-  // We accept integer and pointer types only
+  // See EmitLoadOfGlobalRegLValue for how non-integer types travel.
   llvm::Type *OrigTy = CGM.getTypes().ConvertType(Dst.getType());
   llvm::Type *Ty = OrigTy;
   if (OrigTy->isPointerTy())
     Ty = CGM.getTypes().getDataLayout().getIntPtrType(OrigTy);
+  else if (!OrigTy->isIntegerTy())
+    Ty = getRegisterLaneType(OrigTy);
   llvm::Type *Types[] = { Ty };
 
   llvm::Function *F = CGM.getIntrinsic(llvm::Intrinsic::write_register, Types);
   llvm::Value *Value = Src.getScalarVal();
   if (OrigTy->isPointerTy())
     Value = Builder.CreatePtrToInt(Value, Ty);
+  else if (Ty != OrigTy)
+    Value = Builder.CreateBitCast(Value, Ty);
   Builder.CreateCall(
       F, {llvm::MetadataAsValue::get(Ty->getContext(), RegName), Value});
 }
@@ -3567,6 +3585,33 @@ static LValue EmitGlobalNamedRegister(const VarDecl *VD, CodeGenModule &CGM) {
   return LValue::MakeGlobalReg(Ptr, Alignment, VD->getType());
 }
 
+/// Name the register tuple an amdgpu_pin_{vgpr,agpr} local asks for, as an
+/// l-value read and written through llvm.{read,write}_register. The tuple runs
+/// from the requested number for as many registers as the type occupies, so a
+/// four-dword value pinned to 256 names v[256:259].
+LValue CodeGenFunction::EmitAMDGPUPinnedRegister(const VarDecl *VD) {
+  bool IsAGPR = VD->hasAttr<AMDGPUPinAGPRAttr>();
+  const Expr *RegE = IsAGPR ? VD->getAttr<AMDGPUPinAGPRAttr>()->getReg()
+                            : VD->getAttr<AMDGPUPinVGPRAttr>()->getReg();
+  unsigned Reg = RegE->EvaluateKnownConstInt(getContext()).getZExtValue();
+  unsigned NumRegs = getContext().getTypeSize(VD->getType()) / 32;
+
+  SmallString<16> RegName;
+  llvm::raw_svector_ostream OS(RegName);
+  OS << (IsAGPR ? 'a' : 'v');
+  if (NumRegs > 1)
+    OS << '[' << Reg << ':' << Reg + NumRegs - 1 << ']';
+  else
+    OS << Reg;
+
+  llvm::MDString *Str = llvm::MDString::get(getLLVMContext(), RegName);
+  llvm::Metadata *Ops[] = {Str};
+  llvm::Value *Ptr = llvm::MetadataAsValue::get(
+      getLLVMContext(), llvm::MDNode::get(getLLVMContext(), Ops));
+  return LValue::MakeGlobalReg(Ptr, getContext().getDeclAlign(VD),
+                               VD->getType());
+}
+
 /// Determine whether we can emit a reference to \p VD from the current
 /// context, despite not necessarily having seen an odr-use of the variable in
 /// this context.
@@ -3629,6 +3674,12 @@ LValue CodeGenFunction::EmitDeclRefLValue(const DeclRefExpr *E) {
     if (VD->getStorageClass() == SC_Register &&
         VD->hasAttr<AsmLabelAttr>() && !VD->isLocalVarDecl())
       return EmitGlobalNamedRegister(VD, CGM);
+
+    // A local carrying amdgpu_pin_{vgpr,agpr} names a register the same way,
+    // so every read and write of it becomes read/write_register instead of a
+    // load and store of stack storage.
+    if (VD->hasAttr<AMDGPUPinVGPRAttr>() || VD->hasAttr<AMDGPUPinAGPRAttr>())
+      return EmitAMDGPUPinnedRegister(VD);
 
     // If this DeclRefExpr does not constitute an odr-use of the variable,
     // we're not permitted to emit a reference to it in general, and it might

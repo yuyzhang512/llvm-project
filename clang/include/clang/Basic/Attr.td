@@ -2524,19 +2524,21 @@ def AMDGPUNumVGPR : InheritableAttr {
   let Subjects = SubjectList<[Function], ErrorDiag, "kernel functions">;
 }
 
-def AMDGPUPinVGPR : StmtAttr {
-  let Spellings = [CXX11<"clang", "amdgpu_pin_vgpr">,
+def AMDGPUPinVGPR : DeclOrStmtAttr {
+  let Spellings = [GNU<"amdgpu_pin_vgpr">, CXX11<"clang", "amdgpu_pin_vgpr">,
                    C23<"clang", "amdgpu_pin_vgpr">];
   let Args = [ExprArgument<"Reg">];
   let Documentation = [AMDGPUPinRegDocs];
-  let Subjects = SubjectList<[Stmt], WarnDiag, "statements">;
+  let Subjects = SubjectList<[Var, Stmt], WarnDiag,
+                             "local variables and statements">;
 }
-def AMDGPUPinAGPR : StmtAttr {
-  let Spellings = [CXX11<"clang", "amdgpu_pin_agpr">,
+def AMDGPUPinAGPR : DeclOrStmtAttr {
+  let Spellings = [GNU<"amdgpu_pin_agpr">, CXX11<"clang", "amdgpu_pin_agpr">,
                    C23<"clang", "amdgpu_pin_agpr">];
   let Args = [ExprArgument<"Reg">];
   let Documentation = [AMDGPUPinRegDocs];
-  let Subjects = SubjectList<[Stmt], WarnDiag, "statements">;
+  let Subjects = SubjectList<[Var, Stmt], WarnDiag,
+                             "local variables and statements">;
 }
 
 def AMDGPUMaxNumWorkGroups : InheritableAttr {

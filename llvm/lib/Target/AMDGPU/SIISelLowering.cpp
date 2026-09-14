@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "SIISelLowering.h"
+#include "Utils/AMDGPUBaseInfo.h"
 #include "AMDGPU.h"
 #include "AMDGPUInstrInfo.h"
 #include "AMDGPULaneMaskUtils.h"
@@ -5098,8 +5099,34 @@ Register SITargetLowering::getRegisterByName(const char *RegName, LLT VT,
                      .Case("flat_scratch_lo", AMDGPU::FLAT_SCR_LO)
                      .Case("flat_scratch_hi", AMDGPU::FLAT_SCR_HI)
                      .Default(Register());
-  if (!Reg)
+
+  // A VGPR or AGPR can be named too ("v8", "v[8:9]", "a[16:19]"), so that a
+  // value can be bound to one through llvm.{read,write}_register.
+  if (!Reg) {
+    auto [Kind, Idx, Width] = AMDGPU::parseAsmPhysRegName(RegName);
+    if (Kind == 'v' || Kind == 'a') {
+      const SIRegisterInfo *TRI = Subtarget->getRegisterInfo();
+      MCRegister First = (Kind == 'a' ? AMDGPU::AGPR0 : AMDGPU::VGPR0) + Idx;
+      unsigned Bits = VT.isValid() ? VT.getSizeInBits() : 32;
+      if (Bits == 32)
+        return First;
+      // Widen to the tuple of the requested size.
+      for (const TargetRegisterClass *C :
+           {&AMDGPU::VReg_64RegClass, &AMDGPU::VReg_96RegClass,
+            &AMDGPU::VReg_128RegClass, &AMDGPU::VReg_256RegClass,
+            &AMDGPU::VReg_512RegClass, &AMDGPU::AReg_64RegClass,
+            &AMDGPU::AReg_128RegClass, &AMDGPU::AReg_256RegClass,
+            &AMDGPU::AReg_512RegClass}) {
+        if (TRI->getRegSizeInBits(*C) != Bits)
+          continue;
+        if ((Kind == 'a') != TRI->isAGPRClass(C))
+          continue;
+        if (MCRegister T = TRI->getMatchingSuperReg(First, AMDGPU::sub0, C))
+          return T;
+      }
+    }
     return Reg;
+  }
 
   if (!Subtarget->hasFlatScrRegister() &&
       Subtarget->getRegisterInfo()->regsOverlap(Reg, AMDGPU::FLAT_SCR)) {

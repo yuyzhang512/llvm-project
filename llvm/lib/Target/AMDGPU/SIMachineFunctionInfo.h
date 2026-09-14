@@ -523,6 +523,12 @@ private:
   /// relevant for gfx90a-gfx950. For gfx908, this should be infinite.
   unsigned MinNumAGPRs = ~0u;
 
+  /// Size of the AGPR window named by llvm.{read,write}_register, or 0. Naming
+  /// an AGPR is an explicit placement request, so it selects the AGPR form of
+  /// an MFMA that fits in the window even where the heuristic would default to
+  /// the VGPR form.
+  unsigned NamedAGPRs = 0;
+
   // The hard-wired high half of the address of the global information table
   // for AMDPAL OS type. 0xffffffff represents no hard-wired high half, since
   // current hardware only allows a 16 bit value.
@@ -1237,6 +1243,11 @@ public:
   /// Return true if an MFMA that requires at least \p NumRegs should select to
   /// the AGPR form, instead of the VGPR form.
   bool selectAGPRFormMFMA(unsigned NumRegs) const {
+    // An explicit AGPR name asks for the value to live in that file; honour it
+    // over the VGPR-form default, which would otherwise force a pair of accvgpr
+    // moves around every use.
+    if (NamedAGPRs >= NumRegs && NamedAGPRs != 0)
+      return true;
     return !MFMAVGPRForm && getMinNumAGPRs() >= NumRegs;
   }
 

@@ -23,8 +23,17 @@
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/RegisterScavenging.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
+
+static cl::opt<bool> ReserveNamedRegs(
+    "amdgpu-reserve-named-regs", cl::init(true), cl::Hidden,
+    cl::desc("Take registers named by llvm.{read,write}_register out of the "
+             "allocatable set"));
 
 #define GET_REGINFO_TARGET_DESC
 #include "AMDGPUGenRegisterInfo.inc"
@@ -773,6 +782,56 @@ BitVector SIRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
 
   for (MCPhysReg Reg : MFI->getVGPRSpillAGPRs())
     reserveRegisterTuples(Reserved, Reg);
+
+  // Registers named by llvm.{read,write}_register.
+  //
+  // A read lowers to a use of the physical register. Where a write in the same
+  // block precedes it, that write defines the register and ordinary liveness
+  // both keeps the value safe and stops anything else being placed there while
+  // it is live -- no reservation needed, and reserving would only shrink the
+  // allocatable set for everyone else.
+  //
+  // A read with no such write is live-in: nothing in the function defines the
+  // register, so the value arrives from outside (another function, inline asm,
+  // the ABI) and the machine verifier rejects the use as an undefined physical
+  // register. Reserving it is what makes it defined by convention, so reserve
+  // exactly those.
+  if (ReserveNamedRegs) {
+    auto namedReg = [](const Instruction &I) -> StringRef {
+      const auto *CI = dyn_cast<CallInst>(&I);
+      if (!CI)
+        return StringRef();
+      Intrinsic::ID IID = CI->getIntrinsicID();
+      if (IID != Intrinsic::read_register && IID != Intrinsic::write_register)
+        return StringRef();
+      const auto *MD = cast<MDNode>(
+          cast<MetadataAsValue>(CI->getArgOperand(0))->getMetadata());
+      return cast<MDString>(MD->getOperand(0))->getString();
+    };
+
+    SmallDenseSet<StringRef, 8> NeedsReserve;
+    for (const BasicBlock &BB : MF.getFunction()) {
+      SmallDenseSet<StringRef, 8> WrittenHere;
+      for (const Instruction &I : BB) {
+        StringRef Name = namedReg(I);
+        if (Name.empty())
+          continue;
+        if (cast<CallInst>(I).getIntrinsicID() == Intrinsic::write_register)
+          WrittenHere.insert(Name);
+        else if (!WrittenHere.contains(Name))
+          NeedsReserve.insert(Name);
+      }
+    }
+
+    for (StringRef Name : NeedsReserve) {
+      auto [Kind, Idx, Width] = AMDGPU::parseAsmPhysRegName(Name);
+      if (Kind != 'v' && Kind != 'a')
+        continue;
+      MCRegister First = (Kind == 'a' ? AMDGPU::AGPR0 : AMDGPU::VGPR0) + Idx;
+      for (unsigned I = 0; I != std::max(Width, 1u); ++I)
+        reserveRegisterTuples(Reserved, First + I);
+    }
+  }
 
   return Reserved;
 }

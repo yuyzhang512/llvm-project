@@ -47,6 +47,29 @@ const GCNTargetMachine &getTM(const GCNSubtarget *STI) {
 
 bool SIMachineFunctionInfo::MFMAVGPRForm = false;
 
+// One past the highest AGPR number named by an llvm.{read,write}_register in
+// \p F, or 0 if none: the size of the AGPR window those names occupy.
+static unsigned getHighestNamedAGPR(const Function &F) {
+  unsigned Highest = 0;
+  for (const BasicBlock &BB : F) {
+    for (const Instruction &I : BB) {
+      const auto *CI = dyn_cast<CallInst>(&I);
+      if (!CI)
+        continue;
+      Intrinsic::ID IID = CI->getIntrinsicID();
+      if (IID != Intrinsic::read_register && IID != Intrinsic::write_register)
+        continue;
+      const auto *MD = cast<MDNode>(
+          cast<MetadataAsValue>(CI->getArgOperand(0))->getMetadata());
+      auto [Kind, Idx, Width] =
+          AMDGPU::parseAsmPhysRegName(cast<MDString>(MD->getOperand(0))->getString());
+      if (Kind == 'a')
+        Highest = std::max(Highest, Idx + std::max(Width, 1u));
+    }
+  }
+  return Highest;
+}
+
 SIMachineFunctionInfo::SIMachineFunctionInfo(const Function &F,
                                              const GCNSubtarget *STI)
     : AMDGPUMachineFunctionInfo(F, *STI), Mode(F, *STI),
@@ -86,6 +109,16 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const Function &F,
         AMDGPU::getIntegerPairAttribute(F, "amdgpu-agpr-alloc", {~0u, ~0u},
                                         /*OnlyFirstRequired=*/true);
     MinNumAGPRs = MinNumAGPRAttr;
+
+    // Naming an AGPR through llvm.{read,write}_register is a request to keep a
+    // value in that file. Record the window it covers so an MFMA that fits in
+    // it selects the AGPR form during lowering (selectAGPRFormMFMA) rather than
+    // the VGPR form, which would need a pair of accvgpr moves at every round
+    // trip, and so the registers are accounted for in the AGPR budget.
+    NamedAGPRs = getHighestNamedAGPR(F);
+    if (NamedAGPRs)
+      MinNumAGPRs = MinNumAGPRs == ~0u ? NamedAGPRs
+                                       : std::max(MinNumAGPRs, NamedAGPRs);
   }
 
   if (!isEntryFunction()) {

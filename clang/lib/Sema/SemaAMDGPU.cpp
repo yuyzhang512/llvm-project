@@ -730,6 +730,50 @@ void SemaAMDGPU::handleAMDGPUNumVGPRAttr(Decl *D, const ParsedAttr &AL) {
                  AMDGPUNumVGPRAttr(getASTContext(), AL, NumVGPR));
 }
 
+void SemaAMDGPU::handleAMDGPUPinRegAttr(Decl *D, const ParsedAttr &AL,
+                                        bool IsAGPR) {
+  // Only an automatic local has a lifetime short enough to sit in a register
+  // for its whole existence. Anything else (a parameter, a static, a field)
+  // has storage the pin cannot replace.
+  const auto *VD = dyn_cast<VarDecl>(D);
+  if (!VD || !VD->isLocalVarDecl() || VD->isStaticLocal()) {
+    Diag(AL.getLoc(), diag::warn_attribute_ignored) << AL;
+    return;
+  }
+
+  // The value occupies whole 32-bit registers, so a type that is not a
+  // multiple of a register cannot be placed.
+  QualType T = VD->getType();
+  if (!T->isDependentType()) {
+    uint64_t Bits = getASTContext().getTypeSize(T);
+    if (Bits == 0 || Bits % 32) {
+      Diag(AL.getLoc(), diag::warn_attribute_ignored) << AL;
+      return;
+    }
+  }
+
+  Expr *E = AL.getArgAsExpr(0);
+  if (!E->isValueDependent()) {
+    llvm::APSInt Val;
+    ExprResult R = SemaRef.VerifyIntegerConstantExpression(E, &Val);
+    if (R.isInvalid())
+      return;
+    if (Val.isNegative()) {
+      Diag(E->getExprLoc(), diag::err_attribute_requires_positive_integer)
+          << AL << /*non-negative*/ 1;
+      return;
+    }
+    E = R.get();
+  }
+
+  if (IsAGPR)
+    D->addAttr(::new (getASTContext())
+                   AMDGPUPinAGPRAttr(getASTContext(), AL, E));
+  else
+    D->addAttr(::new (getASTContext())
+                   AMDGPUPinVGPRAttr(getASTContext(), AL, E));
+}
+
 static bool
 checkAMDGPUMaxNumWorkGroupsArguments(Sema &S, Expr *XExpr, Expr *YExpr,
                                      Expr *ZExpr,
