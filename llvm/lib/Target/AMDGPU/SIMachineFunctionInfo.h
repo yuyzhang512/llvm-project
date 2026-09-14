@@ -523,6 +523,12 @@ private:
   /// relevant for gfx90a-gfx950. For gfx908, this should be infinite.
   unsigned MinNumAGPRs = ~0u;
 
+  /// Size of the AGPR window named by llvm.{read,write}_register, or 0.
+  unsigned NamedAGPRs = 0;
+
+  /// Registers named by llvm.{read,write}_register that have to be reserved.
+  SmallVector<MCPhysReg, 8> ReservedNamedRegs;
+
   // The hard-wired high half of the address of the global information table
   // for AMDPAL OS type. 0xffffffff represents no hard-wired high half, since
   // current hardware only allows a 16 bit value.
@@ -1234,9 +1240,15 @@ public:
 
   unsigned getMinNumAGPRs() const { return MinNumAGPRs; }
 
+  ArrayRef<MCPhysReg> getReservedNamedRegs() const { return ReservedNamedRegs; }
+
   /// Return true if an MFMA that requires at least \p NumRegs should select to
   /// the AGPR form, instead of the VGPR form.
   bool selectAGPRFormMFMA(unsigned NumRegs) const {
+    // An accumulator that fits the named AGPR window overrides the VGPR-form
+    // default, which would need accvgpr moves around every use.
+    if (NamedAGPRs >= NumRegs)
+      return true;
     return !MFMAVGPRForm && getMinNumAGPRs() >= NumRegs;
   }
 

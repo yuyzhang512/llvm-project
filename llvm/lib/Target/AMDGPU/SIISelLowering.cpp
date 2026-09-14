@@ -23,6 +23,7 @@
 #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "SIMachineFunctionInfo.h"
 #include "SIRegisterInfo.h"
+#include "Utils/AMDGPUBaseInfo.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/FloatingPointMode.h"
@@ -5143,8 +5144,45 @@ Register SITargetLowering::getRegisterByName(const char *RegName, LLT VT,
           .Case("src_flat_scratch_base_lo", AMDGPU::SRC_FLAT_SCRATCH_BASE_LO)
           .Case("src_flat_scratch_base_hi", AMDGPU::SRC_FLAT_SCRATCH_BASE_HI)
           .Default(Register());
-  if (!Reg)
+
+  // VGPRs and AGPRs can be named too: "v8", "v[8:9]", "a[16:19]".
+  if (!Reg) {
+    auto [Kind, Idx, Width] = AMDGPU::parseAsmPhysRegName(RegName);
+    if (Kind == 'v' || Kind == 'a') {
+      const SIRegisterInfo *TRI = Subtarget->getRegisterInfo();
+      unsigned Bits = VT.isValid() ? VT.getSizeInBits() : 32;
+      if (Bits % 32)
+        return Register();
+      unsigned NumRegs = Bits / 32;
+      // The type decides how many registers the value occupies, so a name that
+      // spells a different number of them is a mistake rather than a request.
+      if (Width != NumRegs)
+        return Register();
+      // A number past the end of the file the subtarget can address is still a
+      // valid register number, and would silently alias a low register.
+      if (Idx + NumRegs >
+          AMDGPU::IsaInfo::getAddressableNumArchVGPRs(*Subtarget))
+        return Register();
+      MCRegister First = (Kind == 'a' ? AMDGPU::AGPR0 : AMDGPU::VGPR0) + Idx;
+      if (Bits == 32)
+        return First;
+      // Widen to the tuple of the requested size.
+      for (const TargetRegisterClass *C :
+           {&AMDGPU::VReg_64RegClass, &AMDGPU::VReg_96RegClass,
+            &AMDGPU::VReg_128RegClass, &AMDGPU::VReg_256RegClass,
+            &AMDGPU::VReg_512RegClass, &AMDGPU::AReg_64RegClass,
+            &AMDGPU::AReg_128RegClass, &AMDGPU::AReg_256RegClass,
+            &AMDGPU::AReg_512RegClass}) {
+        if (TRI->getRegSizeInBits(*C) != Bits)
+          continue;
+        if ((Kind == 'a') != TRI->isAGPRClass(C))
+          continue;
+        if (MCRegister T = TRI->getMatchingSuperReg(First, AMDGPU::sub0, C))
+          return T;
+      }
+    }
     return Reg;
+  }
 
   const SIRegisterInfo *TRI = Subtarget->getRegisterInfo();
   if (!Subtarget->hasFlatScrRegister() &&

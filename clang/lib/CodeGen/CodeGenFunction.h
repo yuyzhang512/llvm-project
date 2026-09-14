@@ -4578,6 +4578,7 @@ public:
   LValue EmitVAArgExprLValue(const VAArgExpr *E);
   LValue EmitDeclRefLValue(const DeclRefExpr *E);
   LValue EmitOMPCapturedBindingLValue(const BindingDecl *BD);
+  LValue EmitAMDGPUPinnedRegister(const VarDecl *VD);
   LValue EmitStringLiteralLValue(const StringLiteral *E);
   LValue EmitObjCEncodeExprLValue(const ObjCEncodeExpr *E);
   LValue EmitPredefinedLValue(const PredefinedExpr *E);
