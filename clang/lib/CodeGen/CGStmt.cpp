@@ -781,19 +781,63 @@ void CodeGenFunction::EmitLabelStmt(const LabelStmt &S) {
   EmitStmt(S.getSubStmt());
 }
 
-// Name the register for \p I's result, per amdgpu_pin_{vgpr,agpr}.
+// Name the register for \p I's result, per amdgpu_pin_{vgpr,agpr}. A null
+// \p RegE asks only for the file, which is an empty node.
 static void setAMDGPUPinnedReg(CodeGenFunction &CGF, llvm::Instruction *I,
                                bool IsAGPR, const Expr *RegE) {
-  std::optional<llvm::APSInt> Reg =
-      RegE->getIntegerConstantExpr(CGF.getContext());
-  if (!Reg)
-    return;
-
   llvm::LLVMContext &Ctx = CGF.getLLVMContext();
-  llvm::Metadata *MD = llvm::ConstantAsMetadata::get(
-      llvm::ConstantInt::get(CGF.Int32Ty, Reg->getZExtValue()));
+  SmallVector<llvm::Metadata *, 1> Ops;
+  if (RegE) {
+    std::optional<llvm::APSInt> Reg =
+        RegE->getIntegerConstantExpr(CGF.getContext());
+    if (!Reg)
+      return;
+    Ops.push_back(llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(CGF.Int32Ty, Reg->getZExtValue())));
+  }
   I->setMetadata(IsAGPR ? "amdgpu.pin.agpr" : "amdgpu.pin.vgpr",
-                 llvm::MDNode::get(Ctx, MD));
+                 llvm::MDNode::get(Ctx, Ops));
+}
+
+// Place \p I's operands per amdgpu_pin_gpr(N, "reg", ...). Operand 0 is the
+// result, so it is named the same way as amdgpu_pin_{vgpr,agpr}; the rest name
+// the instruction's sources, and are carried by whatever computes them.
+static void setAMDGPUPinnedOperands(CodeGenFunction &CGF, llvm::Instruction *I,
+                                    const AMDGPUPinGPRAttr *A) {
+  Expr **Args = A->args_begin();
+  for (unsigned N = A->args_size(), K = 0; K + 1 < N; K += 2) {
+    std::optional<llvm::APSInt> Idx =
+        Args[K]->getIntegerConstantExpr(CGF.getContext());
+    const auto *Str = dyn_cast<StringLiteral>(Args[K + 1]->IgnoreParenCasts());
+    if (!Idx || !Str)
+      continue;
+
+    // "v8" / "a[16:19]": the file is the first character, the number follows.
+    StringRef Name = Str->getString();
+    if (Name.size() < 2 || (Name[0] != 'v' && Name[0] != 'a'))
+      continue;
+    StringRef Num = Name.drop_front();
+    Num.consume_front("[");
+    unsigned Reg;
+    if (Num.consumeInteger(10, Reg))
+      continue;
+
+    uint64_t OpNo = Idx->getZExtValue();
+    llvm::Instruction *Target = I;
+    if (OpNo) {
+      if (OpNo > I->getNumOperands())
+        continue;
+      Target = dyn_cast<llvm::Instruction>(I->getOperand(OpNo - 1));
+      if (!Target)
+        continue;
+    }
+
+    llvm::LLVMContext &Ctx = CGF.getLLVMContext();
+    llvm::Metadata *MD =
+        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(CGF.Int32Ty, Reg));
+    Target->setMetadata(Name[0] == 'a' ? "amdgpu.pin.agpr" : "amdgpu.pin.vgpr",
+                        llvm::MDNode::get(Ctx, MD));
+  }
 }
 
 void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
@@ -803,6 +847,7 @@ void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
   bool noconvergent = InNoConvergentAttributedStmt;
   StringRef amdgpuAVMode = AMDGPUAvailableVisibleMode;
   std::optional<std::pair<bool, const Expr *>> amdgpuPin;
+  const AMDGPUPinGPRAttr *amdgpuPinOps = nullptr;
   HLSLControlFlowHintAttr::Spelling flattenOrBranch = HLSLControlFlowAttr;
   const CallExpr *musttail = MustTailCall;
   const AtomicAttr *AA = nullptr;
@@ -850,6 +895,9 @@ void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
     case attr::AMDGPUPinAGPR:
       amdgpuPin = {true, cast<AMDGPUPinAGPRAttr>(A)->getReg()};
       break;
+    case attr::AMDGPUPinGPR:
+      amdgpuPinOps = cast<AMDGPUPinGPRAttr>(A);
+      break;
     case attr::HLSLControlFlowHint: {
       flattenOrBranch = cast<HLSLControlFlowHintAttr>(A)->getSemanticSpelling();
     } break;
@@ -873,13 +921,17 @@ void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
   // an expression statement only for its side effects and drops the value, so
   // emit it here instead and keep what it produced.
   const auto *PinnedExpr = dyn_cast<Expr>(S.getSubStmt());
-  if (amdgpuPin && PinnedExpr && HaveInsertPoint() &&
+  if ((amdgpuPin || amdgpuPinOps) && PinnedExpr && HaveInsertPoint() &&
       hasScalarEvaluationKind(PinnedExpr->getType())) {
     PGO->setCurrentStmt(PinnedExpr);
     EmitStopPoint(PinnedExpr);
     llvm::Value *V = EmitAnyExpr(PinnedExpr).getScalarVal();
-    if (auto *I = dyn_cast<llvm::Instruction>(V))
-      setAMDGPUPinnedReg(*this, I, amdgpuPin->first, amdgpuPin->second);
+    if (auto *I = dyn_cast<llvm::Instruction>(V)) {
+      if (amdgpuPin)
+        setAMDGPUPinnedReg(*this, I, amdgpuPin->first, amdgpuPin->second);
+      if (amdgpuPinOps)
+        setAMDGPUPinnedOperands(*this, I, amdgpuPinOps);
+    }
     return;
   }
 

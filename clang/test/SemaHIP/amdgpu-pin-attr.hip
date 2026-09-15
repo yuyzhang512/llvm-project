@@ -20,7 +20,7 @@ __attribute__((device)) void bad(int n) { // expected-note {{declared here}}
   // expected-note@+1 {{function parameter 'n' with unknown value cannot be used in a constant expression}}
   [[clang::amdgpu_pin_vgpr(n)]] b = b + b;
   // Only the result is named; an operand is pinned by pinning what produces it.
-  // expected-error@+1 {{'clang::amdgpu_pin_vgpr' attribute takes one argument}}
+  // expected-error@+1 {{'clang::amdgpu_pin_vgpr' attribute takes no more than 1 argument}}
   [[clang::amdgpu_pin_vgpr(4, 8)]] c = c + c;
   (void)a; (void)b; (void)c;
 }

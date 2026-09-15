@@ -987,6 +987,9 @@ bool shouldEmitConstantsToTextSection(const Triple &TT);
 /// width. Does not validate the number of registers exists in the class. Unlike
 /// parseAsmConstraintPhysReg, this does not expect the name to be wrapped in
 /// "{}".
+/// A pin that asks only for the register file, with no number.
+constexpr unsigned PinNoReg = ~0u;
+
 std::tuple<char, unsigned, unsigned> parseAsmPhysRegName(StringRef TupleString);
 
 /// Returns a valid charcode or 0 in the first entry if this is a valid physical

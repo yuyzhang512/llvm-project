@@ -211,10 +211,15 @@ static bool recordPinHints(MachineFunction &MF) {
       if (MachineInstr *Def = MRI.getVRegDef(Src))
         useAGPRFormMFMA(*Def, TII, TRI, MRI);
 
-    if (MCRegister PR = pinPhysReg(TRI, RC, TRI->isAGPRClass(RC), RegNo)) {
-      MRI.setRegAllocationHint(Dst, AMDGPURI::PinnedReg, PR);
-      if (Src.isVirtual())
-        MRI.setRegAllocationHint(Src, AMDGPURI::PinnedReg, PR);
+    // Without a number the request is only that the value live in the file,
+    // which the pseudo's own class already says: the copy below carries it to
+    // the value, and no particular register is asked for.
+    if (RegNo != AMDGPU::PinNoReg) {
+      if (MCRegister PR = pinPhysReg(TRI, RC, TRI->isAGPRClass(RC), RegNo)) {
+        MRI.setRegAllocationHint(Dst, AMDGPURI::PinnedReg, PR);
+        if (Src.isVirtual())
+          MRI.setRegAllocationHint(Src, AMDGPURI::PinnedReg, PR);
+      }
     }
 
     // The carrier is an identity; forward it and drop it.

@@ -2527,14 +2527,22 @@ def AMDGPUNumVGPR : InheritableAttr {
 def AMDGPUPinVGPR : StmtAttr {
   let Spellings = [CXX11<"clang", "amdgpu_pin_vgpr">,
                    C23<"clang", "amdgpu_pin_vgpr">];
-  let Args = [ExprArgument<"Reg">];
+  let Args = [ExprArgument<"Reg", /*opt=*/1>];
   let Documentation = [AMDGPUPinRegDocs];
   let Subjects = SubjectList<[Stmt], WarnDiag, "statements">;
 }
 def AMDGPUPinAGPR : StmtAttr {
   let Spellings = [CXX11<"clang", "amdgpu_pin_agpr">,
                    C23<"clang", "amdgpu_pin_agpr">];
-  let Args = [ExprArgument<"Reg">];
+  let Args = [ExprArgument<"Reg", /*opt=*/1>];
+  let Documentation = [AMDGPUPinRegDocs];
+  let Subjects = SubjectList<[Stmt], WarnDiag, "statements">;
+}
+
+def AMDGPUPinGPR : StmtAttr {
+  let Spellings = [CXX11<"clang", "amdgpu_pin_gpr">,
+                   C23<"clang", "amdgpu_pin_gpr">];
+  let Args = [VariadicExprArgument<"Args">];
   let Documentation = [AMDGPUPinRegDocs];
   let Subjects = SubjectList<[Stmt], WarnDiag, "statements">;
 }

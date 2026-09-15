@@ -2619,12 +2619,15 @@ static bool pinValue(Instruction &I, StringRef MDName, Intrinsic::ID IID) {
   if (!MD)
     return false;
   I.setMetadata(MDName, nullptr);
-  if (MD->getNumOperands() != 1)
-    return false;
-  auto *CI = mdconst::dyn_extract<ConstantInt>(MD->getOperand(0));
-  if (!CI)
-    return false;
-  unsigned Reg = CI->getZExtValue();
+  // No register number asks only for the file. NoReg carries that through the
+  // same path, so the placement and the file request share one mechanism.
+  unsigned Reg = AMDGPU::PinNoReg;
+  if (MD->getNumOperands()) {
+    auto *CI = mdconst::dyn_extract<ConstantInt>(MD->getOperand(0));
+    if (!CI)
+      return false;
+    Reg = CI->getZExtValue();
+  }
 
   Value *V = &I;
   Type *Ty = V->getType();

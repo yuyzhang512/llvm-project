@@ -659,6 +659,11 @@ CheckForIncompatibleAttributes(Sema &S,
 template <typename AttrT>
 static Attr *handleAMDGPUPinAttr(Sema &S, Stmt *St, const ParsedAttr &A,
                                  SourceRange Range) {
+  // Without a register number the request is only for the file, so there is
+  // nothing to check.
+  if (A.getNumArgs() == 0)
+    return ::new (S.Context) AttrT(S.Context, A, nullptr);
+
   Expr *E = A.getArgAsExpr(0);
   if (!E->isValueDependent()) {
     llvm::APSInt Val;
@@ -673,6 +678,66 @@ static Attr *handleAMDGPUPinAttr(Sema &S, Stmt *St, const ParsedAttr &A,
     E = R.get();
   }
   return ::new (S.Context) AttrT(S.Context, A, E);
+}
+
+// amdgpu_pin_gpr(0, "v8", 1, "a[16:19]", ...): an operand number and the
+// register it is to be placed in, repeated. Operand 0 is the result and the
+// rest are the sources, in the order the instruction takes them.
+static Attr *handleAMDGPUPinGPRAttr(Sema &S, Stmt *St, const ParsedAttr &A,
+                                    SourceRange Range) {
+  unsigned N = A.getNumArgs();
+  if (N == 0) {
+    S.Diag(A.getLoc(), diag::err_attribute_wrong_number_arguments) << A << 2;
+    return nullptr;
+  }
+  // An odd count means the last operand number has no register name after it.
+  if (N % 2) {
+    S.Diag(A.getArgAsExpr(N - 1)->getExprLoc(),
+           diag::err_attribute_argument_type)
+        << A << /*string*/ 2;
+    return nullptr;
+  }
+
+  SmallVector<Expr *, 8> Args;
+  llvm::SmallDenseSet<uint64_t, 8> Seen;
+  for (unsigned I = 0; I != N; I += 2) {
+    Expr *IdxE = A.getArgAsExpr(I);
+    Expr *RegE = A.getArgAsExpr(I + 1);
+
+    if (!IdxE->isValueDependent()) {
+      llvm::APSInt Val;
+      ExprResult R = S.VerifyIntegerConstantExpression(IdxE, &Val);
+      if (R.isInvalid())
+        return nullptr;
+      if (Val.isNegative()) {
+        S.Diag(IdxE->getExprLoc(),
+               diag::err_attribute_requires_positive_integer)
+            << A << /*non-negative*/ 1;
+        return nullptr;
+      }
+      if (!Seen.insert(Val.getZExtValue()).second) {
+        S.Diag(IdxE->getExprLoc(), diag::err_attribute_argument_out_of_bounds)
+            << A << I + 1;
+        return nullptr;
+      }
+      IdxE = R.get();
+    }
+
+    // The register is spelled the way the assembler spells it, so that the
+    // file is part of the name: "v8", "a[16:19]".
+    const auto *Str = dyn_cast<StringLiteral>(RegE->IgnoreParenCasts());
+    if (!Str) {
+      S.Diag(RegE->getExprLoc(), diag::err_attribute_argument_type)
+          << A << /*string*/ 2 << RegE->getSourceRange();
+      return nullptr;
+    }
+
+    Args.push_back(IdxE);
+    Args.push_back(RegE);
+  }
+
+  return ::new (S.Context)
+      AMDGPUPinGPRAttr(S.Context, A, Args.data(), Args.size());
 }
 
 static Attr *handleOpenCLUnrollHint(Sema &S, Stmt *St, const ParsedAttr &A,
@@ -817,6 +882,8 @@ static Attr *ProcessStmtAttribute(Sema &S, Stmt *St, const ParsedAttr &A,
     return handleAMDGPUPinAttr<AMDGPUPinVGPRAttr>(S, St, A, Range);
   case ParsedAttr::AT_AMDGPUPinAGPR:
     return handleAMDGPUPinAttr<AMDGPUPinAGPRAttr>(S, St, A, Range);
+  case ParsedAttr::AT_AMDGPUPinGPR:
+    return handleAMDGPUPinGPRAttr(S, St, A, Range);
   case ParsedAttr::AT_Suppress:
     return handleSuppressAttr(S, St, A, Range);
   case ParsedAttr::AT_NoMerge:
