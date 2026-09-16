@@ -1324,6 +1324,11 @@ bool SIFoldOperandsImpl::foldOperand(
       if (SplatRC) {
         if (RSUseMI->isCopy()) {
           Register DstReg = RSUseMI->getOperand(0).getReg();
+          // Uses of a physical register are not reached only from this copy;
+          // another definition elsewhere may reach them instead, so the splat
+          // value cannot be assumed to arrive there.
+          if (DstReg.isPhysical())
+            continue;
           append_range(UsesToProcess,
                        make_pointer_range(MRI->use_nodbg_operands(DstReg)));
           continue;
