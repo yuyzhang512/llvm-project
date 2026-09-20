@@ -14955,6 +14955,15 @@ enum {
 /// Diagnose invalid operand for address of operations.
 ///
 /// \param Type The type of operand which cannot have its address taken.
+// True for a local bound to a named VGPR/AGPR by amdgpu_pin_{vgpr,agpr}. Such a
+// variable is emitted as reads and writes of the register itself and is given
+// no storage, so anything that needs its address has to be rejected here
+// rather than failing to generate code later.
+static bool isAMDGPUPinnedRegVar(const ValueDecl *D) {
+  return D &&
+         (D->hasAttr<AMDGPUPinVGPRAttr>() || D->hasAttr<AMDGPUPinAGPRAttr>());
+}
+
 static void diagnoseAddressOfInvalidType(Sema &S, SourceLocation Loc,
                                          Expr *E, unsigned Type) {
   S.Diag(Loc, diag::err_typecheck_address_of) << Type << E->getSourceRange();
@@ -15164,6 +15173,11 @@ QualType Sema::CheckAddressOfOperand(ExprResult &OrigOp, SourceLocation OpLoc) {
       // variable (c++03 7.1.1P3)
       if (vd->getStorageClass() == SC_Register &&
           !getLangOpts().CPlusPlus) {
+        AddressOfError = AO_Register_Variable;
+      } else if (isAMDGPUPinnedRegVar(vd)) {
+        // A pinned variable is the register, not storage holding it, so it has
+        // no address to take. Unlike the register storage class this is a
+        // guarantee rather than a hint, so it holds in C++ too.
         AddressOfError = AO_Register_Variable;
       }
     } else if (isa<MSPropertyDecl>(dcl)) {
@@ -19684,6 +19698,14 @@ static bool captureInLambda(LambdaScopeInfo *LSI, ValueDecl *Var,
   if (BuildAndDiagnose && S.Context.getTargetInfo().getTriple().isWasm() &&
       CaptureType.getNonReferenceType().isWebAssemblyReferenceType()) {
     S.Diag(Loc, diag::err_wasm_ca_reference) << 0;
+    Invalid = true;
+  }
+
+  // Capturing by reference stores the variable's address in the closure, which
+  // a pinned variable does not have.
+  if (ByRef && BuildAndDiagnose && isAMDGPUPinnedRegVar(Var)) {
+    S.Diag(Loc, diag::err_typecheck_address_of) << AO_Register_Variable;
+    S.Diag(Var->getLocation(), diag::note_entity_declared_at) << Var;
     Invalid = true;
   }
 

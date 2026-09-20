@@ -700,7 +700,14 @@ RValue
 CodeGenFunction::EmitReferenceBindingToExpr(const Expr *E) {
   // Emit the expression as an lvalue.
   LValue LV = EmitLValue(E);
-  assert(LV.isSimple());
+  if (!LV.isSimple()) {
+    // Binding needs an address, and an lvalue naming a register does not have
+    // one. Sema rejects the forms it can see; report anything that still
+    // arrives here instead of asserting on it.
+    CGM.ErrorUnsupported(E, "reference bound to a value held in a register");
+    return RValue::get(
+        llvm::PoisonValue::get(llvm::PointerType::get(getLLVMContext(), 0)));
+  }
   llvm::Value *Value = LV.getPointer(*this);
 
   if (sanitizePerformTypeCheck() && !E->getType()->isFunctionType()) {
