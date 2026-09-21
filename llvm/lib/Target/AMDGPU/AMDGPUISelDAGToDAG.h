@@ -48,6 +48,55 @@ static inline bool getConstantValue(SDValue N, uint32_t &Out) {
 
 /// AMDGPU specific code to select AMDGPU machine instructions for
 /// SelectionDAG operations.
+// True when the metadata operand of a {READ,WRITE}_REGISTER names an AGPR.
+inline bool namesAGPR(const SDNode *N, unsigned MDOpNo) {
+  const auto *MD = dyn_cast<MDNodeSDNode>(N->getOperand(MDOpNo));
+  if (!MD || MD->getMD()->getNumOperands() == 0)
+    return false;
+  const auto *Str = dyn_cast<MDString>(MD->getMD()->getOperand(0));
+  return Str &&
+         std::get<0>(AMDGPU::parseAsmPhysRegName(Str->getString())) == 'a';
+}
+
+// True when an MFMA's accumulator lives in a register the program named with
+// llvm.{read,write}_register, and that register is an AGPR -- either the
+// accumulator is read from one, or the result is written to one. The two ends
+// move together, so either is enough to pick the form that writes the AGPR
+// file. Choosing it for any other accumulator only moves that value into the
+// AGPR file and back out again.
+inline bool mfmaAccIsNamedAGPR(const SDNode *N, const SIRegisterInfo *TRI) {
+  // Operand 0 is the intrinsic id, so the accumulator is operand 3.
+  if (N->getNumOperands() >= 4) {
+    SDValue SrcC = N->getOperand(3);
+    while (SrcC.getOpcode() == ISD::BITCAST)
+      SrcC = SrcC.getOperand(0);
+    if (SrcC.getOpcode() == ISD::READ_REGISTER && namesAGPR(SrcC.getNode(), 1))
+      return true;
+    // A read of a physical register reaches here as a copy out of it.
+    if (SrcC.getOpcode() == ISD::CopyFromReg)
+      if (const auto *R = dyn_cast<RegisterSDNode>(SrcC.getOperand(1)))
+        if (R->getReg().isPhysical() &&
+            SIRegisterInfo::isAGPRClass(
+                TRI->getPhysRegBaseClass(R->getReg().asMCReg())))
+          return true;
+  }
+
+  // The write of the result has already become a copy into the register.
+  for (const SDNode *U : N->users()) {
+    while (U->getOpcode() == ISD::BITCAST && U->hasOneUse())
+      U = *U->user_begin();
+    if (U->getOpcode() == ISD::WRITE_REGISTER && namesAGPR(U, 1))
+      return true;
+    if (U->getOpcode() == ISD::CopyToReg)
+      if (const auto *R = dyn_cast<RegisterSDNode>(U->getOperand(1)))
+        if (R->getReg().isPhysical() &&
+            SIRegisterInfo::isAGPRClass(
+                TRI->getPhysRegBaseClass(R->getReg().asMCReg())))
+          return true;
+  }
+  return false;
+}
+
 class AMDGPUDAGToDAGISel : public SelectionDAGISel {
   // Subtarget - Keep a pointer to the AMDGPU Subtarget around so that we can
   // make the right decision when generating code for different targets.
