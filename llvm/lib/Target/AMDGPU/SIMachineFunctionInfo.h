@@ -1245,10 +1245,19 @@ public:
   /// Return true if an MFMA that requires at least \p NumRegs should select to
   /// the AGPR form, instead of the VGPR form.
   bool selectAGPRFormMFMA(unsigned NumRegs) const {
-    // An accumulator that fits the named AGPR window overrides the VGPR-form
-    // default, which would need accvgpr moves around every use.
+    // Naming any AGPR picks this form for every MFMA in the function, so an
+    // accumulator with nothing to do with the name is moved into the AGPR file
+    // and back out again. Too broad, but all that can be decided from a size:
+    // the SelectionDAG path asks mfmaAccIsNamedAGPR() instead, which can see
+    // which register the accumulator itself lives in.
     if (NamedAGPRs >= NumRegs)
       return true;
+    return selectAGPRFormMFMAByBudget(NumRegs);
+  }
+
+  /// As selectAGPRFormMFMA(), without the function-wide named-AGPR trigger.
+  /// For callers that decide the named case for themselves.
+  bool selectAGPRFormMFMAByBudget(unsigned NumRegs) const {
     return !MFMAVGPRForm && getMinNumAGPRs() >= NumRegs;
   }
 
