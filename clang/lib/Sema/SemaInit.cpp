@@ -4050,6 +4050,7 @@ bool InitializationSequence::isAmbiguous() const {
   case FK_NonConstLValueReferenceBindingToBitfield:
   case FK_NonConstLValueReferenceBindingToVectorElement:
   case FK_NonConstLValueReferenceBindingToMatrixElement:
+  case FK_NonConstLValueReferenceBindingToRegisterVariable:
   case FK_NonConstLValueReferenceBindingToUnrelated:
   case FK_RValueReferenceBindingToLValue:
   case FK_ReferenceAddrspaceMismatchTemporary:
@@ -5516,12 +5517,28 @@ static void TryReferenceInitialization(Sema &S, const InitializedEntity &Entity,
                                  TopLevelOfInitList);
 }
 
+/// The variable an expression names, if that variable was given a register
+/// with amdgpu_pin_{vgpr,agpr}. It is assignable but has no address, like a
+/// bit-field, so a reference to it can only bind to a copy.
+static const VarDecl *getRegisterVariable(const Expr *E) {
+  const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParens());
+  const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+  if (VD &&
+      (VD->hasAttr<AMDGPUPinVGPRAttr>() || VD->hasAttr<AMDGPUPinAGPRAttr>()))
+    return VD;
+  return nullptr;
+}
+
+static bool refersToRegisterVariable(const Expr *E) {
+  return getRegisterVariable(E) != nullptr;
+}
+
 /// Determine whether an expression is a non-referenceable glvalue (one to
 /// which a reference can never bind). Attempting to bind a reference to
 /// such a glvalue will always create a temporary.
 static bool isNonReferenceableGLValue(Expr *E) {
   return E->refersToBitField() || E->refersToVectorElement() ||
-         E->refersToMatrixElement();
+         E->refersToMatrixElement() || refersToRegisterVariable(E);
 }
 
 /// Reference initialization without resolving overloaded functions.
@@ -5655,6 +5672,9 @@ static void TryReferenceInitializationCore(Sema &S,
         else if (Initializer->refersToMatrixElement())
           FK = InitializationSequence::
               FK_NonConstLValueReferenceBindingToMatrixElement;
+        else if (refersToRegisterVariable(Initializer))
+          FK = InitializationSequence::
+              FK_NonConstLValueReferenceBindingToRegisterVariable;
         else
           llvm_unreachable("unexpected kind of compatible initializer");
         break;
@@ -9274,6 +9294,14 @@ bool InitializationSequence::Diagnose(Sema &S,
         << DestType.isVolatileQualified() << Args[0]->getSourceRange();
     break;
 
+  case FK_NonConstLValueReferenceBindingToRegisterVariable: {
+    const VarDecl *VD = getRegisterVariable(Args[0]);
+    S.Diag(Kind.getLocation(), diag::err_reference_bind_to_register_variable)
+        << DestType.isVolatileQualified() << VD << Args[0]->getSourceRange();
+    S.Diag(VD->getLocation(), diag::note_entity_declared_at) << VD;
+    break;
+  }
+
   case FK_RValueReferenceBindingToLValue:
     S.Diag(Kind.getLocation(), diag::err_lvalue_to_rvalue_ref)
       << DestType.getNonReferenceType() << OnlyArg->getType()
@@ -9666,6 +9694,10 @@ void InitializationSequence::dump(raw_ostream &OS) const {
 
     case FK_NonConstLValueReferenceBindingToMatrixElement:
       OS << "non-const lvalue reference bound to matrix element";
+      break;
+
+    case FK_NonConstLValueReferenceBindingToRegisterVariable:
+      OS << "non-const lvalue reference bound to register variable";
       break;
 
     case FK_NonConstLValueReferenceBindingToUnrelated:

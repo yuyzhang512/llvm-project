@@ -67,9 +67,28 @@ __global__ void init(int *out) {
   out[0] = acc;
 }
 
+// A const reference binds to a copy read out of the register, the way it would
+// bind to a bit-field. The copy is a temporary; the variable gets no storage.
+__device__ __attribute__((noinline)) float4 by_const_ref(const float4 &v) { return v * v; }
+
+// CHECK-LABEL: define {{.*}}@_Z15const_ref_to_cpPDv4_f(
+// CHECK: %ref.tmp = alloca <4 x float>
+// CHECK-NOT: alloca
+// CHECK: call void @llvm.write_register.v4i32(metadata ![[V64:[0-9]+]], <4 x i32>
+// CHECK: %[[COPY:.*]] = tail call <4 x i32> @llvm.read_register.v4i32(metadata ![[V64]])
+// CHECK: store <4 x i32> %[[COPY]], ptr addrspace(5) %ref.tmp
+// CHECK: call {{.*}}@_Z12by_const_refRKDv4_f(
+__global__ void const_ref_to_cp(float4 *out) {
+  __attribute__((amdgpu_pin_vgpr(64))) float4 acc;
+  acc = out[0];
+  out[1] = by_const_ref(acc);
+}
+
 // CHECK-DAG: ![[V8]] = !{!"v8"}
 // CHECK-DAG: ![[V256]] = !{!"v[256:259]"}
 // CHECK-DAG: ![[A16]] = !{!"a[16:19]"}
+// CHECK-DAG: ![[V64]] = !{!"v[64:67]"}
 // CHECK-DAG: ![[V4]] = !{!"v4"}
 // CHECK-DAG: ![[T264]] = !{!"v264"}
 // CHECK-DAG: ![[T520]] = !{!"v520"}
+
