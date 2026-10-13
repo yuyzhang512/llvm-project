@@ -1005,12 +1005,14 @@ void Sema::InstantiateAttrs(const MultiLevelTemplateArgumentList &TemplateArgs,
       instantiateDependentAMDGPUPinRegAttr(*this, TemplateArgs,
                                            PinVGPR->getReg(), *PinVGPR,
                                            /*IsAGPR=*/false, New);
+      continue;
     }
 
     if (const auto *PinAGPR = dyn_cast<AMDGPUPinAGPRAttr>(TmplAttr)) {
       instantiateDependentAMDGPUPinRegAttr(*this, TemplateArgs,
                                            PinAGPR->getReg(), *PinAGPR,
                                            /*IsAGPR=*/true, New);
+      continue;
     }
 
     if (const auto *CUDAClusterDims = dyn_cast<CUDAClusterDimsAttr>(TmplAttr)) {
