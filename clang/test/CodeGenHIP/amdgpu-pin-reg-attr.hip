@@ -84,10 +84,29 @@ __global__ void const_ref_to_cp(float4 *out) {
   out[1] = by_const_ref(acc);
 }
 
+// One pinned local per tile, numbered from a generic lambda's parameter inside
+// a function template: each instantiation names its own tuple.
+template <int I> struct num { static constexpr int value = I; };
+template <class F> __device__ void twice(F f) { f(num<0>{}); f(num<1>{}); }
+template <int Base> __device__ void per_tile(float4 *out) {
+  twice([&](auto i) {
+    __attribute__((amdgpu_pin_vgpr(Base + i.value * 4))) auto t = out[i.value];
+    out[2 + i.value] = t;
+  });
+}
+
+// CHECK-LABEL: define {{.*}}@_Z5tilesPDv4_f(
+// CHECK-NOT: alloca
+// CHECK: call void @llvm.write_register.v4i32(metadata ![[T0:[0-9]+]], <4 x i32>
+// CHECK: call void @llvm.write_register.v4i32(metadata ![[T1:[0-9]+]], <4 x i32>
+__global__ void tiles(float4 *out) { per_tile<32>(out); }
+
 // CHECK-DAG: ![[V8]] = !{!"v8"}
 // CHECK-DAG: ![[V256]] = !{!"v[256:259]"}
 // CHECK-DAG: ![[A16]] = !{!"a[16:19]"}
 // CHECK-DAG: ![[V64]] = !{!"v[64:67]"}
+// CHECK-DAG: ![[T0]] = !{!"v[32:35]"}
+// CHECK-DAG: ![[T1]] = !{!"v[36:39]"}
 // CHECK-DAG: ![[V4]] = !{!"v4"}
 // CHECK-DAG: ![[T264]] = !{!"v264"}
 // CHECK-DAG: ![[T520]] = !{!"v520"}

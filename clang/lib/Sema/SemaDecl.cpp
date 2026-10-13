@@ -15060,6 +15060,7 @@ void Sema::CheckCompleteVariableDeclaration(VarDecl *var) {
   if (var->isInvalidDecl()) return;
 
   CUDA().MaybeAddConstantAttr(var);
+  AMDGPU().checkPinnedRegVarType(var);
 
   if (getLangOpts().OpenCL) {
     // OpenCL v2.0 s6.12.5 - Every block variable declaration must have an

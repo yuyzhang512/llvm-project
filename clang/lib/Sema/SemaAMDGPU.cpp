@@ -730,6 +730,24 @@ void SemaAMDGPU::handleAMDGPUNumVGPRAttr(Decl *D, const ParsedAttr &AL) {
                  AMDGPUNumVGPRAttr(getASTContext(), AL, NumVGPR));
 }
 
+bool SemaAMDGPU::fillsWholeRegisters(QualType T) {
+  if (T->isDependentType() || T->isUndeducedType())
+    return true;
+  uint64_t Bits = getASTContext().getTypeSize(T);
+  return Bits != 0 && Bits % 32 == 0;
+}
+
+void SemaAMDGPU::checkPinnedRegVarType(VarDecl *VD) {
+  const Attr *A = VD->getAttr<AMDGPUPinVGPRAttr>();
+  if (!A)
+    A = VD->getAttr<AMDGPUPinAGPRAttr>();
+  if (!A || fillsWholeRegisters(VD->getType()))
+    return;
+  Diag(A->getLocation(), diag::warn_attribute_ignored) << A;
+  VD->dropAttr<AMDGPUPinVGPRAttr>();
+  VD->dropAttr<AMDGPUPinAGPRAttr>();
+}
+
 void SemaAMDGPU::addAMDGPUPinRegAttr(Decl *D, const AttributeCommonInfo &CI,
                                      Expr *E, bool IsAGPR) {
   // Only an automatic local can live in a register for its whole lifetime.
@@ -739,14 +757,11 @@ void SemaAMDGPU::addAMDGPUPinRegAttr(Decl *D, const AttributeCommonInfo &CI,
     return;
   }
 
-  // The value has to fill whole registers.
-  QualType T = VD->getType();
-  if (!T->isDependentType()) {
-    uint64_t Bits = getASTContext().getTypeSize(T);
-    if (Bits == 0 || Bits % 32) {
-      Diag(CI.getLoc(), diag::warn_attribute_ignored) << CI;
-      return;
-    }
+  // The value has to fill whole registers. An auto type is not known yet;
+  // checkPinnedRegVarType() looks again once it has been deduced.
+  if (!fillsWholeRegisters(VD->getType())) {
+    Diag(CI.getLoc(), diag::warn_attribute_ignored) << CI;
+    return;
   }
 
   // A dependent argument is checked when the template is instantiated.
