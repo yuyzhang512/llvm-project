@@ -39,3 +39,24 @@ template <int N> __device__ int tmpl() {
 __global__ void use(int *out) {
   out[0] = tmpl<-1>(); // expected-note {{in instantiation of function template specialization 'tmpl<-1>' requested here}}
 }
+
+// An auto type is checked once it has been deduced, not before.
+__global__ void deduced(float4 *in, short *s) {
+  __attribute__((amdgpu_pin_vgpr(8))) auto v = in[0];
+  __attribute__((amdgpu_pin_vgpr(12))) auto h = s[0]; // expected-warning {{'amdgpu_pin_vgpr' attribute ignored}}
+  in[1] = v;
+  s[1] = h;
+}
+
+// A register number computed from a generic lambda's parameter, inside a
+// function template: the lambda's call operator is instantiated after the
+// template, and the pin has to follow it there.
+template <int I> struct num { static constexpr int value = I; };
+template <class F> __device__ void twice(F f) { f(num<0>{}); f(num<1>{}); }
+template <int Base> __device__ void per_tile(float4 *out) {
+  twice([&](auto i) {
+    __attribute__((amdgpu_pin_agpr(Base + i.value * 4))) auto t = out[i.value];
+    out[2 + i.value] = t;
+  });
+}
+__global__ void tiles(float4 *out) { per_tile<16>(out); }

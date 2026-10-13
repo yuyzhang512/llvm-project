@@ -84,6 +84,14 @@ public:
   void handleAMDGPUPinRegAttr(Decl *D, const ParsedAttr &AL, bool IsAGPR);
   void addAMDGPUPinRegAttr(Decl *D, const AttributeCommonInfo &CI, Expr *E,
                            bool IsAGPR);
+  /// Drop a register pin from a variable whose type, once known, does not fill
+  /// whole registers. Covers types deduced after the attribute was attached.
+  void checkPinnedRegVarType(VarDecl *VD);
+
+private:
+  bool fillsWholeRegisters(QualType T);
+
+public:
 
   /// Expand a valid use of the feature identification builtins into its
   /// corresponding sequence of instructions.
