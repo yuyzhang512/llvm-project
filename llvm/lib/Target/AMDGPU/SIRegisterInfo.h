@@ -359,8 +359,8 @@ public:
   unsigned getRegPressureSetLimit(const MachineFunction &MF,
                                   unsigned Idx) const override;
 
-  void updateRegAllocHint(Register Reg, Register NewReg,
-                          MachineFunction &MF) const override;
+  void updateRegAllocHint(Register Reg, unsigned RegIdx, Register NewReg,
+                          unsigned NewIdx, MachineFunction &MF) const override;
 
   bool getRegAllocationHints(Register VirtReg, ArrayRef<MCPhysReg> Order,
                              SmallVectorImpl<MCPhysReg> &Hints,

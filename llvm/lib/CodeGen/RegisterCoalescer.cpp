@@ -2293,7 +2293,8 @@ RegisterCoalescer::JoinResult RegisterCoalescer::joinCopy(
   LIS->removeInterval(CP.getSrcReg());
 
   // Update regalloc hint.
-  TRI->updateRegAllocHint(CP.getSrcReg(), CP.getDstReg(), *MF);
+  TRI->updateRegAllocHint(CP.getSrcReg(), CP.getSrcIdx(), CP.getDstReg(),
+                          CP.getDstIdx(), *MF);
 
   LLVM_DEBUG({
     dbgs() << "\tSuccess: " << printReg(CP.getSrcReg(), TRI, CP.getSrcIdx())

@@ -107,8 +107,8 @@ public:
                              const MachineFunction &MF, const VirtRegMap *VRM,
                              const LiveRegMatrix *Matrix) const override;
 
-  void updateRegAllocHint(Register Reg, Register NewReg,
-                          MachineFunction &MF) const override;
+  void updateRegAllocHint(Register Reg, unsigned RegIdx, Register NewReg,
+                          unsigned NewIdx, MachineFunction &MF) const override;
 
   bool hasBasePointer(const MachineFunction &MF) const;
 

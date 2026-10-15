@@ -1196,7 +1196,8 @@ bool RISCVRegisterInfo::getRegAllocationHints(
   return BaseImplRetVal;
 }
 
-void RISCVRegisterInfo::updateRegAllocHint(Register Reg, Register NewReg,
+void RISCVRegisterInfo::updateRegAllocHint(Register Reg, unsigned RegIdx,
+                                           Register NewReg, unsigned NewIdx,
                                            MachineFunction &MF) const {
   MachineRegisterInfo *MRI = &MF.getRegInfo();
   std::pair<unsigned, Register> Hint = MRI->getRegAllocationHint(Reg);

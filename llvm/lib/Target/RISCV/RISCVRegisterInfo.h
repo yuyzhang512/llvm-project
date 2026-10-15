@@ -159,8 +159,8 @@ struct RISCVRegisterInfo : public RISCVGenRegisterInfo {
                              const MachineFunction &MF, const VirtRegMap *VRM,
                              const LiveRegMatrix *Matrix) const override;
 
-  void updateRegAllocHint(Register Reg, Register NewReg,
-                          MachineFunction &MF) const override;
+  void updateRegAllocHint(Register Reg, unsigned RegIdx, Register NewReg,
+                          unsigned NewIdx, MachineFunction &MF) const override;
 
   Register findVRegWithEncoding(const TargetRegisterClass &RegClass,
                                 uint16_t Encoding) const;

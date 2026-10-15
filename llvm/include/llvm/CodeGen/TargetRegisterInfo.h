@@ -847,7 +847,10 @@ public:
   /// e.g. On ARM, some virtual registers should target register pairs,
   /// if one of pair is coalesced to another register, the allocation hint of
   /// the other half of the pair should be changed to point to the new register.
-  virtual void updateRegAllocHint(Register Reg, Register NewReg,
+  /// After the change, Reg's value occupies NewReg:RegIdx and NewReg's previous
+  /// value occupies NewReg:NewIdx; a zero index means the whole register.
+  virtual void updateRegAllocHint(Register Reg, unsigned RegIdx,
+                                  Register NewReg, unsigned NewIdx,
                                   MachineFunction &MF) const {
     // Do nothing.
   }

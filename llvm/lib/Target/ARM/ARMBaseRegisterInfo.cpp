@@ -417,7 +417,8 @@ bool ARMBaseRegisterInfo::getRegAllocationHints(
   return false;
 }
 
-void ARMBaseRegisterInfo::updateRegAllocHint(Register Reg, Register NewReg,
+void ARMBaseRegisterInfo::updateRegAllocHint(Register Reg, unsigned RegIdx,
+                                             Register NewReg, unsigned NewIdx,
                                              MachineFunction &MF) const {
   MachineRegisterInfo *MRI = &MF.getRegInfo();
   std::pair<unsigned, Register> Hint = MRI->getRegAllocationHint(Reg);

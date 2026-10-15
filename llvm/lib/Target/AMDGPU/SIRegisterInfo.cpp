@@ -4106,7 +4106,8 @@ const int *SIRegisterInfo::getRegUnitPressureSets(MCRegUnit RegUnit) const {
   return AMDGPUGenRegisterInfo::getRegUnitPressureSets(RegUnit);
 }
 
-void SIRegisterInfo::updateRegAllocHint(Register Reg, Register NewReg,
+void SIRegisterInfo::updateRegAllocHint(Register Reg, unsigned RegIdx,
+                                        Register NewReg, unsigned NewIdx,
                                         MachineFunction &MF) const {
   MachineRegisterInfo &MRI = MF.getRegInfo();
 
@@ -4114,11 +4115,28 @@ void SIRegisterInfo::updateRegAllocHint(Register Reg, Register NewReg,
   // particular register now describes NewReg. Without this the request is lost
   // for any value whose live range is merged with another, which is the normal
   // outcome for something accumulated across a loop.
-  std::pair<unsigned, Register> Hint = MRI.getRegAllocationHint(Reg);
-  if (Hint.first != AMDGPURI::PinnedReg || !NewReg.isVirtual())
+  if (!NewReg.isVirtual())
     return;
-  if (MRI.getRegAllocationHint(NewReg).first != AMDGPURI::PinnedReg)
-    MRI.setRegAllocationHint(NewReg, AMDGPURI::PinnedReg, Hint.second);
+  const TargetRegisterClass *RC = MRI.getRegClass(NewReg);
+
+  // A value that is now only part of NewReg, such as one half of an MFMA
+  // operand, asks for the register that puts that part where it was pinned.
+  auto Widen = [&](std::pair<unsigned, Register> Hint,
+                   unsigned Idx) -> MCRegister {
+    if (Hint.first != AMDGPURI::PinnedReg || !Hint.second.isPhysical())
+      return MCRegister();
+    MCRegister PR = Hint.second.asMCReg();
+    if (Idx)
+      PR = getMatchingSuperReg(PR, Idx, RC);
+    return PR && RC->contains(PR) ? PR : MCRegister();
+  };
+
+  // NewReg's own request comes first; it only needs widening if NewReg grew.
+  MCRegister PR = Widen(MRI.getRegAllocationHint(NewReg), NewIdx);
+  if (!PR)
+    PR = Widen(MRI.getRegAllocationHint(Reg), RegIdx);
+  if (PR)
+    MRI.setRegAllocationHint(NewReg, AMDGPURI::PinnedReg, PR);
 }
 
 bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
