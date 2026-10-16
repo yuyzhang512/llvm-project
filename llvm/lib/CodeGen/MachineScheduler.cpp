@@ -1688,6 +1688,36 @@ void ScheduleDAGMILive::dump() const {
 /// scheduling algorithm. However, if a scheduler further subclasses
 /// ScheduleDAGMILive then it will want to override this virtual method in order
 /// to update any specialized state.
+// Read-undef flags on subregister defs were dropped when the DAG was built and
+// added back as each instruction was placed, before the final order was known,
+// so a def placed early can keep a flag that a def moved above it should carry.
+// Settle them in the final order: a subregister def reads its register unless
+// no other lane of it is live just before.
+static void settleReadUndefFlags(MachineBasicBlock::iterator Begin,
+                                 MachineBasicBlock::iterator End,
+                                 const LiveIntervals &LIS,
+                                 const TargetRegisterInfo &TRI) {
+  for (MachineInstr &MI : make_range(Begin, End)) {
+    if (MI.isDebugInstr())
+      continue;
+    SlotIndex Before = LIS.getInstructionIndex(MI).getBaseIndex();
+    for (MachineOperand &MO : MI.all_defs()) {
+      Register Reg = MO.getReg();
+      if (!Reg.isVirtual() || !MO.getSubReg() || !LIS.hasInterval(Reg))
+        continue;
+      const LiveInterval &LI = LIS.getInterval(Reg);
+      if (!LI.hasSubRanges())
+        continue;
+      LaneBitmask LiveBefore;
+      for (const LiveInterval::SubRange &S : LI.subranges())
+        if (S.liveAt(Before))
+          LiveBefore |= S.LaneMask;
+      LaneBitmask DefLanes = TRI.getSubRegIndexLaneMask(MO.getSubReg());
+      MO.setIsUndef((LiveBefore & ~DefLanes).none());
+    }
+  }
+}
+
 void ScheduleDAGMILive::schedule() {
   LLVM_DEBUG(dbgs() << "ScheduleDAGMILive::schedule starting\n");
   LLVM_DEBUG(SchedImpl->dumpPolicy());
@@ -1739,6 +1769,9 @@ void ScheduleDAGMILive::schedule() {
   assert(CurrentTop == CurrentBottom && "Nonempty unscheduled zone.");
 
   placeDebugValues();
+
+  if (ShouldTrackLaneMasks)
+    settleReadUndefFlags(RegionBegin, RegionEnd, *LIS, *TRI);
 
   LLVM_DEBUG({
     dbgs() << "*** Final schedule for "
