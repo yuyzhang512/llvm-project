@@ -2647,7 +2647,10 @@ bool SIFoldOperandsImpl::tryFoldRegSequence(MachineInstr &MI) {
     const MachineInstr *SubDef = MRI->getVRegDef(Op->getReg());
     if (!SubDef || !SubDef->isCopy() || SubDef->getOperand(1).getSubReg())
       return false;
-    if (!TRI->isAGPR(*MRI, SubDef->getOperand(1).getReg()))
+    // A lane of a physical tuple would need its subregister index folded into
+    // the register; the REG_SEQUENCE below only carries it as an index.
+    if (!SubDef->getOperand(1).getReg().isVirtual() ||
+        !TRI->isAGPR(*MRI, SubDef->getOperand(1).getReg()))
       return false;
   }
 
