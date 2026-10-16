@@ -38,6 +38,7 @@
 ; GCN-O0-NEXT:    Lower uses of LDS variables from non-kernel functions
 ; GCN-O0-NEXT:    FunctionPass Manager
 ; GCN-O0-NEXT:      Expand Atomic instructions
+; GCN-O0-NEXT:      AMDGPU Lower Pin To Named Register
 ; GCN-O0-NEXT:      Remove unreachable blocks from the CFG
 ; GCN-O0-NEXT:      Instrument function entry/exit with calls to e.g. mcount() (post inlining)
 ; GCN-O0-NEXT:      Scalarize Masked Memory Intrinsics
@@ -205,6 +206,7 @@
 ; GCN-O1-NEXT:      Uniformity Analysis
 ; GCN-O1-NEXT:      AMDGPU atomic optimizations
 ; GCN-O1-NEXT:      Expand Atomic instructions
+; GCN-O1-NEXT:      AMDGPU Lower Pin To Named Register
 ; GCN-O1-NEXT:      Dominator Tree Construction
 ; GCN-O1-NEXT:      Natural Loop Information
 ; GCN-O1-NEXT:      AMDGPU Promote Alloca
@@ -500,6 +502,7 @@
 ; GCN-O1-OPTS-NEXT:      Uniformity Analysis
 ; GCN-O1-OPTS-NEXT:      AMDGPU atomic optimizations
 ; GCN-O1-OPTS-NEXT:      Expand Atomic instructions
+; GCN-O1-OPTS-NEXT:      AMDGPU Lower Pin To Named Register
 ; GCN-O1-OPTS-NEXT:      Dominator Tree Construction
 ; GCN-O1-OPTS-NEXT:      Natural Loop Information
 ; GCN-O1-OPTS-NEXT:      AMDGPU Promote Alloca
@@ -825,6 +828,7 @@
 ; GCN-O2-NEXT:      Uniformity Analysis
 ; GCN-O2-NEXT:      AMDGPU atomic optimizations
 ; GCN-O2-NEXT:      Expand Atomic instructions
+; GCN-O2-NEXT:      AMDGPU Lower Pin To Named Register
 ; GCN-O2-NEXT:      Dominator Tree Construction
 ; GCN-O2-NEXT:      Natural Loop Information
 ; GCN-O2-NEXT:      AMDGPU Promote Alloca
@@ -1154,6 +1158,7 @@
 ; GCN-O3-NEXT:      Uniformity Analysis
 ; GCN-O3-NEXT:      AMDGPU atomic optimizations
 ; GCN-O3-NEXT:      Expand Atomic instructions
+; GCN-O3-NEXT:      AMDGPU Lower Pin To Named Register
 ; GCN-O3-NEXT:      Dominator Tree Construction
 ; GCN-O3-NEXT:      Natural Loop Information
 ; GCN-O3-NEXT:      AMDGPU Promote Alloca

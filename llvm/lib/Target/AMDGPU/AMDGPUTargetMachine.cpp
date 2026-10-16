@@ -721,6 +721,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPURegBankCombinerLegacyPass(*PR);
   initializeAMDGPUPromoteAllocaPass(*PR);
   initializeAMDGPUCodeGenPreparePass(*PR);
+  initializeAMDGPULowerPinToNamedRegLegacyPass(*PR);
   initializeAMDGPULateCodeGenPrepareLegacyPass(*PR);
   initializeAMDGPURemoveIncompatibleFunctionsLegacyPass(*PR);
   initializeAMDGPULowerModuleLDSLegacyPass(*PR);
@@ -1617,6 +1618,12 @@ void AMDGPUPassConfig::addIRPasses() {
   }
 
   addPass(createAtomicExpandLegacyPass());
+
+  // Before AMDGPUCodeGenPrepare splits large PHIs into lanes: a PHI that
+  // carries a pinned value around a loop is folded into the pin while it is
+  // still whole.
+  if (TM.getTargetTriple().isAMDGCN())
+    addPass(createAMDGPULowerPinToNamedRegLegacyPass());
 
   if (TM.getOptLevel() > CodeGenOptLevel::None) {
     addPass(createAMDGPUPromoteAlloca());
