@@ -526,8 +526,9 @@ private:
   /// Size of the AGPR window named by llvm.{read,write}_register, or 0.
   unsigned NamedAGPRs = 0;
 
-  /// Registers named by llvm.{read,write}_register that have to be reserved.
-  SmallVector<MCPhysReg, 8> ReservedNamedRegs;
+  /// A register named by llvm.{read,write}_register is read in a block that
+  /// does not write it, so the blocks need live-ins after selection.
+  bool NamedRegLiveIns = false;
 
   // The hard-wired high half of the address of the global information table
   // for AMDPAL OS type. 0xffffffff represents no hard-wired high half, since
@@ -1240,7 +1241,7 @@ public:
 
   unsigned getMinNumAGPRs() const { return MinNumAGPRs; }
 
-  ArrayRef<MCPhysReg> getReservedNamedRegs() const { return ReservedNamedRegs; }
+  bool needsNamedRegLiveIns() const { return NamedRegLiveIns; }
 
   /// Return true if an MFMA that requires at least \p NumRegs should select to
   /// the AGPR form, instead of the VGPR form.

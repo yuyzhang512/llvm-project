@@ -33,6 +33,7 @@
 #include "llvm/CodeGen/Analysis.h"
 #include "llvm/CodeGen/ByteProvider.h"
 #include "llvm/CodeGen/FunctionLoweringInfo.h"
+#include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/GlobalISel/GISelValueTracking.h"
 #include "llvm/CodeGen/GlobalISel/GenericMachineInstrs.h"
 #include "llvm/CodeGen/GlobalISel/MIPatternMatch.h"
@@ -20581,6 +20582,15 @@ void SITargetLowering::finalizeLowering(MachineFunction &MF) const {
   }
 
   TargetLoweringBase::finalizeLowering(MF);
+
+  // Selection lowers a read of a named register to a copy from the physical
+  // register without a live-in. Add the live-ins it needs.
+  if (MF.getInfo<SIMachineFunctionInfo>()->needsNamedRegLiveIns()) {
+    SmallVector<MachineBasicBlock *> MBBs;
+    for (MachineBasicBlock &MBB : reverse(MF))
+      MBBs.push_back(&MBB);
+    fullyRecomputeLiveIns(MBBs);
+  }
 }
 
 void SITargetLowering::computeKnownBitsForTargetNode(const SDValue Op,

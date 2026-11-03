@@ -59,17 +59,11 @@ static StringRef getNamedReg(const Instruction &I) {
 }
 
 // Collect what naming a VGPR or AGPR through llvm.{read,write}_register implies
-// for \p F: one past the highest AGPR named, and the registers that have to be
-// reserved.
-//
-// A read of a named register lowers to a use of that physical register. If a
-// write precedes it in the same block, liveness already protects the value, and
-// reserving would only shrink the allocatable set. Otherwise the read is
-// live-in and the verifier rejects it as an undefined physical register unless
-// the register is reserved, so reserve only those.
+// for \p F: one past the highest AGPR named, and whether a named register is
+// read in a block that does not write it first. Such a read is a use of a
+// physical register live into the block, so the blocks need live-ins.
 static void scanNamedRegs(const Function &F, unsigned &HighestAGPR,
-                          SmallVectorImpl<MCPhysReg> &ToReserve) {
-  SmallDenseSet<StringRef, 8> NeedsReserve;
+                          bool &NeedsLiveIns) {
   for (const BasicBlock &BB : F) {
     SmallDenseSet<StringRef, 8> WrittenHere;
     for (const Instruction &I : BB) {
@@ -84,15 +78,8 @@ static void scanNamedRegs(const Function &F, unsigned &HighestAGPR,
       if (cast<CallInst>(I).getIntrinsicID() == Intrinsic::write_register)
         WrittenHere.insert(Name);
       else if (!WrittenHere.contains(Name))
-        NeedsReserve.insert(Name);
+        NeedsLiveIns = true;
     }
-  }
-
-  for (StringRef Name : NeedsReserve) {
-    auto [Kind, Idx, Width] = AMDGPU::parseAsmPhysRegName(Name);
-    MCRegister First = (Kind == 'a' ? AMDGPU::AGPR0 : AMDGPU::VGPR0) + Idx;
-    for (unsigned I = 0; I != Width; ++I)
-      ToReserve.push_back(First + I);
   }
 }
 
@@ -142,7 +129,7 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const Function &F,
   // asks for the value to live in that file, so record the window: an MFMA that
   // fits it selects the AGPR form, and the registers are counted in the AGPR
   // budget.
-  scanNamedRegs(F, NamedAGPRs, ReservedNamedRegs);
+  scanNamedRegs(F, NamedAGPRs, NamedRegLiveIns);
   if (NamedAGPRs && ST.hasGFX90AInsts())
     MinNumAGPRs =
         MinNumAGPRs == ~0u ? NamedAGPRs : std::max(MinNumAGPRs, NamedAGPRs);
