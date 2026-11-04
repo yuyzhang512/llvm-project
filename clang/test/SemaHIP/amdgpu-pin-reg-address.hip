@@ -1,5 +1,12 @@
 // RUN: %clang_cc1 -triple amdgcn-amd-amdhsa -target-cpu gfx942 -x hip \
 // RUN:   -fcuda-is-device -fsyntax-only -verify %s
+// RUN: %clang_cc1 -triple amdgcn-amd-amdhsa -target-cpu gfx942 -x hip \
+// RUN:   -fcuda-is-device -fsyntax-only -fpin-register-lowering=intrinsic \
+// RUN:   -Wno-pinned-register-call -verify=memory %s
+
+// With -fpin-register-lowering=intrinsic a pinned variable is kept in memory,
+// so all of these are allowed.
+// memory-no-diagnostics
 
 #define __global__ __attribute__((global))
 #define __device__ __attribute__((device))

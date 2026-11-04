@@ -1616,6 +1616,9 @@ private:
   /// decls.
   DeclMapTy LocalDeclMap;
 
+  /// Pinned locals kept in an alloca, keyed by their address.
+  llvm::DenseMap<llvm::Value *, const VarDecl *> PinnedLocals;
+
   /// Lookup map for privatized BindingDecls.
   /// Used when BindingDecls are remapped during OpenMP outlining, since the
   /// remapped BindingDecl has a different pointer than the original.
@@ -4587,6 +4590,14 @@ public:
 
   /// Copies made by EmitPinnedRegisterCopy, and their registers.
   llvm::DenseMap<llvm::Value *, LValue> PinnedRegisterCopies;
+  /// Whether \p D is a pinned local that lives in its named register rather
+  /// than in an alloca.
+  bool isPinnedToNamedRegister(const VarDecl &D);
+  /// The register name node of a local with amdgpu_pin_{vgpr,agpr}.
+  llvm::MDNode *getAMDGPUPinnedRegName(const VarDecl *VD);
+  /// If \p Addr is a pinned local kept in an alloca, pin \p Value, which is
+  /// about to be stored there.
+  llvm::Value *EmitPinnedStoreValue(llvm::Value *Value, Address Addr);
   LValue EmitStringLiteralLValue(const StringLiteral *E);
   LValue EmitObjCEncodeExprLValue(const ObjCEncodeExpr *E);
   LValue EmitPredefinedLValue(const PredefinedExpr *E);

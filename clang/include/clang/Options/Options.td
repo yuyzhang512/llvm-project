@@ -1340,6 +1340,20 @@ def fgpu_default_stream_EQ : Joined<["-"], "fgpu-default-stream=">,
   NormalizedValues<["Legacy", "PerThread"]>,
   MarshallingInfoEnum<LangOpts<"GPUDefaultStream">, "Legacy">;
 
+def fpin_register_lowering_EQ : Joined<["-"], "fpin-register-lowering=">,
+  HelpText<"How to emit a local pinned to a register: 'named-register' (no "
+           "storage) or 'intrinsic' (an alloca whose stored values are "
+           "pinned)">,
+  Visibility<[CC1Option]>,
+  Values<"named-register,intrinsic">,
+  NormalizedValuesScope<"LangOptions::PinRegisterLoweringKind">,
+  NormalizedValues<["NamedRegister", "Intrinsic"]>,
+  MarshallingInfoEnum<LangOpts<"PinRegisterLowering">, "NamedRegister">;
+def fpin_register_hint : Flag<["-"], "fpin-register-hint">,
+  HelpText<"Make the pins of locals kept in memory allocation hints">,
+  Visibility<[CC1Option]>,
+  MarshallingInfoFlag<LangOpts<"PinRegisterHint">>;
+
 def fgpu_flush_denormals_to_zero : Flag<["-"], "fgpu-flush-denormals-to-zero">,
   HelpText<"Flush denormal floating point values to zero in CUDA/HIP device mode.">;
 def fno_gpu_flush_denormals_to_zero : Flag<["-"], "fno-gpu-flush-denormals-to-zero">;

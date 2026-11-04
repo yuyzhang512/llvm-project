@@ -15452,7 +15452,8 @@ QualType Sema::CheckAddressOfOperand(ExprResult &OrigOp, SourceLocation OpLoc) {
       if (vd->getStorageClass() == SC_Register &&
           !getLangOpts().CPlusPlus) {
         AddressOfError = AO_Register_Variable;
-      } else if (isAMDGPUPinnedRegVar(vd)) {
+      } else if (isAMDGPUPinnedRegVar(vd) &&
+                 getLangOpts().pinnedLocalsHaveNoStorage()) {
         // A pinned variable is the register, not storage holding it, so it has
         // no address to take. Unlike the register storage class this is a
         // guarantee rather than a hint, so it holds in C++ too.
@@ -20043,8 +20044,9 @@ static bool captureInLambda(LambdaScopeInfo *LSI, ValueDecl *Var,
   }
 
   // Capturing by reference stores the variable's address in the closure, which
-  // a pinned variable does not have.
-  if (ByRef && BuildAndDiagnose && isAMDGPUPinnedRegVar(Var)) {
+  // a pinned variable without storage does not have.
+  if (ByRef && BuildAndDiagnose && isAMDGPUPinnedRegVar(Var) &&
+      S.getLangOpts().pinnedLocalsHaveNoStorage()) {
     S.Diag(Loc, diag::err_typecheck_address_of) << AO_Register_Variable;
     S.Diag(Var->getLocation(), diag::note_entity_declared_at) << Var;
     Invalid = true;

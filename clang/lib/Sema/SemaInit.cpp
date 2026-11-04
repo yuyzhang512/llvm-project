@@ -5516,13 +5516,14 @@ static void TryReferenceInitialization(Sema &S, const InitializedEntity &Entity,
 }
 
 /// The variable an expression names, if that variable was given a register
-/// with amdgpu_pin_{vgpr,agpr}. It is assignable but has no address, like a
-/// bit-field, so a reference to it can only bind to a copy.
+/// with amdgpu_pin_{vgpr,agpr} and no storage. It is assignable but has no
+/// address, like a bit-field, so a reference to it can only bind to a copy.
 static const VarDecl *getRegisterVariable(const Expr *E) {
   const auto *DRE = dyn_cast<DeclRefExpr>(E->IgnoreParens());
   const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
   if (VD &&
-      (VD->hasAttr<AMDGPUPinVGPRAttr>() || VD->hasAttr<AMDGPUPinAGPRAttr>()))
+      (VD->hasAttr<AMDGPUPinVGPRAttr>() || VD->hasAttr<AMDGPUPinAGPRAttr>()) &&
+      VD->getASTContext().getLangOpts().pinnedLocalsHaveNoStorage())
     return VD;
   return nullptr;
 }

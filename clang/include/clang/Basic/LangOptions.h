@@ -341,6 +341,14 @@ public:
     ExtendTo64
   };
 
+  /// How a local pinned to a register is emitted.
+  enum class PinRegisterLoweringKind {
+    /// No storage; every access is llvm.read_register/llvm.write_register.
+    NamedRegister,
+    /// An alloca; each value stored to it goes through llvm.pin.register.
+    Intrinsic,
+  };
+
   enum class GPUDefaultStreamKind {
     /// Legacy default stream
     Legacy,
@@ -584,6 +592,19 @@ public:
 
   /// The default stream kind used for HIP kernel launching.
   GPUDefaultStreamKind GPUDefaultStream;
+
+  /// How a local pinned to a register is emitted.
+  PinRegisterLoweringKind PinRegisterLowering =
+      PinRegisterLoweringKind::NamedRegister;
+
+  /// Whether a pin of a local kept in memory is an allocation hint rather
+  /// than a required register.
+  bool PinRegisterHint = false;
+
+  /// Whether a local pinned to a register has no storage, and so no address.
+  bool pinnedLocalsHaveNoStorage() const {
+    return PinRegisterLowering == PinRegisterLoweringKind::NamedRegister;
+  }
 
   /// Which overflow patterns should be excluded from sanitizer instrumentation
   unsigned OverflowPatternExclusionMask = 0;

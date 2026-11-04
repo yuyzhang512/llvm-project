@@ -2446,6 +2446,8 @@ void CodeGenFunction::EmitStoreOfScalar(llvm::Value *Value, Address Addr,
                                         LValueBaseInfo BaseInfo,
                                         TBAAAccessInfo TBAAInfo,
                                         bool isInit, bool isNontemporal) {
+  Value = EmitPinnedStoreValue(Value, Addr);
+
   if (auto *GV = dyn_cast<llvm::GlobalValue>(Addr.getBasePointer()))
     if (GV->isThreadLocal())
       Addr = Addr.withPointer(Builder.CreateThreadLocalAddress(GV),
@@ -2881,6 +2883,7 @@ void CodeGenFunction::EmitStoreThroughLValue(RValue Src, LValue Dst,
         Vec = Builder.CreateBitCast(Vec, IRStoreTy);
       }
 
+      Vec = EmitPinnedStoreValue(Vec, Dst.getVectorAddress());
       auto *I = Builder.CreateStore(Vec, Dst.getVectorAddress(),
                                     Dst.isVolatileQualified());
       addInstToCurrentSourceAtom(I, Vec);
@@ -3265,6 +3268,7 @@ void CodeGenFunction::EmitStoreThroughExtVectorComponentLValue(RValue Src,
     Vec = Builder.CreateInsertElement(Vec, SrcVal, Elt);
   }
 
+  Vec = EmitPinnedStoreValue(Vec, Dst.getExtVectorAddress());
   Builder.CreateStore(Vec, Dst.getExtVectorAddress(),
                       Dst.isVolatileQualified());
   EmitPinnedRegisterWriteBack(Dst.getExtVectorAddress());
@@ -3625,6 +3629,32 @@ void CodeGenFunction::EmitPinnedRegisterWriteBack(Address Addr) {
 /// gives the first register and the type gives how many, so a four-dword value
 /// pinned to 256 names v[256:259]. A vector's padding takes no register.
 LValue CodeGenFunction::EmitAMDGPUPinnedRegister(const VarDecl *VD) {
+  llvm::Value *Ptr =
+      llvm::MetadataAsValue::get(getLLVMContext(), getAMDGPUPinnedRegName(VD));
+  return LValue::MakeGlobalReg(Ptr, getContext().getDeclAlign(VD),
+                               VD->getType());
+}
+
+bool CodeGenFunction::isPinnedToNamedRegister(const VarDecl &D) {
+  return (D.hasAttr<AMDGPUPinVGPRAttr>() || D.hasAttr<AMDGPUPinAGPRAttr>()) &&
+         getLangOpts().pinnedLocalsHaveNoStorage();
+}
+
+llvm::Value *CodeGenFunction::EmitPinnedStoreValue(llvm::Value *Value,
+                                                   Address Addr) {
+  if (PinnedLocals.empty())
+    return Value;
+  const VarDecl *VD = PinnedLocals.lookup(Addr.getBasePointer());
+  if (!VD)
+    return Value;
+  llvm::Value *Name =
+      llvm::MetadataAsValue::get(getLLVMContext(), getAMDGPUPinnedRegName(VD));
+  return Builder.CreateIntrinsic(
+      llvm::Intrinsic::pin_register, {Value->getType()},
+      {Value, Name, Builder.getInt1(!getLangOpts().PinRegisterHint)});
+}
+
+llvm::MDNode *CodeGenFunction::getAMDGPUPinnedRegName(const VarDecl *VD) {
   bool IsAGPR = VD->hasAttr<AMDGPUPinAGPRAttr>();
   const Expr *RegE = IsAGPR ? VD->getAttr<AMDGPUPinAGPRAttr>()->getReg()
                             : VD->getAttr<AMDGPUPinVGPRAttr>()->getReg();
@@ -3644,12 +3674,8 @@ LValue CodeGenFunction::EmitAMDGPUPinnedRegister(const VarDecl *VD) {
   else
     OS << Reg;
 
-  llvm::MDString *Str = llvm::MDString::get(getLLVMContext(), RegName);
-  llvm::Metadata *Ops[] = {Str};
-  llvm::Value *Ptr = llvm::MetadataAsValue::get(
-      getLLVMContext(), llvm::MDNode::get(getLLVMContext(), Ops));
-  return LValue::MakeGlobalReg(Ptr, getContext().getDeclAlign(VD),
-                               VD->getType());
+  llvm::Metadata *Ops[] = {llvm::MDString::get(getLLVMContext(), RegName)};
+  return llvm::MDNode::get(getLLVMContext(), Ops);
 }
 
 /// Determine whether we can emit a reference to \p VD from the current
@@ -3779,7 +3805,7 @@ LValue CodeGenFunction::EmitDeclRefLValue(const DeclRefExpr *E) {
       return EmitGlobalNamedRegister(VD, CGM);
 
     // A local with amdgpu_pin_{vgpr,agpr} lives in a register, not in memory.
-    if (VD->hasAttr<AMDGPUPinVGPRAttr>() || VD->hasAttr<AMDGPUPinAGPRAttr>())
+    if (isPinnedToNamedRegister(*VD))
       return EmitAMDGPUPinnedRegister(VD);
 
     // If this DeclRefExpr does not constitute an odr-use of the variable,

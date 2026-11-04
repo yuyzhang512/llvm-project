@@ -1360,13 +1360,26 @@ static llvm::Constant *replaceUndef(CodeGenModule &CGM, IsPattern isPattern,
 void CodeGenFunction::EmitAutoVarDecl(const VarDecl &D) {
   // A pinned local has no storage, so there is no alloca to emit, initialize
   // or clean up. Any initializer is written straight to the register.
-  if (D.hasAttr<AMDGPUPinVGPRAttr>() || D.hasAttr<AMDGPUPinAGPRAttr>()) {
+  if (isPinnedToNamedRegister(D)) {
     if (const Expr *Init = D.getInit())
       EmitStoreThroughLValue(EmitAnyExpr(Init), EmitAMDGPUPinnedRegister(&D));
     return;
   }
 
   AutoVarEmission emission = EmitAutoVarAlloca(D);
+  if (D.hasAttr<AMDGPUPinVGPRAttr>() || D.hasAttr<AMDGPUPinAGPRAttr>()) {
+    PinnedLocals[emission.Addr.getBasePointer()] = &D;
+    // Values stored through a pointer to the variable, such as a by-reference
+    // capture, are pinned when the alloca is promoted.
+    if (auto *AI = dyn_cast<llvm::AllocaInst>(
+            emission.getOriginalAllocatedAddress().getPointer())) {
+      llvm::Metadata *Ops[] = {getAMDGPUPinnedRegName(&D)->getOperand(0),
+                               llvm::ConstantAsMetadata::get(Builder.getInt1(
+                                   !getLangOpts().PinRegisterHint))};
+      AI->setMetadata("llvm.pin.register",
+                      llvm::MDNode::get(getLLVMContext(), Ops));
+    }
+  }
   EmitAutoVarInit(emission);
   EmitAutoVarCleanups(emission);
 }
