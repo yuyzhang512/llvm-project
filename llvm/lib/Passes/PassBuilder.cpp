@@ -403,6 +403,7 @@
 #include "llvm/Transforms/Utils/LowerGlobalDtors.h"
 #include "llvm/Transforms/Utils/LowerIFunc.h"
 #include "llvm/Transforms/Utils/LowerInvoke.h"
+#include "llvm/Transforms/Utils/LowerPinRegisterMetadata.h"
 #include "llvm/Transforms/Utils/LowerSwitch.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 #include "llvm/Transforms/Utils/MetaRenamer.h"

@@ -15550,6 +15550,12 @@ as an integer of the same layout. Supported names vary by target and can be
 found in each target's `getRegisterByName` implementation. An unsupported
 name or type results in an error during code generation.
 
+A frontend that keeps the variable in memory can instead put
+`!llvm.pin.register !{!"<name>", i1 <required>}` on each store to it. The
+`lower-pin-register-metadata` pass turns such a store into a call to
+'`llvm.pin.register`' on the stored value. It must run before other
+optimizations, which drop metadata they do not know.
+
 (int_stacksave)=
 
 #### '`llvm.stacksave`' Intrinsic
