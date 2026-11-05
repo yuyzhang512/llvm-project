@@ -2317,6 +2317,18 @@ RegisterCoalescer::JoinResult RegisterCoalescer::joinCopy(
 
   // Update regalloc hint.
   TRI->updateRegAllocHint(CP.getSrcReg(), CP.getDstReg(), *MF);
+  if (!CP.isPhys() && !CP.getDstIdx() && MRI->hasPinHint(CP.getSrcReg())) {
+    // Keep a requested hint of SrcReg, which now lives in DstReg:SrcIdx.
+    Register Hint = MRI->getSimpleHint(CP.getSrcReg());
+    if (Hint.isPhysical() && !MRI->getSimpleHint(CP.getDstReg())) {
+      const TargetRegisterClass *RC = MRI->getRegClass(CP.getDstReg());
+      MCRegister DstHint =
+          CP.getSrcIdx() ? TRI->getMatchingSuperReg(Hint, CP.getSrcIdx(), RC)
+                         : MCRegister(Hint);
+      if (DstHint && RC->contains(DstHint))
+        MRI->setPinHint(CP.getDstReg(), DstHint);
+    }
+  }
 
   LLVM_DEBUG({
     dbgs() << "\tSuccess: " << printReg(CP.getSrcReg(), TRI, CP.getSrcIdx())

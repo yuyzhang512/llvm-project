@@ -146,6 +146,10 @@ bool RenameIndependentSubregs::renameComponents(LiveInterval &LI) const {
   for (unsigned I = 1, NumClasses = Classes.getNumClasses(); I < NumClasses;
        ++I) {
     Register NewVReg = MRI->createVirtualRegister(RegClass);
+    // The new register keeps the class and subregister layout, so a
+    // requested hint for the whole register still applies.
+    if (MRI->hasPinHint(Reg))
+      MRI->setPinHint(NewVReg, MRI->getSimpleHint(Reg));
     LiveInterval &NewLI = LIS->createEmptyInterval(NewVReg);
     Intervals.push_back(&NewLI);
     LLVM_DEBUG(dbgs() << ' ' << printReg(NewVReg));

@@ -35,6 +35,7 @@
 #include "llvm/IR/DebugProgramInstruction.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
@@ -1356,11 +1357,44 @@ void PromoteMem2Reg::RenamePass(BasicBlock *BB, BasicBlock *Pred) {
       pushToWorklist(S, BB);
 }
 
+// An alloca marked !llvm.pin.register !{!"<name>", i1 <required>} holds a
+// variable pinned to a register. Pin each value stored to it before it is
+// promoted, so the value keeps the request once the alloca is gone. A value
+// already pinned to the register is left alone.
+static void pinStoredValues(AllocaInst *AI) {
+  MDNode *MD = AI->getMetadata("llvm.pin.register");
+  if (!MD || MD->getNumOperands() != 2 || !isa<MDString>(MD->getOperand(0)))
+    return;
+  auto *Required = mdconst::dyn_extract<ConstantInt>(MD->getOperand(1));
+  if (!Required)
+    return;
+  LLVMContext &Ctx = AI->getContext();
+  Metadata *NameOps[] = {MD->getOperand(0).get()};
+  MDNode *Name = MDNode::get(Ctx, NameOps);
+  for (User *U : AI->users()) {
+    auto *SI = dyn_cast<StoreInst>(U);
+    if (!SI || SI->getPointerOperand() != AI)
+      continue;
+    Value *V = SI->getValueOperand();
+    if (auto *II = dyn_cast<IntrinsicInst>(V);
+        II && II->getIntrinsicID() == Intrinsic::pin_register &&
+        cast<MetadataAsValue>(II->getArgOperand(1))->getMetadata() == Name)
+      continue;
+    IRBuilder<> B(SI);
+    SI->setOperand(
+        0, B.CreateIntrinsic(Intrinsic::pin_register, {V->getType()},
+                             {V, MetadataAsValue::get(Ctx, Name), Required}));
+  }
+}
+
 void llvm::PromoteMemToReg(ArrayRef<AllocaInst *> Allocas, DominatorTree &DT,
                            AssumptionCache *AC) {
   // If there is nothing to do, bail out...
   if (Allocas.empty())
     return;
+
+  for (AllocaInst *AI : Allocas)
+    pinStoredValues(AI);
 
   PromoteMem2Reg(Allocas, DT, AC).run();
 }

@@ -117,6 +117,11 @@ private:
              VirtReg2IndexFunctor>
       RegAllocHints;
 
+  /// Virtual registers whose hint was requested explicitly, e.g. by
+  /// llvm.pin.register. Unlike heuristic hints, these follow the register
+  /// when it is coalesced or split.
+  DenseSet<Register> PinHintRegs;
+
   /// Hold the register properties that are used to populate the VirtRegMap
   /// pass when deserializing from .mir files.
   SmallVector<PendingVirtRegMapEntry, 0> PendingVirtRegMapEntries;
@@ -884,6 +889,16 @@ public:
   void setSimpleHint(Register VReg, Register PrefReg) {
     setRegAllocationHint(VReg, /*Type=*/0, PrefReg);
   }
+
+  /// Set an explicitly requested hint for \p VReg, one that should be kept
+  /// when \p VReg is coalesced or split.
+  void setPinHint(Register VReg, MCRegister PrefReg) {
+    setSimpleHint(VReg, PrefReg);
+    PinHintRegs.insert(VReg);
+  }
+
+  /// Whether the hint of \p VReg was set with setPinHint.
+  bool hasPinHint(Register VReg) const { return PinHintRegs.contains(VReg); }
 
   void clearSimpleHint(Register VReg) {
     assert (!RegAllocHints[VReg].first &&

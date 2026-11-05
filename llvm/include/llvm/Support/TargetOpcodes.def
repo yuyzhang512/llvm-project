@@ -231,6 +231,11 @@ HANDLE_TARGET_OPCODE(ICALL_BRANCH_FUNNEL)
 /// Represents a use of the operand but generates no code.
 HANDLE_TARGET_OPCODE(FAKE_USE)
 
+/// A copy of the source whose result prefers the physical register given as
+/// an immediate. Lowered to a COPY with an allocation hint before register
+/// allocation.
+HANDLE_TARGET_OPCODE(PIN_REGISTER)
+
 // This is a fence with the singlethread scope. It represents a compiler memory
 // barrier, but does not correspond to any generated instruction.
 HANDLE_TARGET_OPCODE(MEMBARRIER)

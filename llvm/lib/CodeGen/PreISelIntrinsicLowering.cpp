@@ -12,7 +12,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/PreISelIntrinsicLowering.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Analysis/ObjCARCInstKind.h"
 #include "llvm/Analysis/ObjCARCUtil.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
@@ -23,9 +27,12 @@
 #include "llvm/CodeGen/RuntimeLibcallUtil.h"
 #include "llvm/CodeGen/TargetLowering.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Metadata.h"
@@ -43,6 +50,7 @@
 #include "llvm/Transforms/Utils/BuildLibCalls.h"
 #include "llvm/Transforms/Utils/LowerMemIntrinsics.h"
 #include "llvm/Transforms/Utils/LowerVectorIntrinsics.h"
+#include <optional>
 
 using namespace llvm;
 
@@ -680,6 +688,348 @@ static bool expandLoopTrap(Function &Intr) {
   return true;
 }
 
+//===----------------------------------------------------------------------===//
+// llvm.pin.register
+//
+// A required llvm.pin.register writes its value to the register where it is
+// pinned. Where the register is known to still hold the value, uses read the
+// register, so the value is carried between blocks and around loops in the
+// register rather than in a virtual register. Knowing that takes a forward
+// data flow per register: which pinned value, or which PHI of them, the
+// register holds at each point, if any.
+//===----------------------------------------------------------------------===//
+
+// The integer type with the layout of \p Ty, which read_register and
+// write_register take: an integer vector for a vector, an integer otherwise.
+// Null if there is none.
+static Type *getPinIntType(Type *Ty, const DataLayout &DL) {
+  if (Ty->isIntOrIntVectorTy())
+    return Ty;
+  if (Ty->isPointerTy())
+    return DL.getIntPtrType(Ty);
+  if (auto *VT = dyn_cast<FixedVectorType>(Ty)) {
+    if (!VT->getElementType()->isFloatingPointTy())
+      return nullptr;
+    return FixedVectorType::get(
+        IntegerType::get(Ty->getContext(), VT->getScalarSizeInBits()),
+        VT->getNumElements());
+  }
+  if (Ty->isFloatingPointTy())
+    return IntegerType::get(Ty->getContext(), Ty->getPrimitiveSizeInBits());
+  return nullptr;
+}
+
+static StringRef getNamedRegister(const Value *MDArg) {
+  const auto *MD = cast<MDNode>(cast<MetadataAsValue>(MDArg)->getMetadata());
+  const auto *Name =
+      MD->getNumOperands() ? dyn_cast<MDString>(MD->getOperand(0)) : nullptr;
+  return Name ? Name->getString() : StringRef();
+}
+
+static bool isRequiredPin(const Instruction &I, StringRef Name) {
+  const auto *II = dyn_cast<IntrinsicInst>(&I);
+  return II && II->getIntrinsicID() == Intrinsic::pin_register &&
+         cast<ConstantInt>(II->getArgOperand(2))->isOne() &&
+         getNamedRegister(II->getArgOperand(1)) == Name &&
+         getPinIntType(II->getType(), I.getDataLayout());
+}
+
+namespace {
+
+// Lowers the required pins of one register name.
+class RegisterPins {
+  Function &F;
+  StringRef Name;
+  // The values the register can hold: the pins, and the PHIs merging them.
+  SmallSetVector<Value *, 8> Group;
+  // The PHI of each block that arrives in the register, if any.
+  DenseMap<BasicBlock *, PHINode *> BlockPhi;
+  // Blocks whose end writes the incoming value of their successor's PHI.
+  DenseMap<BasicBlock *, PHINode *> EdgeWrites;
+  // What the register holds at the end of each block: std::nullopt if not
+  // known yet, nullptr if nothing in Group.
+  DenseMap<BasicBlock *, std::optional<Value *>> Out;
+
+public:
+  RegisterPins(Function &F, StringRef Name) : F(F), Name(Name) {}
+  bool run();
+
+private:
+  void findPhis();
+  std::optional<Value *> entryState(BasicBlock *BB);
+  Value *step(Instruction &I, Value *State);
+  void solve();
+  bool fixPhis();
+  void rewrite();
+};
+
+} // end anonymous namespace
+
+void RegisterPins::findPhis() {
+  // A PHI can arrive in the register when each incoming value is in Group, or
+  // can be written at the end of an incoming block that leads to it alone.
+  bool Changed = true;
+  while (Changed) {
+    Changed = false;
+    for (BasicBlock &BB : F) {
+      if (BlockPhi.count(&BB))
+        continue;
+      for (PHINode &PN : BB.phis()) {
+        if (!getPinIntType(PN.getType(), F.getDataLayout()))
+          continue;
+        bool Uses = false, Can = true;
+        for (unsigned K = 0, E = PN.getNumIncomingValues(); K != E; ++K) {
+          Value *In = PN.getIncomingValue(K);
+          if (Group.contains(In)) {
+            Uses = true;
+            continue;
+          }
+          if (!isa<UndefValue>(In) &&
+              PN.getIncomingBlock(K)->getSingleSuccessor() != &BB)
+            Can = false;
+        }
+        if (Uses && Can) {
+          Group.insert(&PN);
+          BlockPhi[&BB] = &PN;
+          Changed = true;
+          break;
+        }
+      }
+    }
+  }
+}
+
+std::optional<Value *> RegisterPins::entryState(BasicBlock *BB) {
+  if (BB->isEntryBlock())
+    return nullptr;
+  PHINode *PN = BlockPhi.lookup(BB);
+  bool PhiArrives = PN != nullptr, Any = false;
+  std::optional<Value *> Same;
+  bool AllSame = true;
+  for (BasicBlock *Pred : predecessors(BB)) {
+    std::optional<Value *> O = Out.lookup(Pred);
+    if (!O)
+      continue;
+    Any = true;
+    if (PN && *O != PN && *O != PN->getIncomingValueForBlock(Pred))
+      PhiArrives = false;
+    if (!Same)
+      Same = *O;
+    else if (*Same != *O)
+      AllSame = false;
+  }
+  if (!Any)
+    return std::nullopt;
+  if (PhiArrives)
+    return PN;
+  return AllSame ? *Same : nullptr;
+}
+
+// What the register holds after \p I, given it holds \p State before.
+Value *RegisterPins::step(Instruction &I, Value *State) {
+  if (Group.contains(&I) && !isa<PHINode>(I))
+    return &I;
+  if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+    if ((II->getIntrinsicID() == Intrinsic::write_register ||
+         II->getIntrinsicID() == Intrinsic::write_volatile_register) &&
+        getNamedRegister(II->getArgOperand(0)) == Name)
+      return nullptr;
+    return State;
+  }
+  // A call may clobber the register; so may inline asm.
+  if (isa<CallBase>(I))
+    return nullptr;
+  return State;
+}
+
+void RegisterPins::solve() {
+  Out.clear();
+  ReversePostOrderTraversal<Function *> RPOT(&F);
+  bool Changed = true;
+  for (unsigned Iter = 0; Changed && Iter != 64; ++Iter) {
+    Changed = false;
+    for (BasicBlock *BB : RPOT) {
+      std::optional<Value *> In = entryState(BB);
+      if (!In)
+        continue;
+      Value *State = *In;
+      for (Instruction &I : *BB)
+        if (!isa<PHINode>(I))
+          State = step(I, State);
+      if (PHINode *PN = EdgeWrites.lookup(BB))
+        State = PN;
+      std::optional<Value *> &O = Out[BB];
+      if (!O || *O != State) {
+        O = State;
+        Changed = true;
+      }
+    }
+  }
+}
+
+// Make each PHI in BlockPhi arrive in the register, writing its incoming value
+// at the end of a block that leads to it alone where needed, or give up on it.
+// Returns true if anything changed.
+bool RegisterPins::fixPhis() {
+  for (auto [BB, PN] : BlockPhi) {
+    SmallVector<BasicBlock *, 4> Missing;
+    bool CanWrite = true;
+    for (BasicBlock *Pred : predecessors(BB)) {
+      std::optional<Value *> O = Out.lookup(Pred);
+      if (O && (*O == PN || *O == PN->getIncomingValueForBlock(Pred)))
+        continue;
+      if (isa<UndefValue>(PN->getIncomingValueForBlock(Pred)))
+        continue;
+      if (Pred->getSingleSuccessor() != BB || EdgeWrites.count(Pred))
+        CanWrite = false;
+      Missing.push_back(Pred);
+    }
+    if (Missing.empty())
+      continue;
+    if (CanWrite) {
+      for (BasicBlock *Pred : Missing)
+        EdgeWrites[Pred] = PN;
+    } else {
+      Group.remove(PN);
+      BlockPhi.erase(BB);
+      for (auto It = EdgeWrites.begin(); It != EdgeWrites.end();)
+        if (It->second == PN)
+          EdgeWrites.erase(It++);
+        else
+          ++It;
+    }
+    return true;
+  }
+  return false;
+}
+
+void RegisterPins::rewrite() {
+  LLVMContext &Ctx = F.getContext();
+  Value *MD =
+      MetadataAsValue::get(Ctx, MDNode::get(Ctx, MDString::get(Ctx, Name)));
+  auto Write = [&](Instruction *At, Value *V) {
+    IRBuilder<> B(At);
+    Type *IntTy = getPinIntType(V->getType(), F.getDataLayout());
+    B.CreateIntrinsic(Intrinsic::write_register, {IntTy},
+                      {MD, B.CreateBitOrPointerCast(V, IntTy)});
+  };
+  auto Read = [&](Instruction *At, Value *V) -> Value * {
+    IRBuilder<> B(At);
+    Type *IntTy = getPinIntType(V->getType(), F.getDataLayout());
+    return B.CreateBitOrPointerCast(
+        B.CreateIntrinsic(Intrinsic::read_register, {IntTy}, {MD}),
+        V->getType());
+  };
+
+  // What the register holds right before each instruction.
+  DenseMap<Instruction *, Value *> Before;
+  for (BasicBlock &BB : F) {
+    std::optional<Value *> In = entryState(&BB);
+    if (!In)
+      continue;
+    Value *State = *In;
+    for (Instruction &I : BB) {
+      if (isa<PHINode>(I))
+        continue;
+      Before[&I] = State;
+      State = step(I, State);
+    }
+  }
+
+  // Where each use reads the register.
+  MapVector<std::pair<BasicBlock *, Value *>, SmallVector<Use *, 4>> Reads;
+  for (Value *V : Group)
+    for (Use &U : V->uses()) {
+      auto *User = cast<Instruction>(U.getUser());
+      if (auto *PN = dyn_cast<PHINode>(User)) {
+        if (Group.contains(PN))
+          continue;
+        BasicBlock *Pred = PN->getIncomingBlock(U);
+        std::optional<Value *> O = Out.lookup(Pred);
+        if (O && *O == V)
+          Reads[{Pred, V}].push_back(&U);
+        continue;
+      }
+      if (Before.lookup(User) == V)
+        Reads[{User->getParent(), V}].push_back(&U);
+    }
+
+  SmallVector<IntrinsicInst *, 8> Pins;
+  for (Value *V : Group)
+    if (auto *II = dyn_cast<IntrinsicInst>(V))
+      Pins.push_back(II);
+  for (IntrinsicInst *II : Pins)
+    Write(II, II->getArgOperand(0));
+  for (auto [Pred, PN] : EdgeWrites)
+    Write(Pred->getTerminator(), PN->getIncomingValueForBlock(Pred));
+
+  for (auto &[Key, Uses] : Reads) {
+    auto [BB, V] = Key;
+    Instruction *At = BB->getTerminator();
+    for (Use *U : Uses) {
+      auto *User = cast<Instruction>(U->getUser());
+      if (!isa<PHINode>(User) && User->comesBefore(At))
+        At = User;
+    }
+    Value *R = Read(At, V);
+    for (Use *U : Uses)
+      U->set(R);
+  }
+
+  for (IntrinsicInst *II : Pins) {
+    II->replaceAllUsesWith(II->getArgOperand(0));
+    II->eraseFromParent();
+  }
+}
+
+bool RegisterPins::run() {
+  for (Instruction &I : instructions(F))
+    if (isRequiredPin(I, Name))
+      Group.insert(&I);
+  if (Group.empty())
+    return false;
+  findPhis();
+  for (unsigned Iter = 0; Iter != 16; ++Iter) {
+    solve();
+    if (!fixPhis())
+      break;
+  }
+  rewrite();
+  return true;
+}
+
+// Lower the required form of llvm.pin.register in \p F to named-register
+// accesses. Each pinned value is written to its register where it is pinned,
+// and a use reads the register instead of the value wherever the register still
+// holds it on every path from the pin: no other value pinned to the register,
+// write_register of it, call or inline asm comes in between. A PHI whose
+// incoming values all arrive in the register is read from it too. Other uses
+// keep the value. Registers with different names are assumed not to overlap.
+static bool lowerRequiredPinRegisters(Function &F) {
+  SmallSetVector<StringRef, 4> Names;
+  bool Changed = false;
+  for (Instruction &I : make_early_inc_range(instructions(F))) {
+    auto *II = dyn_cast<IntrinsicInst>(&I);
+    if (!II || II->getIntrinsicID() != Intrinsic::pin_register ||
+        !cast<ConstantInt>(II->getArgOperand(2))->isOne())
+      continue;
+    StringRef Name = getNamedRegister(II->getArgOperand(1));
+    if (!Name.empty() && isRequiredPin(I, Name)) {
+      Names.insert(Name);
+      continue;
+    }
+    // No register can hold a value of this type as one integer.
+    F.getContext().diagnose(DiagnosticInfoGenericWithLoc(
+        "unsupported type for llvm.pin.register", F, II->getDebugLoc()));
+    II->replaceAllUsesWith(II->getArgOperand(0));
+    II->eraseFromParent();
+    Changed = true;
+  }
+  for (StringRef Name : Names)
+    Changed |= RegisterPins(F, Name).run();
+  return Changed;
+}
+
 bool PreISelIntrinsicLowering::lowerIntrinsics(Module &M) const {
   // Map unique constants to globals.
   DenseMap<Constant *, GlobalVariable *> CMap;
@@ -699,6 +1049,15 @@ bool PreISelIntrinsicLowering::lowerIntrinsics(Module &M) const {
     case Intrinsic::load_relative:
       Changed |= lowerLoadRelative(F);
       break;
+    case Intrinsic::pin_register: {
+      SmallSetVector<Function *, 4> Fns;
+      for (User *U : F.users())
+        if (auto *CI = dyn_cast<CallInst>(U))
+          Fns.insert(CI->getFunction());
+      for (Function *Fn : Fns)
+        Changed |= lowerRequiredPinRegisters(*Fn);
+      break;
+    }
     case Intrinsic::can_load_speculatively:
       Changed |= lowerCanLoadSpeculatively(F, TM);
       break;

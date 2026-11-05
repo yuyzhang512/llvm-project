@@ -1009,6 +1009,12 @@ def int_read_register  : DefaultAttrsIntrinsic<[llvm_anyint_ty],
                              "llvm.read_register">;
 def int_write_register : Intrinsic<[], [llvm_metadata_ty, llvm_anyint_ty],
                                    [IntrNoCallback], "llvm.write_register">;
+def int_pin_register : DefaultAttrsIntrinsic<[llvm_any_ty],
+                                    [LLVMMatchType<0>, llvm_metadata_ty,
+                                     llvm_i1_ty],
+                                    [IntrNoMem, IntrSpeculatable,
+                                     ImmArg<ArgIndex<2>>],
+                                    "llvm.pin.register">;
 def int_write_volatile_register : Intrinsic<[],
                                             [llvm_metadata_ty, llvm_anyint_ty],
                                             [], "llvm.write_volatile_register">;

@@ -217,6 +217,14 @@ void InstrEmitter::CreateVirtualRegisters(SDNode *Node,
         RC = VTRC;
     }
 
+    // PIN_REGISTER is a copy, so its result stays in the class of its source:
+    // a value in a scalar register is not moved just to follow a hint.
+    if (Node->getMachineOpcode() == TargetOpcode::PIN_REGISTER) {
+      Register Src = VRBaseMap.lookup(Node->getOperand(0));
+      if (Src.isVirtual())
+        RC = MRI->getRegClass(Src);
+    }
+
     if (!II.operands().empty() && II.operands()[i].isOptionalDef()) {
       // Optional def must be a physical register.
       VRBase = cast<RegisterSDNode>(Node->getOperand(i-NumResults))->getReg();

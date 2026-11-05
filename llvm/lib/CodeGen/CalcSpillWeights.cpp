@@ -346,12 +346,14 @@ float VirtRegAuxInfo::weightCalcHelper(LiveInterval &LI) {
 
   // Pass all the sorted copy hints to mri.
   if (Hint.size()) {
-    // Remove a generic hint if previously added by target.
-    if (TargetHint.first == 0 && TargetHint.second)
+    // Remove a generic hint if previously added by target. A requested hint
+    // stays first, ahead of the copy hints.
+    bool KeepHint = TargetHint.first != 0 || MRI.hasPinHint(LI.reg());
+    if (!KeepHint && TargetHint.second)
       MRI.clearSimpleHint(LI.reg());
 
-    // Don't add the target-type hint again.
-    Register SkipReg = TargetHint.first != 0 ? TargetHint.second : Register();
+    // Don't add the kept hint again.
+    Register SkipReg = KeepHint ? TargetHint.second : Register();
     SmallVector<CopyHint, 8> RegHints;
     for (const auto &[Reg, Weight] : Hint) {
       if (Reg != SkipReg)

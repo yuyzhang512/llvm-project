@@ -15504,6 +15504,52 @@ found in each target's `getRegisterByName` implementation.
 '`llvm.write_volatile_register`' support for allocatable registers is
 currently only implemented on AArch64.
 
+(int_pin_register)=
+
+#### '`llvm.pin.register`' Intrinsic
+
+##### Syntax:
+
+This is an overloaded intrinsic.
+
+```
+declare i32 @llvm.pin.register.i32(i32 %value, metadata, i1 immarg %required)
+declare <4 x i32> @llvm.pin.register.v4i32(<4 x i32> %value, metadata,
+                                           i1 immarg %required)
+!0 = !{!"v8"}
+```
+
+##### Overview:
+
+The '`llvm.pin.register`' intrinsic asks the register allocator to place a
+value in a named register. The name is given the same way as for
+'`llvm.read_register`'.
+
+##### Semantics:
+
+The intrinsic returns `%value` unchanged. If `%required` is false, the
+result is allocated to the named register where possible, and elsewhere
+otherwise. If `%required` is true, the value is written to the named
+register at the call, and later uses of the result read the register wherever
+it still holds the value on every path from the call: no other value pinned
+to the register, '`llvm.write_register`' of it, call or inline assembly comes
+in between. A PHI whose incoming values all arrive in the register is read
+from it as well, so a loop-carried value stays in the register. Other uses
+take the value from wherever the compiler kept it. Registers with different
+names are assumed not to overlap.
+
+A frontend that keeps a pinned variable in memory can mark its `alloca` with
+`!llvm.pin.register !{!"<name>", i1 <required>}`. When the `alloca` is
+promoted to registers, each value stored to it is first passed through
+'`llvm.pin.register`', so the request survives stores the frontend did not
+see, such as stores through a pointer to the variable.
+
+The value may be an integer, a floating-point value, a pointer, or a vector
+of integers or floating-point values; the required form accesses the register
+as an integer of the same layout. Supported names vary by target and can be
+found in each target's `getRegisterByName` implementation. An unsupported
+name or type results in an error during code generation.
+
 (int_stacksave)=
 
 #### '`llvm.stacksave`' Intrinsic

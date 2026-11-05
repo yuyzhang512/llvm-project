@@ -1476,6 +1476,12 @@ def FAKE_USE : StandardPseudoInstruction {
   let hasSideEffects = 0;
   let isMeta = true;
 }
+def PIN_REGISTER : StandardPseudoInstruction {
+  let OutOperandList = (outs unknown:$dst);
+  let InOperandList = (ins unknown:$src, i32imm:$reg);
+  let AsmString = "";
+  let hasSideEffects = false;
+}
 def PATCHABLE_OP : StandardPseudoInstruction {
   let OutOperandList = (outs);
   let InOperandList = (ins variable_ops);

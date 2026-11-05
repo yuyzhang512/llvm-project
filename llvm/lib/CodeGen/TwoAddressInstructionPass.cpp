@@ -187,6 +187,7 @@ class TwoAddressInstructionImpl {
   bool collectTiedOperands(MachineInstr *MI, TiedOperandMap&);
   void processTiedPairs(MachineInstr *MI, TiedPairList&, unsigned &Dist);
   void eliminateRegSequence(MachineBasicBlock::iterator&);
+  void lowerPinRegister(MachineInstr &MI);
   bool processStatepoint(MachineInstr *MI, TiedOperandMap &TiedOperands);
 
 public:
@@ -1835,6 +1836,11 @@ bool TwoAddressInstructionImpl::run() {
         MadeChange = true;
       }
 
+      if (mi->getOpcode() == TargetOpcode::PIN_REGISTER) {
+        lowerPinRegister(*mi);
+        MadeChange = true;
+      }
+
       DistanceMap.insert(std::make_pair(&*mi, ++Dist));
 
       processCopy(&*mi);
@@ -1985,6 +1991,20 @@ bool TwoAddressInstructionImpl::run() {
 ///
 ///   undef %dst:ssub0 = COPY %v1
 ///   %dst:ssub1 = COPY %v2
+/// Turn PIN_REGISTER into a COPY whose result is hinted to the register.
+void TwoAddressInstructionImpl::lowerPinRegister(MachineInstr &MI) {
+  Register Dst = MI.getOperand(0).getReg();
+  MCRegister PhysReg = MI.getOperand(2).getImm();
+  MI.removeOperand(2);
+  MI.setDesc(TII->get(TargetOpcode::COPY));
+  // The register may be in a larger class than ISel picked, e.g. an AGPR for
+  // a value selected into a VGPR class.
+  if (!MRI->getRegClass(Dst)->contains(PhysReg))
+    MRI->recomputeRegClass(Dst);
+  if (MRI->getRegClass(Dst)->contains(PhysReg))
+    MRI->setPinHint(Dst, PhysReg);
+}
+
 void TwoAddressInstructionImpl::eliminateRegSequence(
     MachineBasicBlock::iterator &MBBI) {
   MachineInstr &MI = *MBBI;

@@ -6953,6 +6953,35 @@ void SelectionDAGBuilder::visitIntrinsicCall(const CallInst &I,
                             RegName, getValue(RegValue)));
     return;
   }
+  case Intrinsic::pin_register: {
+    SDValue Val = getValue(I.getArgOperand(0));
+    const MDNode *MD =
+        cast<MDNode>(cast<MetadataAsValue>(I.getArgOperand(1))->getMetadata());
+    EVT VT = Val.getValueType();
+    // PreISelIntrinsicLowering lowers the required form; this is the hint: the
+    // result prefers the named register.
+    assert(!cast<ConstantInt>(I.getArgOperand(2))->isOne() &&
+           "required llvm.pin.register not lowered before selection");
+    MachineFunction &MF = DAG.getMachineFunction();
+    StringRef Name = cast<MDString>(MD->getOperand(0))->getString();
+    Register PhysReg;
+    if (VT.isSimple() && TLI.isTypeLegal(VT))
+      PhysReg = TLI.getRegisterByName(Name.str().c_str(),
+                                      getLLTForMVT(VT.getSimpleVT()), MF);
+    if (!PhysReg) {
+      I.getContext().diagnose(DiagnosticInfoGenericWithLoc(
+          "invalid register \"" + Name + "\" for llvm.pin.register",
+          *I.getFunction(), I.getDebugLoc()));
+      setValue(&I, Val);
+      return;
+    }
+    setValue(&I,
+             SDValue(DAG.getMachineNode(
+                         TargetOpcode::PIN_REGISTER, sdl, VT, Val,
+                         DAG.getTargetConstant(PhysReg.id(), sdl, MVT::i32)),
+                     0));
+    return;
+  }
   case Intrinsic::write_volatile_register: {
     Value *Reg = I.getArgOperand(0);
     Value *RegValue = I.getArgOperand(1);
