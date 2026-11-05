@@ -15141,6 +15141,41 @@ void Sema::addLifetimeBoundToImplicitThis(CXXMethodDecl *MD) {
       FTL.setParam(I, MD->getParamDecl(I));
 }
 
+bool Sema::getPinnedRegisterRequest(const VarDecl *VD, std::string &Name,
+                                    uint64_t &Bits, const Attr *&A) {
+  // Each attribute that pins a local spells its register its own way.
+  return SemaAMDGPU::getPinnedRegisterRequest(Context, VD, Name, Bits, A);
+}
+
+void Sema::CheckPinnedRegisterVar(VarDecl *VD) {
+  // Device code is checked when compiling for the device.
+  if (getLangOpts().CUDA && !getLangOpts().CUDAIsDevice)
+    return;
+  std::string Name;
+  uint64_t Bits;
+  const Attr *A = nullptr;
+  if (!getPinnedRegisterRequest(VD, Name, Bits, A))
+    return;
+  TargetInfo::PinnedRegister Reg;
+  TargetInfo::PinnedRegisterError E =
+      Context.getTargetInfo().getPinnedRegister(Name, Bits, Reg);
+  switch (E.K) {
+  case TargetInfo::PinnedRegisterError::None:
+    break;
+  case TargetInfo::PinnedRegisterError::Name:
+    Diag(A->getLocation(), diag::err_pinned_reg_invalid) << VD << Name;
+    break;
+  case TargetInfo::PinnedRegisterError::Width:
+    Diag(A->getLocation(), diag::err_pinned_reg_width)
+        << VD << unsigned(Bits / 32) << E.Detail;
+    break;
+  case TargetInfo::PinnedRegisterError::Range:
+    Diag(A->getLocation(), diag::err_pinned_reg_out_of_range)
+        << VD << Name << E.Limit << E.Detail << (E.Limit ? 0 : 1) << E.Target;
+    break;
+  }
+}
+
 void Sema::CheckCompleteVariableDeclaration(VarDecl *var) {
   if (var->isInvalidDecl()) return;
 

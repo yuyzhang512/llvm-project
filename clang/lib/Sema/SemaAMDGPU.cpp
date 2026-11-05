@@ -747,22 +747,65 @@ void SemaAMDGPU::handleAMDGPUNumVGPRAttr(Decl *D, const ParsedAttr &AL) {
                  AMDGPUNumVGPRAttr(getASTContext(), AL, NumVGPR));
 }
 
+uint64_t SemaAMDGPU::getPinnedValueBits(ASTContext &Ctx, QualType T) {
+  if (const auto *VT = T->getAs<VectorType>())
+    return VT->getNumElements() * Ctx.getTypeSize(VT->getElementType());
+  return Ctx.getTypeSize(T);
+}
+
 bool SemaAMDGPU::fillsWholeRegisters(QualType T) {
   if (T->isDependentType() || T->isUndeducedType())
     return true;
-  uint64_t Bits = getASTContext().getTypeSize(T);
+  uint64_t Bits = getPinnedValueBits(getASTContext(), T);
   return Bits != 0 && Bits % 32 == 0;
+}
+
+std::string SemaAMDGPU::getPinnedRegName(bool IsAGPR, unsigned First,
+                                         unsigned Num) {
+  std::string Name = IsAGPR ? "a" : "v";
+  if (Num == 1)
+    return Name + std::to_string(First);
+  return Name + "[" + std::to_string(First) + ":" +
+         std::to_string(First + Num - 1) + "]";
+}
+
+bool SemaAMDGPU::getPinnedRegisterRequest(ASTContext &Ctx, const VarDecl *VD,
+                                          std::string &Name, uint64_t &Bits,
+                                          const Attr *&A) {
+  const Expr *RegE = nullptr;
+  bool IsAGPR = false;
+  if (const auto *V = VD->getAttr<AMDGPUPinVGPRAttr>()) {
+    A = V;
+    RegE = V->getReg();
+  } else if (const auto *G = VD->getAttr<AMDGPUPinAGPRAttr>()) {
+    A = G;
+    RegE = G->getReg();
+    IsAGPR = true;
+  }
+  if (!RegE || RegE->isValueDependent() || VD->getType()->isDependentType() ||
+      VD->getType()->isUndeducedType())
+    return false;
+  Bits = getPinnedValueBits(Ctx, VD->getType());
+  if (!Bits || Bits % 32)
+    return false;
+  Name = getPinnedRegName(
+      IsAGPR, RegE->EvaluateKnownConstInt(Ctx).getZExtValue(), Bits / 32);
+  return true;
 }
 
 void SemaAMDGPU::checkPinnedRegVarType(VarDecl *VD) {
   const Attr *A = VD->getAttr<AMDGPUPinVGPRAttr>();
   if (!A)
     A = VD->getAttr<AMDGPUPinAGPRAttr>();
-  if (!A || fillsWholeRegisters(VD->getType()))
+  if (!A)
     return;
-  Diag(A->getLocation(), diag::warn_attribute_ignored) << A;
-  VD->dropAttr<AMDGPUPinVGPRAttr>();
-  VD->dropAttr<AMDGPUPinAGPRAttr>();
+  if (!fillsWholeRegisters(VD->getType())) {
+    Diag(A->getLocation(), diag::warn_attribute_ignored) << A;
+    VD->dropAttr<AMDGPUPinVGPRAttr>();
+    VD->dropAttr<AMDGPUPinAGPRAttr>();
+    return;
+  }
+  SemaRef.CheckPinnedRegisterVar(VD);
 }
 
 void SemaAMDGPU::addAMDGPUPinRegAttr(Decl *D, const AttributeCommonInfo &CI,
@@ -795,6 +838,7 @@ void SemaAMDGPU::addAMDGPUPinRegAttr(Decl *D, const AttributeCommonInfo &CI,
     E = R.get();
   }
 
+  SemaRef.HasPinnedRegisterVars = true;
   if (IsAGPR)
     D->addAttr(::new (getASTContext())
                    AMDGPUPinAGPRAttr(getASTContext(), CI, E));

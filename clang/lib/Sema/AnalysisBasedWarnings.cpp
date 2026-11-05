@@ -33,6 +33,7 @@
 #include "clang/Analysis/Analyses/CalledOnceCheck.h"
 #include "clang/Analysis/Analyses/Consumed.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/LifetimeSafety.h"
+#include "clang/Analysis/Analyses/LiveVariables.h"
 #include "clang/Analysis/Analyses/ReachableCode.h"
 #include "clang/Analysis/Analyses/ThreadSafety.h"
 #include "clang/Analysis/Analyses/UninitializedValues.h"
@@ -45,6 +46,7 @@
 #include "clang/Basic/DiagnosticSema.h"
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Basic/TargetInfo.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Sema/ScopeInfo.h"
 #include "clang/Sema/SemaInternal.h"
@@ -3161,6 +3163,181 @@ void clang::sema::AnalysisBasedWarnings::IssueWarningsForImplicitFunction(
                                          LSStats, S.CollectStats);
 }
 
+//===----------------------------------------------------------------------===//
+// Checks on locals pinned to registers, for any target that pins them.
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct PinnedReg {
+  const VarDecl *VD;
+  TargetInfo::PinnedRegister Reg;
+  std::string Name;
+};
+} // namespace
+
+// The locals of \p D pinned to registers the target accepts. Lambdas are
+// their own functions and are checked on their own.
+static SmallVector<PinnedReg> collectPinnedRegs(Sema &S, const Stmt *Body) {
+  SmallVector<PinnedReg> Regs;
+  SmallVector<const Stmt *> Work{Body};
+  while (!Work.empty()) {
+    const Stmt *St = Work.pop_back_val();
+    if (!St || isa<LambdaExpr>(St))
+      continue;
+    if (const auto *DS = dyn_cast<DeclStmt>(St))
+      for (const Decl *Dcl : DS->decls()) {
+        const auto *VD = dyn_cast<VarDecl>(Dcl);
+        std::string Name;
+        uint64_t Bits;
+        const Attr *A;
+        TargetInfo::PinnedRegister Reg;
+        if (VD && S.getPinnedRegisterRequest(VD, Name, Bits, A) &&
+            S.getASTContext()
+                    .getTargetInfo()
+                    .getPinnedRegister(Name, Bits, Reg)
+                    .K == TargetInfo::PinnedRegisterError::None)
+          Regs.push_back({VD, Reg, Name});
+      }
+    for (const Stmt *Child : St->children())
+      Work.push_back(Child);
+  }
+  return Regs;
+}
+
+// The pinned local a statement writes, if any.
+static const VarDecl *
+getPinnedWrite(const Stmt *St,
+               const llvm::DenseMap<const VarDecl *, unsigned> &Idx) {
+  auto Base = [&](const Expr *E) -> const VarDecl * {
+    while (true) {
+      E = E->IgnoreParenImpCasts();
+      if (const auto *EV = dyn_cast<ExtVectorElementExpr>(E))
+        E = EV->getBase();
+      else if (const auto *AS = dyn_cast<ArraySubscriptExpr>(E))
+        E = AS->getBase();
+      else if (const auto *ME = dyn_cast<MemberExpr>(E))
+        E = ME->getBase();
+      else
+        break;
+    }
+    const auto *DRE = dyn_cast<DeclRefExpr>(E);
+    const auto *VD = DRE ? dyn_cast<VarDecl>(DRE->getDecl()) : nullptr;
+    return VD && Idx.count(VD) ? VD : nullptr;
+  };
+  if (const auto *DS = dyn_cast<DeclStmt>(St)) {
+    for (const Decl *D : DS->decls())
+      if (const auto *VD = dyn_cast<VarDecl>(D);
+          VD && VD->hasInit() && Idx.count(VD))
+        return VD;
+    return nullptr;
+  }
+  if (const auto *BO = dyn_cast<BinaryOperator>(St))
+    return BO->isAssignmentOp() ? Base(BO->getLHS()) : nullptr;
+  if (const auto *UO = dyn_cast<UnaryOperator>(St))
+    return UO->isIncrementDecrementOp() ? Base(UO->getSubExpr()) : nullptr;
+  if (const auto *OC = dyn_cast<CXXOperatorCallExpr>(St))
+    return OC->isAssignmentOp() ? Base(OC->getArg(0)) : nullptr;
+  return nullptr;
+}
+
+// A call that is not inlined, so it can clobber caller-saved registers.
+static bool isRealCall(const Stmt *St) {
+  const FunctionDecl *FD;
+  if (const auto *CE = dyn_cast<CallExpr>(St)) {
+    if (CE->getBuiltinCallee())
+      return false;
+    FD = CE->getDirectCallee();
+  } else if (const auto *CE = dyn_cast<CXXConstructExpr>(St)) {
+    FD = CE->getConstructor();
+    if (FD->isTrivial())
+      return false;
+  } else {
+    return false;
+  }
+  return !FD || !FD->hasAttr<AlwaysInlineAttr>();
+}
+
+// Two pinned locals whose registers overlap cannot both hold their values, so
+// writing one while the other is used later clobbers it. A call that is not
+// inlined clobbers the caller-saved registers.
+static void checkPinnedRegs(Sema &S, AnalysisDeclContext &AC,
+                            ArrayRef<PinnedReg> Regs, bool CheckOverlap,
+                            bool CheckCalls) {
+  auto Overlap = [](const PinnedReg &A, const PinnedReg &B) {
+    return A.Reg.File == B.Reg.File &&
+           A.Reg.First < B.Reg.First + B.Reg.Count &&
+           B.Reg.First < A.Reg.First + A.Reg.Count;
+  };
+  bool AnyOverlap = false;
+  for (unsigned I = 0; I != Regs.size() && CheckOverlap && !AnyOverlap; ++I)
+    for (unsigned J = I + 1; J != Regs.size() && !AnyOverlap; ++J)
+      AnyOverlap = Overlap(Regs[I], Regs[J]);
+  SmallVector<bool> CallerSaved;
+  bool AnyCallerSaved = false;
+  for (const PinnedReg &R : Regs) {
+    CallerSaved.push_back(
+        CheckCalls &&
+        !S.getASTContext().getTargetInfo().isCalleeSavedPinnedRegister(R.Reg));
+    AnyCallerSaved |= CallerSaved.back();
+  }
+  if ((!AnyOverlap && !AnyCallerSaved) || !AC.getCFG())
+    return;
+  LiveVariables *LV = AC.getAnalysis<LiveVariables>();
+  if (!LV)
+    return;
+  llvm::DenseMap<const VarDecl *, unsigned> Idx;
+  for (unsigned I = 0; I != Regs.size(); ++I)
+    Idx[Regs[I].VD] = I;
+
+  llvm::SmallDenseSet<std::pair<unsigned, unsigned>, 4> Reported;
+  llvm::SmallDenseSet<unsigned, 4> ReportedCall;
+  for (const CFGBlock *B : *AC.getCFG()) {
+    for (auto It = B->begin(), E = B->end(); It != E; ++It) {
+      std::optional<CFGStmt> CS = It->getAs<CFGStmt>();
+      if (!CS)
+        continue;
+      const Stmt *St = CS->getStmt();
+      const VarDecl *W = AnyOverlap ? getPinnedWrite(St, Idx) : nullptr;
+      bool IsCall = AnyCallerSaved && isRealCall(St);
+      if (!W && !IsCall)
+        continue;
+      // Liveness right after the statement: at the next statement of the
+      // block, or at the end of the block.
+      const Stmt *Next = nullptr;
+      for (auto N = std::next(It); N != E && !Next; ++N)
+        if (std::optional<CFGStmt> NS = N->getAs<CFGStmt>())
+          Next = NS->getStmt();
+      auto LiveAfter = [&](const VarDecl *VD) {
+        return Next ? LV->isLive(Next, VD) : LV->isLive(B, VD);
+      };
+      if (IsCall)
+        for (unsigned I = 0; I != Regs.size(); ++I) {
+          if (!CallerSaved[I] || !LiveAfter(Regs[I].VD) ||
+              !ReportedCall.insert(I).second)
+            continue;
+          S.Diag(St->getBeginLoc(), diag::warn_pinned_reg_call)
+              << Regs[I].VD << Regs[I].Name;
+          S.Diag(Regs[I].VD->getLocation(), diag::note_pinned_reg_call_fix)
+              << Regs[I].VD;
+        }
+      if (!W)
+        continue;
+      unsigned WI = Idx[W];
+      for (unsigned OI = 0; OI != Regs.size(); ++OI) {
+        if (OI == WI || !Overlap(Regs[WI], Regs[OI]))
+          continue;
+        const VarDecl *O = Regs[OI].VD;
+        if (!LiveAfter(O) || !Reported.insert({WI, OI}).second)
+          continue;
+        S.Diag(St->getBeginLoc(), diag::warn_pinned_reg_clobber)
+            << W << Regs[WI].Name << O << Regs[OI].Name;
+        S.Diag(O->getLocation(), diag::note_pinned_reg_declared)
+            << O << Regs[OI].Name;
+      }
+    }
+  }
+}
+
 void clang::sema::AnalysisBasedWarnings::IssueWarnings(
     sema::AnalysisBasedWarnings::Policy P, sema::FunctionScopeInfo *fscope,
     const Decl *D, QualType BlockType) {
@@ -3201,6 +3378,16 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
 
   bool EnableLifetimeSafetyAnalysis = lifetimes::IsLifetimeSafetyEnabled(S, D);
 
+  bool CheckPinnedOverlap =
+      !Diags.isIgnored(diag::warn_pinned_reg_clobber, D->getBeginLoc());
+  bool CheckPinnedCalls =
+      !Diags.isIgnored(diag::warn_pinned_reg_call, D->getBeginLoc());
+  SmallVector<PinnedReg> PinnedRegs;
+  if (S.HasPinnedRegisterVars &&
+      !(S.getLangOpts().CUDA && !S.getLangOpts().CUDAIsDevice) &&
+      (CheckPinnedOverlap || CheckPinnedCalls))
+    PinnedRegs = collectPinnedRegs(S, Body);
+
   // Force that certain expressions appear as CFGElements in the CFG.  This
   // is used to speed up various analyses.
   // FIXME: This isn't the right factoring.  This is here for initial
@@ -3208,7 +3395,8 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
   // expect to always be CFGElements and then fill in the BuildOptions
   // appropriately.  This is essentially a layering violation.
   if (P.enableCheckUnreachable || P.enableThreadSafetyAnalysis ||
-      P.enableConsumedAnalysis || EnableLifetimeSafetyAnalysis) {
+      P.enableConsumedAnalysis || EnableLifetimeSafetyAnalysis ||
+      !PinnedRegs.empty()) {
     // Unreachable code analysis and thread safety require a linearized CFG.
     AC.getCFGBuildOptions().setAllAlwaysAdd();
   } else {
@@ -3230,6 +3418,9 @@ void clang::sema::AnalysisBasedWarnings::IssueWarnings(
     LEH.emplace(S);
     AC.getCFGBuildOptions().Observer = &*LEH;
   }
+
+  if (!PinnedRegs.empty())
+    checkPinnedRegs(S, AC, PinnedRegs, CheckPinnedOverlap, CheckPinnedCalls);
 
   // Emit delayed diagnostics.
   auto &PUDs = fscope->PossiblyUnreachableDiags;

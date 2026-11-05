@@ -3623,13 +3623,18 @@ void CodeGenFunction::EmitPinnedRegisterWriteBack(Address Addr) {
 
 /// Build the l-value for a local with amdgpu_pin_{vgpr,agpr}. The attribute
 /// gives the first register and the type gives how many, so a four-dword value
-/// pinned to 256 names v[256:259].
+/// pinned to 256 names v[256:259]. A vector's padding takes no register.
 LValue CodeGenFunction::EmitAMDGPUPinnedRegister(const VarDecl *VD) {
   bool IsAGPR = VD->hasAttr<AMDGPUPinAGPRAttr>();
   const Expr *RegE = IsAGPR ? VD->getAttr<AMDGPUPinAGPRAttr>()->getReg()
                             : VD->getAttr<AMDGPUPinVGPRAttr>()->getReg();
   unsigned Reg = RegE->EvaluateKnownConstInt(getContext()).getZExtValue();
-  unsigned NumRegs = getContext().getTypeSize(VD->getType()) / 32;
+  QualType T = VD->getType();
+  uint64_t Bits = getContext().getTypeSize(T);
+  if (const auto *VT = T->getAs<VectorType>())
+    Bits =
+        VT->getNumElements() * getContext().getTypeSize(VT->getElementType());
+  unsigned NumRegs = Bits / 32;
 
   SmallString<16> RegName;
   llvm::raw_svector_ostream OS(RegName);

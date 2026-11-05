@@ -14443,6 +14443,22 @@ def note_acc_reduction_combiner_forming
            "operator|final assignment operator}0">;
 
 // AMDGCN type diagnostics
+def err_pinned_reg_invalid : Error<
+  "%0 cannot be pinned to %1 on this target">;
+def err_pinned_reg_out_of_range : Error<
+  "%0 is pinned to %1, %select{past the %2 %3|but there are no %3}4 on %5">;
+def err_pinned_reg_width : Error<
+  "%0 takes %1 registers; a pinned value must take %2">;
+def warn_pinned_reg_clobber : Warning<
+  "writing %0 (%1) clobbers %2 (%3), which is used later">,
+  InGroup<DiagGroup<"pinned-register-overlap">>;
+def note_pinned_reg_declared : Note<"%0 is pinned to %1 here">;
+def warn_pinned_reg_call : Warning<
+  "call may clobber %0 (%1), which is used after it">,
+  InGroup<DiagGroup<"pinned-register-call">>;
+def note_pinned_reg_call_fix : Note<
+  "make the callee always_inline, or pin %0 to callee-saved registers">;
+
 def err_amdgpu_target_ext_type_unsupported : Error<
   "AMDGPU built-in type %0 is not supported on target '%1'">;
 

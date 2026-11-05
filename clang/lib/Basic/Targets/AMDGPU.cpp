@@ -192,6 +192,83 @@ void AMDGPUTargetInfo::fillValidCPUList(
     llvm::AMDGPU::fillValidArchListR600(Values);
 }
 
+// Register file numbers for pinned registers.
+enum { PinFileVGPR = 0, PinFileAGPR = 1 };
+
+// "v8", "v[8:11]", "a[16:19]": the file, first register and count.
+static bool parsePinnedRegName(StringRef Name, unsigned &File, unsigned &First,
+                               unsigned &Count) {
+  if (Name.consume_front("v"))
+    File = PinFileVGPR;
+  else if (Name.consume_front("a"))
+    File = PinFileAGPR;
+  else
+    return false;
+  unsigned Last;
+  if (Name.consume_front("[")) {
+    auto [Lo, Hi] = Name.split(':');
+    if (!Hi.consume_back("]") || Lo.getAsInteger(10, First) ||
+        Hi.getAsInteger(10, Last) || Last < First)
+      return false;
+  } else {
+    if (Name.getAsInteger(10, First))
+      return false;
+    Last = First;
+  }
+  Count = Last - First + 1;
+  return true;
+}
+
+TargetInfo::PinnedRegisterError
+AMDGPUTargetInfo::getPinnedRegister(StringRef Name, uint64_t Bits,
+                                    PinnedRegister &Reg) const {
+  PinnedRegisterError E;
+  if (!getTriple().isAMDGCN() || GPUKind == llvm::AMDGPU::GK_NONE ||
+      !parsePinnedRegName(Name, Reg.File, Reg.First, Reg.Count) ||
+      Bits != uint64_t(Reg.Count) * 32) {
+    E.K = PinnedRegisterError::Name;
+    return E;
+  }
+  // The backend names tuples of these sizes.
+  if (Reg.Count > 4 && Reg.Count != 8 && Reg.Count != 16) {
+    E.K = PinnedRegisterError::Width;
+    E.Detail = "1, 2, 3, 4, 8, or 16";
+    return E;
+  }
+  const auto &Features = llvm::AMDGPU::getFeatureBitset(GPUKind);
+  bool IsWave32 = Features.test(llvm::AMDGPU::FEAT_SUPPORTS_WAVE32) &&
+                  !getTargetOpts().FeatureMap.lookup("wavefrontsize64");
+  // With a unified register file, the addressable count covers both files.
+  unsigned NumRegs = 256;
+  if (!Features.test(llvm::AMDGPU::FEAT_GFX90A_INSTS)) {
+    if (Reg.File == PinFileVGPR)
+      NumRegs = llvm::AMDGPU::getAddressableNumVGPRs(GPUKind, IsWave32);
+    else if (!Features.test(llvm::AMDGPU::FEAT_MAI_INSTS))
+      NumRegs = 0;
+  }
+  if (Reg.First + Reg.Count > NumRegs) {
+    E.K = PinnedRegisterError::Range;
+    E.Limit = NumRegs;
+    E.Detail = Reg.File == PinFileVGPR ? "VGPRs" : "AGPRs";
+    E.Target = llvm::AMDGPU::getArchNameAMDGCN(GPUKind).str();
+  }
+  return E;
+}
+
+// Matches CSR_AMDGPU_VGPRs and CSR_AMDGPU_AGPRs in AMDGPUCallingConv.td.
+bool AMDGPUTargetInfo::isCalleeSavedPinnedRegister(
+    const PinnedRegister &Reg) const {
+  unsigned Last = Reg.First + Reg.Count - 1;
+  if (Reg.File == PinFileAGPR)
+    return llvm::AMDGPU::getFeatureBitset(GPUKind).test(
+               llvm::AMDGPU::FEAT_GFX90A_INSTS) &&
+           Reg.First >= 32 && Last < 256;
+  for (unsigned R = Reg.First; R <= Last; ++R)
+    if (R < 40 || R >= 256 || R % 16 < 8)
+      return false;
+  return true;
+}
+
 AMDGPUTargetInfo::AMDGPUTargetInfo(const llvm::Triple &Triple,
                                    const TargetOptions &Opts)
     : TargetInfo(Triple),

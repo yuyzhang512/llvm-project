@@ -94,6 +94,10 @@ class LLVM_LIBRARY_VISIBILITY AMDGPUTargetInfo final : public TargetInfo {
 public:
   AMDGPUTargetInfo(const llvm::Triple &Triple, const TargetOptions &Opts);
 
+  PinnedRegisterError getPinnedRegister(StringRef Name, uint64_t Bits,
+                                        PinnedRegister &Reg) const override;
+  bool isCalleeSavedPinnedRegister(const PinnedRegister &Reg) const override;
+
   void adjust(DiagnosticsEngine &Diags, LangOptions &Opts,
               const TargetInfo *Aux) override;
 

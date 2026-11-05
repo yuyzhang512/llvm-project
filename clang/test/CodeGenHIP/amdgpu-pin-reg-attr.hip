@@ -26,10 +26,10 @@ __global__ void scalar(const int *in, int *out) {
 // the intrinsic as 32-bit lanes because it is declared only over integers.
 // CHECK-LABEL: define {{.*}}void @_Z4widePKDv4_fPS_(
 // CHECK-NOT: alloca
-// CHECK: call void @llvm.write_register.v4i32(metadata ![[V256:[0-9]+]], <4 x i32>
-// CHECK: call <4 x i32> @llvm.read_register.v4i32(metadata ![[V256]])
+// CHECK: call void @llvm.write_register.v4i32(metadata ![[V128:[0-9]+]], <4 x i32>
+// CHECK: call <4 x i32> @llvm.read_register.v4i32(metadata ![[V128]])
 __global__ void wide(const float4 *in, float4 *out) {
-  __attribute__((amdgpu_pin_vgpr(256))) float4 acc;
+  __attribute__((amdgpu_pin_vgpr(128))) float4 acc;
   acc = in[0];
   out[0] = acc;
 }
@@ -55,6 +55,16 @@ __global__ void element(float4 *out, int i) {
   out[1] = acc;
 }
 
+// A three-element vector takes three registers; its padding takes none.
+// CHECK-LABEL: define {{.*}}void @_Z5threePKDv3_fPS_(
+// CHECK: call void @llvm.write_register.v3i32(metadata ![[V20:[0-9]+]], <3 x i32>
+typedef float float3 __attribute__((ext_vector_type(3)));
+__global__ void three(const float3 *in, float3 *out) {
+  __attribute__((amdgpu_pin_vgpr(20))) float3 acc;
+  acc = in[0];
+  out[0] = acc;
+}
+
 // An AGPR request names the other file.
 // CHECK-LABEL: define {{.*}}void @_Z4agprPKDv4_fPS_(
 // CHECK: call void @llvm.write_register.v4i32(metadata ![[A16:[0-9]+]], <4 x i32>
@@ -67,16 +77,16 @@ __global__ void agpr(const float4 *in, float4 *out) {
 // A dependent register number is substituted and re-checked per instantiation,
 // so a template can compute the register from its arguments.
 // CHECK-LABEL: define {{.*}}void @_Z6calleriPi(
-// CHECK: call void @llvm.write_register.i32(metadata ![[T264:[0-9]+]], i32
-// CHECK: call void @llvm.write_register.i32(metadata ![[T520:[0-9]+]], i32
+// CHECK: call void @llvm.write_register.i32(metadata ![[T136:[0-9]+]], i32
+// CHECK: call void @llvm.write_register.i32(metadata ![[T208:[0-9]+]], i32
 template <int Base> __device__ int pin_at(int i) {
   __attribute__((amdgpu_pin_vgpr(Base + 8))) int acc;
   acc = i;
   return acc + 1;
 }
 __global__ void caller(int i, int *out) {
-  out[0] = pin_at<256>(i);
-  out[1] = pin_at<512>(i);
+  out[0] = pin_at<128>(i);
+  out[1] = pin_at<200>(i);
 }
 
 // An initializer is written straight to the register.
@@ -123,13 +133,14 @@ template <int Base> __device__ void per_tile(float4 *out) {
 __global__ void tiles(float4 *out) { per_tile<32>(out); }
 
 // CHECK-DAG: ![[V8]] = !{!"v8"}
-// CHECK-DAG: ![[V256]] = !{!"v[256:259]"}
+// CHECK-DAG: ![[V128]] = !{!"v[128:131]"}
 // CHECK-DAG: ![[V24]] = !{!"v[24:27]"}
+// CHECK-DAG: ![[V20]] = !{!"v[20:22]"}
 // CHECK-DAG: ![[A16]] = !{!"a[16:19]"}
 // CHECK-DAG: ![[V64]] = !{!"v[64:67]"}
 // CHECK-DAG: ![[T0]] = !{!"v[32:35]"}
 // CHECK-DAG: ![[T1]] = !{!"v[36:39]"}
 // CHECK-DAG: ![[V4]] = !{!"v4"}
-// CHECK-DAG: ![[T264]] = !{!"v264"}
-// CHECK-DAG: ![[T520]] = !{!"v520"}
+// CHECK-DAG: ![[T136]] = !{!"v136"}
+// CHECK-DAG: ![[T208]] = !{!"v208"}
 

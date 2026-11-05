@@ -88,6 +88,20 @@ public:
   /// whole registers. Covers types deduced after the attribute was attached.
   void checkPinnedRegVarType(VarDecl *VD);
 
+  /// The register name of a local pinned to \p Num registers from \p First,
+  /// e.g. "v8" or "a[4:7]".
+  static std::string getPinnedRegName(bool IsAGPR, unsigned First,
+                                      unsigned Num);
+
+  /// The bits a pinned value of type \p T occupies. A vector's padding is not
+  /// part of the value, so a float3 takes three registers.
+  static uint64_t getPinnedValueBits(ASTContext &Ctx, QualType T);
+
+  /// Sema::getPinnedRegisterRequest for amdgpu_pin_{vgpr,agpr}.
+  static bool getPinnedRegisterRequest(ASTContext &Ctx, const VarDecl *VD,
+                                       std::string &Name, uint64_t &Bits,
+                                       const Attr *&A);
+
 private:
   bool fillsWholeRegisters(QualType T);
 

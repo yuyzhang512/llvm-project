@@ -1237,6 +1237,49 @@ public:
     }
   };
 
+  /// A range of registers a local variable is pinned to: registers First to
+  /// First + Count - 1 of register file File.
+  struct PinnedRegister {
+    unsigned File = 0;
+    unsigned First = 0;
+    unsigned Count = 0;
+  };
+
+  /// Why a local variable cannot be pinned to a register.
+  struct PinnedRegisterError {
+    enum Kind {
+      None,
+      /// The target cannot pin to a register of that name.
+      Name,
+      /// The target has no register tuple that size. Detail lists the sizes
+      /// it has.
+      Width,
+      /// The registers run past the end of their register file. Limit is the
+      /// size of the file (0 if the target has none), Detail its name.
+      Range,
+    } K = None;
+    unsigned Limit = 0;
+    std::string Detail;
+    /// The processor, for the message.
+    std::string Target;
+  };
+
+  /// Check that a local variable of \p Bits bits can be pinned to the
+  /// register named \p Name, spelled as for llvm.read_register, and fill in
+  /// \p Reg. Overlap and liveness checks between pinned variables are done by
+  /// Sema on the returned ranges.
+  virtual PinnedRegisterError getPinnedRegister(StringRef Name, uint64_t Bits,
+                                                PinnedRegister &Reg) const {
+    PinnedRegisterError E;
+    E.K = PinnedRegisterError::Name;
+    return E;
+  }
+
+  /// Whether a call preserves the registers \p Reg.
+  virtual bool isCalleeSavedPinnedRegister(const PinnedRegister &Reg) const {
+    return false;
+  }
+
   /// Validate register name used for global register variables.
   ///
   /// This function returns true if the register passed in RegName can be used
