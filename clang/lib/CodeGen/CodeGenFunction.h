@@ -4598,6 +4598,9 @@ public:
   /// If \p Addr is a pinned local kept in an alloca, pin \p Value, which is
   /// about to be stored there.
   llvm::Value *EmitPinnedStoreValue(llvm::Value *Value, Address Addr);
+  /// If \p Addr is a pinned local kept in an alloca, mark \p Store with
+  /// !llvm.pin.register.
+  void EmitPinnedStoreMetadata(llvm::StoreInst *Store, Address Addr);
   LValue EmitStringLiteralLValue(const StringLiteral *E);
   LValue EmitObjCEncodeExprLValue(const ObjCEncodeExpr *E);
   LValue EmitPredefinedLValue(const PredefinedExpr *E);

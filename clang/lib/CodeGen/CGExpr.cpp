@@ -2488,6 +2488,7 @@ void CodeGenFunction::EmitStoreOfScalar(llvm::Value *Value, Address Addr,
 
   llvm::StoreInst *Store = Builder.CreateStore(Value, Addr, Volatile);
   addInstToCurrentSourceAtom(Store, Value);
+  EmitPinnedStoreMetadata(Store, Addr);
 
   if (isNontemporal) {
     llvm::MDNode *Node =
@@ -2886,6 +2887,7 @@ void CodeGenFunction::EmitStoreThroughLValue(RValue Src, LValue Dst,
       Vec = EmitPinnedStoreValue(Vec, Dst.getVectorAddress());
       auto *I = Builder.CreateStore(Vec, Dst.getVectorAddress(),
                                     Dst.isVolatileQualified());
+      EmitPinnedStoreMetadata(I, Dst.getVectorAddress());
       addInstToCurrentSourceAtom(I, Vec);
       EmitPinnedRegisterWriteBack(Dst.getVectorAddress());
       return;
@@ -3269,8 +3271,9 @@ void CodeGenFunction::EmitStoreThroughExtVectorComponentLValue(RValue Src,
   }
 
   Vec = EmitPinnedStoreValue(Vec, Dst.getExtVectorAddress());
-  Builder.CreateStore(Vec, Dst.getExtVectorAddress(),
-                      Dst.isVolatileQualified());
+  llvm::StoreInst *Store = Builder.CreateStore(Vec, Dst.getExtVectorAddress(),
+                                               Dst.isVolatileQualified());
+  EmitPinnedStoreMetadata(Store, Dst.getExtVectorAddress());
   EmitPinnedRegisterWriteBack(Dst.getExtVectorAddress());
 }
 
@@ -3645,13 +3648,30 @@ llvm::Value *CodeGenFunction::EmitPinnedStoreValue(llvm::Value *Value,
   if (PinnedLocals.empty())
     return Value;
   const VarDecl *VD = PinnedLocals.lookup(Addr.getBasePointer());
-  if (!VD)
+  if (!VD || getLangOpts().PinRegisterLowering !=
+                 LangOptions::PinRegisterLoweringKind::Intrinsic)
     return Value;
   llvm::Value *Name =
       llvm::MetadataAsValue::get(getLLVMContext(), getAMDGPUPinnedRegName(VD));
   return Builder.CreateIntrinsic(
       llvm::Intrinsic::pin_register, {Value->getType()},
       {Value, Name, Builder.getInt1(!getLangOpts().PinRegisterHint)});
+}
+
+void CodeGenFunction::EmitPinnedStoreMetadata(llvm::StoreInst *Store,
+                                              Address Addr) {
+  if (PinnedLocals.empty() ||
+      getLangOpts().PinRegisterLowering !=
+          LangOptions::PinRegisterLoweringKind::Metadata)
+    return;
+  const VarDecl *VD = PinnedLocals.lookup(Addr.getBasePointer());
+  if (!VD)
+    return;
+  llvm::Metadata *Ops[] = {getAMDGPUPinnedRegName(VD)->getOperand(0),
+                           llvm::ConstantAsMetadata::get(Builder.getInt1(
+                               !getLangOpts().PinRegisterHint))};
+  Store->setMetadata("llvm.pin.register",
+                     llvm::MDNode::get(getLLVMContext(), Ops));
 }
 
 llvm::MDNode *CodeGenFunction::getAMDGPUPinnedRegName(const VarDecl *VD) {

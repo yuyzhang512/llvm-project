@@ -1342,12 +1342,12 @@ def fgpu_default_stream_EQ : Joined<["-"], "fgpu-default-stream=">,
 
 def fpin_register_lowering_EQ : Joined<["-"], "fpin-register-lowering=">,
   HelpText<"How to emit a local pinned to a register: 'named-register' (no "
-           "storage) or 'intrinsic' (an alloca whose stored values are "
-           "pinned)">,
+           "storage), 'intrinsic' (an alloca whose stored values are pinned) "
+           "or 'metadata' (an alloca whose stores are marked)">,
   Visibility<[CC1Option]>,
-  Values<"named-register,intrinsic">,
+  Values<"named-register,intrinsic,metadata">,
   NormalizedValuesScope<"LangOptions::PinRegisterLoweringKind">,
-  NormalizedValues<["NamedRegister", "Intrinsic"]>,
+  NormalizedValues<["NamedRegister", "Intrinsic", "Metadata"]>,
   MarshallingInfoEnum<LangOpts<"PinRegisterLowering">, "NamedRegister">;
 def fpin_register_hint : Flag<["-"], "fpin-register-hint">,
   HelpText<"Make the pins of locals kept in memory allocation hints">,

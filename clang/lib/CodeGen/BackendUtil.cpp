@@ -107,6 +107,7 @@
 #include "llvm/Transforms/Utils/AssignGUID.h"
 #include "llvm/Transforms/Utils/Debugify.h"
 #include "llvm/Transforms/Utils/DynamicDebugging.h"
+#include "llvm/Transforms/Utils/LowerPinRegisterMetadata.h"
 #include "llvm/Transforms/Utils/Mem2Reg.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include <limits>
@@ -943,6 +944,17 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
   SI.registerCallbacks(PIC, &MAM);
   PassBuilder PB(TheModule->getContext(), TM.get(), PTO, PGOOpt, &PIC,
                  CI.getVirtualFileSystemPtr());
+
+  // Turn !llvm.pin.register into llvm.pin.register before the optimizer can
+  // drop it.
+  SmallVector<StringRef> MDKinds;
+  TheModule->getContext().getMDKindNames(MDKinds);
+  if (llvm::is_contained(MDKinds, "llvm.pin.register"))
+    PB.registerPipelineStartEPCallback([](ModulePassManager &MPM,
+                                          OptimizationLevel) {
+      MPM.addPass(
+          createModuleToFunctionPassAdaptor(LowerPinRegisterMetadataPass()));
+    });
 
   // Handle the assignment tracking feature options.
   switch (CodeGenOpts.getAssignmentTrackingMode()) {
