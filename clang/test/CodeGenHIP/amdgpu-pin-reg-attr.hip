@@ -34,6 +34,27 @@ __global__ void wide(const float4 *in, float4 *out) {
   out[0] = acc;
 }
 
+// An element write reads the register, inserts the element and writes the
+// register back.
+// CHECK-LABEL: define {{.*}}void @_Z7elementPDv4_fi(
+// CHECK-NOT: alloca
+// CHECK: %[[R0:.*]] = tail call <4 x i32> @llvm.read_register.v4i32(metadata ![[V24:[0-9]+]])
+// CHECK: %[[F0:.*]] = bitcast <4 x i32> %[[R0]] to <4 x float>
+// CHECK: %[[I0:.*]] = insertelement <4 x float> %[[F0]], float %{{.*}}, i64 0
+// CHECK: %[[B0:.*]] = bitcast <4 x float> %[[I0]] to <4 x i32>
+// CHECK: call void @llvm.write_register.v4i32(metadata ![[V24]], <4 x i32> %[[B0]])
+// CHECK: %[[R1:.*]] = tail call <4 x i32> @llvm.read_register.v4i32(metadata ![[V24]])
+// CHECK: %[[F1:.*]] = bitcast <4 x i32> %[[R1]] to <4 x float>
+// CHECK: %[[I1:.*]] = insertelement <4 x float> %[[F1]], float 2.000000e+00, i32 %i
+// CHECK: %[[B1:.*]] = bitcast <4 x float> %[[I1]] to <4 x i32>
+// CHECK: call void @llvm.write_register.v4i32(metadata ![[V24]], <4 x i32> %[[B1]])
+__global__ void element(float4 *out, int i) {
+  __attribute__((amdgpu_pin_vgpr(24))) float4 acc = out[0];
+  acc.x += 1.0f;
+  acc[i] = 2.0f;
+  out[1] = acc;
+}
+
 // An AGPR request names the other file.
 // CHECK-LABEL: define {{.*}}void @_Z4agprPKDv4_fPS_(
 // CHECK: call void @llvm.write_register.v4i32(metadata ![[A16:[0-9]+]], <4 x i32>
@@ -103,6 +124,7 @@ __global__ void tiles(float4 *out) { per_tile<32>(out); }
 
 // CHECK-DAG: ![[V8]] = !{!"v8"}
 // CHECK-DAG: ![[V256]] = !{!"v[256:259]"}
+// CHECK-DAG: ![[V24]] = !{!"v[24:27]"}
 // CHECK-DAG: ![[A16]] = !{!"a[16:19]"}
 // CHECK-DAG: ![[V64]] = !{!"v[64:67]"}
 // CHECK-DAG: ![[T0]] = !{!"v[32:35]"}

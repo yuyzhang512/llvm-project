@@ -2884,6 +2884,7 @@ void CodeGenFunction::EmitStoreThroughLValue(RValue Src, LValue Dst,
       auto *I = Builder.CreateStore(Vec, Dst.getVectorAddress(),
                                     Dst.isVolatileQualified());
       addInstToCurrentSourceAtom(I, Vec);
+      EmitPinnedRegisterWriteBack(Dst.getVectorAddress());
       return;
     }
 
@@ -3266,6 +3267,7 @@ void CodeGenFunction::EmitStoreThroughExtVectorComponentLValue(RValue Src,
 
   Builder.CreateStore(Vec, Dst.getExtVectorAddress(),
                       Dst.isVolatileQualified());
+  EmitPinnedRegisterWriteBack(Dst.getExtVectorAddress());
 }
 
 /// Store of global named registers are always calls to intrinsics.
@@ -3595,6 +3597,28 @@ static LValue EmitGlobalNamedRegister(const VarDecl *VD, CodeGenModule &CGM) {
   llvm::Value *Ptr =
     llvm::MetadataAsValue::get(CGM.getLLVMContext(), M->getOperand(0));
   return LValue::MakeGlobalReg(Ptr, Alignment, VD->getType());
+}
+
+Address CodeGenFunction::EmitPinnedRegisterCopy(LValue RegLV) {
+  QualType Ty = RegLV.getType();
+  Address Copy = CreateMemTemp(Ty, "pin.copy");
+  EmitStoreOfScalar(EmitLoadOfGlobalRegLValue(RegLV).getScalarVal(), Copy,
+                    /*Volatile=*/false, Ty);
+  PinnedRegisterCopies.try_emplace(Copy.getBasePointer(), RegLV);
+  return Copy;
+}
+
+void CodeGenFunction::EmitPinnedRegisterWriteBack(Address Addr) {
+  if (PinnedRegisterCopies.empty())
+    return;
+  auto It = PinnedRegisterCopies.find(Addr.getBasePointer());
+  if (It == PinnedRegisterCopies.end())
+    return;
+  LValue RegLV = It->second;
+  llvm::Value *V =
+      EmitLoadOfScalar(Addr.withElementType(ConvertTypeForMem(RegLV.getType())),
+                       /*Volatile=*/false, RegLV.getType(), SourceLocation());
+  EmitStoreThroughGlobalRegLValue(RValue::get(V), RegLV);
 }
 
 /// Build the l-value for a local with amdgpu_pin_{vgpr,agpr}. The attribute
@@ -5241,6 +5265,9 @@ LValue CodeGenFunction::EmitArraySubscriptExpr(const ArraySubscriptExpr *E,
       !isa<ExtVectorElementExpr>(E->getBase())) {
     // Emit the vector as an lvalue to get its address.
     LValue LHS = EmitLValue(E->getBase());
+    if (LHS.isGlobalReg())
+      LHS = MakeAddrLValue(EmitPinnedRegisterCopy(LHS), LHS.getType(),
+                           LHS.getBaseInfo(), LHS.getTBAAInfo());
     auto *Idx = EmitIdxAfterBase(/*Promote*/false);
     assert(LHS.isSimple() && "Can only subscript lvalue vectors here!");
     return LValue::MakeVectorElt(LHS.getAddress(), Idx, E->getBase()->getType(),
@@ -5720,6 +5747,9 @@ EmitExtVectorElementExpr(const ExtVectorElementExpr *E) {
     // emit the base as an lvalue.
     assert(E->getBase()->getType()->isVectorType());
     Base = EmitLValue(E->getBase());
+    if (Base.isGlobalReg())
+      Base = MakeAddrLValue(EmitPinnedRegisterCopy(Base), Base.getType(),
+                            Base.getBaseInfo(), Base.getTBAAInfo());
   } else {
     // Otherwise, the base is a normal rvalue (as in (V+V).x), emit it as such.
     assert(E->getBase()->getType()->isVectorType() &&

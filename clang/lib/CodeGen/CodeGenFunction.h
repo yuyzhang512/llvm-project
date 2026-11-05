@@ -4579,6 +4579,14 @@ public:
   LValue EmitDeclRefLValue(const DeclRefExpr *E);
   LValue EmitOMPCapturedBindingLValue(const BindingDecl *BD);
   LValue EmitAMDGPUPinnedRegister(const VarDecl *VD);
+  /// A register holds no addressable elements, so an element of a pinned
+  /// vector is accessed through a fresh copy of the register in memory.
+  Address EmitPinnedRegisterCopy(LValue RegLV);
+  /// If \p Addr is such a copy, write it back to its register.
+  void EmitPinnedRegisterWriteBack(Address Addr);
+
+  /// Copies made by EmitPinnedRegisterCopy, and their registers.
+  llvm::DenseMap<llvm::Value *, LValue> PinnedRegisterCopies;
   LValue EmitStringLiteralLValue(const StringLiteral *E);
   LValue EmitObjCEncodeExprLValue(const ObjCEncodeExpr *E);
   LValue EmitPredefinedLValue(const PredefinedExpr *E);
