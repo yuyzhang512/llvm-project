@@ -6281,6 +6281,7 @@ unsigned SIInstrInfo::getVALUOp(unsigned Opc) const {
   default: return AMDGPU::INSTRUCTION_LIST_END;
   case AMDGPU::REG_SEQUENCE: return AMDGPU::REG_SEQUENCE;
   case AMDGPU::COPY: return AMDGPU::COPY;
+  case AMDGPU::PIN_REGISTER: return AMDGPU::PIN_REGISTER;
   case AMDGPU::PHI: return AMDGPU::PHI;
   case AMDGPU::INSERT_SUBREG: return AMDGPU::INSERT_SUBREG;
   case AMDGPU::WQM: return AMDGPU::WQM;
@@ -9890,6 +9891,7 @@ void SIInstrInfo::addUsersToMoveToVALUWorklist(
 
     switch (UseMI.getOpcode()) {
     case AMDGPU::COPY:
+    case AMDGPU::PIN_REGISTER:
     case AMDGPU::WQM:
     case AMDGPU::SOFT_WQM:
     case AMDGPU::STRICT_WWM:
@@ -10123,6 +10125,7 @@ const TargetRegisterClass *SIInstrInfo::getDestEquivalentVGPRClass(
   // class associated with the operand, so we need to find an equivalent VGPR
   // register class in order to move the instruction to the VALU.
   case AMDGPU::COPY:
+  case AMDGPU::PIN_REGISTER:
   case AMDGPU::PHI:
   case AMDGPU::REG_SEQUENCE:
   case AMDGPU::INSERT_SUBREG:

@@ -65,12 +65,22 @@ inline bool namesAGPR(const SDNode *N, unsigned MDOpNo) {
 // file. Choosing it for any other accumulator only moves that value into the
 // AGPR file and back out again.
 inline bool mfmaAccIsNamedAGPR(const SDNode *N, const SIRegisterInfo *TRI) {
+  // An llvm.pin.register hint names its register in operand 1.
+  auto HintsAGPR = [&](const SDNode *P) {
+    return P->isMachineOpcode() &&
+           P->getMachineOpcode() == TargetOpcode::PIN_REGISTER &&
+           SIRegisterInfo::isAGPRClass(
+               TRI->getPhysRegBaseClass(P->getConstantOperandVal(1)));
+  };
+
   // Operand 0 is the intrinsic id, so the accumulator is operand 3.
   if (N->getNumOperands() >= 4) {
     SDValue SrcC = N->getOperand(3);
     while (SrcC.getOpcode() == ISD::BITCAST)
       SrcC = SrcC.getOperand(0);
     if (SrcC.getOpcode() == ISD::READ_REGISTER && namesAGPR(SrcC.getNode(), 1))
+      return true;
+    if (HintsAGPR(SrcC.getNode()))
       return true;
     // A read of a physical register reaches here as a copy out of it.
     if (SrcC.getOpcode() == ISD::CopyFromReg)
@@ -86,6 +96,8 @@ inline bool mfmaAccIsNamedAGPR(const SDNode *N, const SIRegisterInfo *TRI) {
     while (U->getOpcode() == ISD::BITCAST && U->hasOneUse())
       U = *U->user_begin();
     if (U->getOpcode() == ISD::WRITE_REGISTER && namesAGPR(U, 1))
+      return true;
+    if (HintsAGPR(U))
       return true;
     if (U->getOpcode() == ISD::CopyToReg)
       if (const auto *R = dyn_cast<RegisterSDNode>(U->getOperand(1)))

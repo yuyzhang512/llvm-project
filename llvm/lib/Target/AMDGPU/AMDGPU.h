@@ -112,7 +112,6 @@ FunctionPass *createSIInsertWaitcntsPass();
 FunctionPass *createAMDGPUImageIntrinsicOptimizerPass(const TargetMachine *);
 ModulePass *createAMDGPURemoveIncompatibleFunctionsPass(const TargetMachine *);
 FunctionPass *createAMDGPUCodeGenPreparePass();
-FunctionPass *createAMDGPULowerPinToNamedRegLegacyPass();
 FunctionPass *createAMDGPULateCodeGenPrepareLegacyPass();
 ModulePass *
 createAMDGPULowerModuleLDSLegacyPass(const AMDGPUTargetMachine *TM = nullptr);
@@ -554,8 +553,6 @@ extern char &AMDGPUAnnotateUniformValuesLegacyPassID;
 
 void initializeAMDGPUCodeGenPreparePass(PassRegistry&);
 
-void initializeAMDGPULowerPinToNamedRegLegacyPass(PassRegistry &);
-extern char &AMDGPULowerPinToNamedRegLegacyID;
 extern char &AMDGPUCodeGenPrepareID;
 
 void initializeAMDGPURemoveIncompatibleFunctionsLegacyPass(PassRegistry &);
