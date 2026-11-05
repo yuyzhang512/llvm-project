@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/CodeGen/FinalizeISel.h"
+#include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -77,6 +78,16 @@ static std::pair<bool, bool> runImpl(MachineFunction &MF) {
         }
       }
     }
+  }
+
+  // A read of a named register is a copy from the physical register, with no
+  // live-in for a block it is live into. Add the live-ins it needs.
+  if (MF.hasAllocatableNamedRegs()) {
+    SmallVector<MachineBasicBlock *> MBBs;
+    for (MachineBasicBlock &MBB : reverse(MF))
+      MBBs.push_back(&MBB);
+    fullyRecomputeLiveIns(MBBs);
+    Changed = true;
   }
   return {Changed, PreserveCFG};
 }

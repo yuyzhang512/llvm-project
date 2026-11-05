@@ -58,29 +58,14 @@ static StringRef getNamedReg(const Instruction &I) {
   return cast<MDString>(MD->getOperand(0))->getString();
 }
 
-// Collect what naming a VGPR or AGPR through llvm.{read,write}_register implies
-// for \p F: one past the highest AGPR named, and whether a named register is
-// read in a block that does not write it first. Such a read is a use of a
-// physical register live into the block, so the blocks need live-ins.
-static void scanNamedRegs(const Function &F, unsigned &HighestAGPR,
-                          bool &NeedsLiveIns) {
-  for (const BasicBlock &BB : F) {
-    SmallDenseSet<StringRef, 8> WrittenHere;
+// One past the highest AGPR \p F names through llvm.{read,write}_register.
+static void scanNamedRegs(const Function &F, unsigned &HighestAGPR) {
+  for (const BasicBlock &BB : F)
     for (const Instruction &I : BB) {
-      StringRef Name = getNamedReg(I);
-      if (Name.empty())
-        continue;
-      auto [Kind, Idx, Width] = AMDGPU::parseAsmPhysRegName(Name);
-      if (Kind != 'v' && Kind != 'a')
-        continue;
+      auto [Kind, Idx, Width] = AMDGPU::parseAsmPhysRegName(getNamedReg(I));
       if (Kind == 'a')
         HighestAGPR = std::max(HighestAGPR, Idx + Width);
-      if (cast<CallInst>(I).getIntrinsicID() == Intrinsic::write_register)
-        WrittenHere.insert(Name);
-      else if (!WrittenHere.contains(Name))
-        NeedsLiveIns = true;
     }
-  }
 }
 
 SIMachineFunctionInfo::SIMachineFunctionInfo(const Function &F,
@@ -129,7 +114,7 @@ SIMachineFunctionInfo::SIMachineFunctionInfo(const Function &F,
   // asks for the value to live in that file, so record the window: an MFMA that
   // fits it selects the AGPR form, and the registers are counted in the AGPR
   // budget.
-  scanNamedRegs(F, NamedAGPRs, NamedRegLiveIns);
+  scanNamedRegs(F, NamedAGPRs);
   if (NamedAGPRs && ST.hasGFX90AInsts())
     MinNumAGPRs =
         MinNumAGPRs == ~0u ? NamedAGPRs : std::max(MinNumAGPRs, NamedAGPRs);

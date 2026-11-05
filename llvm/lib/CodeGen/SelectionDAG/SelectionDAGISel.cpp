@@ -2515,6 +2515,9 @@ void SelectionDAGISel::Select_READ_REGISTER(SDNode *Op) {
 
   const MachineFunction &MF = CurDAG->getMachineFunction();
   Register Reg = TLI->getRegisterByName(RegStr->getString().data(), Ty, MF);
+  if (Reg &&
+      CurDAG->getSubtarget().getRegisterInfo()->isInAllocatableClass(Reg))
+    CurDAG->getMachineFunction().setHasAllocatableNamedRegs();
 
   SDValue New;
   if (!Reg) {
@@ -2546,6 +2549,9 @@ void SelectionDAGISel::Select_WRITE_REGISTER(SDNode *Op) {
 
   const MachineFunction &MF = CurDAG->getMachineFunction();
   Register Reg = TLI->getRegisterByName(RegStr->getString().data(), Ty, MF);
+  if (Reg &&
+      CurDAG->getSubtarget().getRegisterInfo()->isInAllocatableClass(Reg))
+    CurDAG->getMachineFunction().setHasAllocatableNamedRegs();
 
   if (!Reg) {
     const Function &Fn = MF.getFunction();

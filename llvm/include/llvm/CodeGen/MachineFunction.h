@@ -358,6 +358,9 @@ class LLVM_ABI MachineFunction {
   /// True if the function includes any inline assembly.
   bool HasInlineAsm = false;
 
+  /// llvm.{read,write}_register names an allocatable register.
+  bool HasAllocatableNamedRegs = false;
+
   /// True if any WinCFI instruction have been emitted in this function.
   bool HasWinCFI = false;
 
@@ -862,6 +865,13 @@ public:
   void setHasInlineAsm(bool B) {
     HasInlineAsm = B;
   }
+
+  /// Whether llvm.{read,write}_register names an allocatable register. A read
+  /// of one is selected to a copy from the physical register, which may be
+  /// live into the block, so the block live-ins are recomputed after
+  /// selection.
+  bool hasAllocatableNamedRegs() const { return HasAllocatableNamedRegs; }
+  void setHasAllocatableNamedRegs() { HasAllocatableNamedRegs = true; }
 
   bool hasWinCFI() const {
     return HasWinCFI;

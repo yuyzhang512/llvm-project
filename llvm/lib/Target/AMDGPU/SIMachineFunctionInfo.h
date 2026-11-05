@@ -526,10 +526,6 @@ private:
   /// Size of the AGPR window named by llvm.{read,write}_register, or 0.
   unsigned NamedAGPRs = 0;
 
-  /// A register named by llvm.{read,write}_register is read in a block that
-  /// does not write it, so the blocks need live-ins after selection.
-  bool NamedRegLiveIns = false;
-
   // The hard-wired high half of the address of the global information table
   // for AMDPAL OS type. 0xffffffff represents no hard-wired high half, since
   // current hardware only allows a 16 bit value.
@@ -1240,8 +1236,6 @@ public:
   unsigned getMaxMemoryClusterDWords() const { return MaxMemoryClusterDWords; }
 
   unsigned getMinNumAGPRs() const { return MinNumAGPRs; }
-
-  bool needsNamedRegLiveIns() const { return NamedRegLiveIns; }
 
   /// Return true if an MFMA that requires at least \p NumRegs should select to
   /// the AGPR form, instead of the VGPR form.
