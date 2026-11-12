@@ -2697,6 +2697,14 @@ def int_amdgcn_pin_agpr :
   Intrinsic<[llvm_any_ty], [LLVMMatchType<0>, llvm_i32_ty],
             [IntrNoMem, IntrWillReturn, IntrNoCallback, IntrNoFree,
              ImmArg<ArgIndex<1>>]>;
+// Asks for the LDS loads producing the value (the first operand) to take their
+// address register from [First, First + Count) (the second and third
+// operands); returns the value. Loads whose addresses differ by a constant
+// share a register.
+def int_amdgcn_pin_lds_addr :
+  Intrinsic<[llvm_any_ty], [LLVMMatchType<0>, llvm_i32_ty, llvm_i32_ty],
+            [IntrNoMem, IntrWillReturn, IntrNoCallback, IntrNoFree,
+             ImmArg<ArgIndex<1>>, ImmArg<ArgIndex<2>>]>;
 
 def int_amdgcn_readfirstlane :
   Intrinsic<[llvm_any_ty], [LLVMMatchType<0>],
