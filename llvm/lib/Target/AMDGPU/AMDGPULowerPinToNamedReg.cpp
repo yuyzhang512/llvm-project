@@ -15,11 +15,13 @@
 //
 // llvm.amdgcn.pin.lds.addr(V, First, Count) asks for the LDS loads producing V
 // to take their address register from [First, First + Count). An LDS address is
-// @lds + root + constant, and instruction selection folds up to 64 KB of the
-// constant into the DS offset field. So each distinct root, split into
-// clusters under 64 KB, gets one base register, pinned through the request
-// above, and every such load becomes base + (constant - cluster start).
-//
+// @lds + the sum of some variable terms (each times a constant scale) + a
+// constant, and instruction selection folds up to 64 KB of the constant into
+// the DS offset field. Loads with the same variable terms, split into clusters
+// under 64 KB, share one base register, pinned through the request above, and
+// every such load becomes base + (constant - cluster start). The terms need
+// not be loop invariant: the slot of a double buffer changes every iteration,
+// and the base is then recomputed, into the same register, where its loads are.
 //===----------------------------------------------------------------------===//
 
 #include "AMDGPU.h"
@@ -177,12 +179,22 @@ static void lowerToNamedReg(Value *V, Value *Old, Instruction *WriteAt,
 
 
 namespace {
-// An LDS address split as Base + Root + Off: Base a constant pointer, Root the
-// one non-constant term.
+// An LDS address split as Base + sum(Terms[i].first * Terms[i].second) + Off:
+// Base a constant pointer, each term an i32 instruction or argument times a
+// byte scale. Addresses are 32-bit, so all of it is mod 2^32.
 struct LDSAddr {
   Constant *Base = nullptr;
-  Value *Root = nullptr;
+  SmallVector<std::pair<Value *, int64_t>, 4> Terms;
   int64_t Off = 0;
+  // The terms in a canonical order, to tell whether two loads share them.
+  SmallVector<std::pair<Value *, int64_t>, 4> key() const {
+    auto K = Terms;
+    llvm::sort(K, [](auto &L, auto &R) {
+      return std::less<Value *>()(L.first, R.first) ||
+             (L.first == R.first && L.second < R.second);
+    });
+    return K;
+  }
 };
 } // end anonymous namespace
 
@@ -217,36 +229,88 @@ static Value *splitOffset(Value *Idx, int64_t &Off, unsigned Depth = 0) {
   return Root;
 }
 
-static bool splitLDSAddr(Value *P, LDSAddr &A) {
+// A * B in 32-bit address arithmetic, sign-extended: products of huge
+// constant indices and scales wrap instead of overflowing int64_t.
+static int64_t mulAddr(int64_t A, int64_t B) {
+  return static_cast<int32_t>(static_cast<uint32_t>(
+      static_cast<uint64_t>(A) * static_cast<uint64_t>(B)));
+}
+
+// Walk the GEP chain of an LDS pointer. Each single-index GEP adds its index
+// times the source element size: a constant index to Off, any other to Terms.
+static bool splitLDSAddr(Value *P, const DataLayout &DL, LDSAddr &A) {
   while (auto *GEP = dyn_cast<GEPOperator>(P)) {
-    if (!GEP->getSourceElementType()->isIntegerTy(8) ||
-        GEP->getNumIndices() != 1)
+    if (GEP->getNumIndices() != 1)
       return false;
+    TypeSize Size = DL.getTypeAllocSize(GEP->getSourceElementType());
+    if (Size.isScalable())
+      return false;
+    // Only the low 32 bits of the scale matter for a 32-bit address.
+    int64_t Scale = Size.getFixedValue() & 0xffffffff;
     Value *Idx = GEP->getOperand(1);
     if (auto *C = dyn_cast<ConstantInt>(Idx)) {
-      A.Off += C->getSExtValue();
+      A.Off += mulAddr(C->getSExtValue(), Scale);
     } else {
-      if (A.Root)
+      if (!Idx->getType()->isIntegerTy(32))
         return false;
-      A.Root = splitOffset(Idx, A.Off);
+      int64_t Off = 0;
+      Value *Root = splitOffset(Idx, Off);
+      A.Off += mulAddr(Off, Scale);
+      // A PHI with no incoming values (unreachable code) has no root.
+      if (!Root)
+        return false;
+      if (auto *C = dyn_cast<ConstantInt>(Root))
+        A.Off += mulAddr(C->getSExtValue(), Scale); // a PHI of equal constants
+      else if (!isa<Instruction, Argument>(Root))
+        return false;
+      else if (Scale)
+        A.Terms.push_back({Root, Scale});
     }
     P = GEP->getPointerOperand();
   }
   A.Base = dyn_cast<Constant>(P);
-  return A.Base && A.Root && A.Root->getType()->isIntegerTy(32);
+  return A.Base && !A.Terms.empty();
+}
+
+// The operand index of an LDS load's address: a load from addrspace(3) or one
+// of the transposing DS load intrinsics. -1 for anything else.
+static int ldsAddrOperand(Instruction *I) {
+  if (auto *LI = dyn_cast<LoadInst>(I))
+    return LI->getPointerAddressSpace() == AMDGPUAS::LOCAL_ADDRESS
+               ? LI->getPointerOperandIndex()
+               : -1;
+  if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::amdgcn_ds_load_tr4_b64:
+    case Intrinsic::amdgcn_ds_load_tr6_b96:
+    case Intrinsic::amdgcn_ds_load_tr8_b64:
+    case Intrinsic::amdgcn_ds_load_tr16_b128:
+    case Intrinsic::amdgcn_ds_read_tr4_b64:
+    case Intrinsic::amdgcn_ds_read_tr6_b96:
+    case Intrinsic::amdgcn_ds_read_tr8_b64:
+    case Intrinsic::amdgcn_ds_read_tr16_b64:
+      return 0;
+    default:
+      break;
+    }
+  }
+  return -1;
 }
 
 // Rewrite every llvm.amdgcn.pin.lds.addr into base registers pinned with
 // llvm.amdgcn.pin.vgpr, which the rest of the pass then lowers.
 static bool lowerLDSAddrPins(Function &F) {
   struct Request {
-    LoadInst *Load;
+    Instruction *Load;
+    int AddrOp;
     int64_t First, Count;
     LDSAddr A;
+    bool Ok;
   };
+  const DataLayout &DL = F.getDataLayout();
   SmallVector<Request> Reqs;
   SmallVector<IntrinsicInst *> Marks;
-  SmallPtrSet<LoadInst *, 32> Seen;
+  SmallPtrSet<Instruction *, 32> Seen;
   for (Instruction &I : instructions(F)) {
     auto *II = dyn_cast<IntrinsicInst>(&I);
     if (!II || II->getIntrinsicID() != Intrinsic::amdgcn_pin_lds_addr)
@@ -262,12 +326,11 @@ static bool lowerLDSAddrPins(Function &F) {
       Value *V = Work.pop_back_val();
       if (!Visited.insert(V).second)
         continue;
-      if (auto *LI = dyn_cast<LoadInst>(V)) {
-        if (LI->getPointerAddressSpace() == AMDGPUAS::LOCAL_ADDRESS &&
-            Seen.insert(LI).second) {
-          Request R{LI, First, Count, {}};
-          if (!splitLDSAddr(LI->getPointerOperand(), R.A))
-            R.A.Root = nullptr;
+      if (auto *I = dyn_cast<Instruction>(V); I && ldsAddrOperand(I) >= 0) {
+        if (Seen.insert(I).second) {
+          int Op = ldsAddrOperand(I);
+          Request R{I, Op, First, Count, {}, false};
+          R.Ok = splitLDSAddr(I->getOperand(Op), DL, R.A);
           Reqs.push_back(R);
         }
         continue;
@@ -286,15 +349,30 @@ static bool lowerLDSAddrPins(Function &F) {
   if (Marks.empty())
     return false;
 
-  // Cluster the offsets of each (range, base, root) so that every load's
-  // offset from its cluster's start fits the 16-bit DS offset.
-  using Key = std::tuple<int64_t, int64_t, Constant *, Value *>;
-  auto keyOf = [](const Request &R) {
-    return Key(R.First, R.Count, R.A.Base, R.A.Root);
+  // Cluster the offsets of each (range, base, terms) so that every load's
+  // offset from its cluster's start fits the 16-bit DS offset. Term lists are
+  // numbered so that they can be part of a key.
+  SmallVector<SmallVector<std::pair<Value *, int64_t>, 4>> TermLists;
+  auto termsId = [&](const LDSAddr &A) -> int64_t {
+    auto K = A.key();
+    for (auto [I, L] : enumerate(TermLists))
+      if (L == K)
+        return I;
+    TermLists.push_back(K);
+    return TermLists.size() - 1;
   };
+  using Key = std::tuple<int64_t, int64_t, Constant *, int64_t>;
+  auto keyOf = [&](const Request &R) {
+    return Key(R.First, R.Count, R.A.Base, termsId(R.A));
+  };
+  // Loads in unreachable blocks keep their addresses.
+  DominatorTree DT(F);
+  for (Request &R : Reqs)
+    if (!DT.isReachableFromEntry(R.Load->getParent()))
+      R.Ok = false;
   MapVector<Key, SmallVector<int64_t>> Offsets;
   for (const Request &R : Reqs)
-    if (R.A.Root)
+    if (R.Ok)
       Offsets[keyOf(R)].push_back(R.A.Off);
   constexpr int64_t MaxDSOffset = 65535;
   struct Cluster {
@@ -306,7 +384,7 @@ static bool lowerLDSAddrPins(Function &F) {
   DenseMap<std::pair<int64_t, int64_t>, int64_t> NextReg;
   for (auto &[K, Offs] : Offsets) {
     llvm::sort(Offs);
-    auto [First, Count, Base, Root] = K;
+    auto [First, Count, Base, Terms] = K;
     for (int64_t Off : Offs) {
       SmallVector<Cluster> &Cs = Clusters[K];
       if (!Cs.empty() && Off - Cs.back().Start <= MaxDSOffset)
@@ -331,7 +409,6 @@ static bool lowerLDSAddrPins(Function &F) {
   // Each cluster's base is computed once, in the nearest block dominating all
   // its loads, so a base that only code after a loop needs is not live across
   // the loop.
-  DominatorTree DT(F);
   auto clusterOf = [&](Request &R) -> Cluster * {
     SmallVector<Cluster> &Cs = Clusters[keyOf(R)];
     Cluster *C = &Cs.front();
@@ -342,7 +419,7 @@ static bool lowerLDSAddrPins(Function &F) {
   };
   DenseMap<Cluster *, BasicBlock *> Home;
   for (Request &R : Reqs) {
-    if (!R.A.Root)
+    if (!R.Ok)
       continue;
     BasicBlock *&H = Home[clusterOf(R)];
     H = H ? DT.findNearestCommonDominator(H, R.Load->getParent())
@@ -350,17 +427,28 @@ static bool lowerLDSAddrPins(Function &F) {
   }
   LLVMContext &Ctx = F.getContext();
   Type *I8 = Type::getInt8Ty(Ctx), *I32 = Type::getInt32Ty(Ctx);
-  auto rawBase = [&](Cluster &C, Constant *Base, Value *Root) -> Value * {
+  auto rawBase = [&](Cluster &C, const LDSAddr &A) -> Value * {
     if (C.RawBase)
       return C.RawBase;
+    // Right after the last term computed in the home block, if any.
     BasicBlock *H = Home.lookup(&C);
     BasicBlock::iterator IP = H->getFirstInsertionPt();
-    if (auto *RI = dyn_cast<Instruction>(Root);
-        RI && RI->getParent() == H && !isa<PHINode>(RI))
-      IP = std::next(RI->getIterator());
+    for (Instruction &I : *H)
+      if (!isa<PHINode>(I) &&
+          any_of(A.Terms, [&](auto &T) { return T.first == &I; }))
+        IP = std::next(I.getIterator());
     IRBuilder<> B(H, IP);
-    Value *Sum = C.Start ? B.CreateAdd(Root, B.getInt32(C.Start)) : Root;
-    Value *Ptr = B.CreateGEP(I8, Base, Sum);
+    Value *Sum = nullptr;
+    for (auto [Term, Scale] : A.Terms) {
+      Value *V = Scale == 1 ? Term
+                 : isPowerOf2_64(Scale)
+                     ? B.CreateShl(Term, Log2_64(Scale))
+                     : B.CreateMul(Term, B.getInt32(Scale));
+      Sum = Sum ? B.CreateAdd(Sum, V) : V;
+    }
+    if (C.Start)
+      Sum = B.CreateAdd(Sum, B.getInt32(C.Start));
+    Value *Ptr = B.CreateGEP(I8, A.Base, Sum);
     C.RawBase = B.CreatePtrToInt(Ptr, I32, "lds.base");
     return C.RawBase;
   };
@@ -368,12 +456,12 @@ static bool lowerLDSAddrPins(Function &F) {
   // One pin per base and block, so the named register stays local to it.
   DenseMap<std::pair<Value *, BasicBlock *>, Value *> Pinned;
   for (Request &R : Reqs) {
-    if (!R.A.Root)
+    if (!R.Ok)
       continue;
     Cluster *C = clusterOf(R);
     if (C->Reg < 0)
       continue;
-    Value *Raw = rawBase(*C, R.A.Base, R.A.Root);
+    Value *Raw = rawBase(*C, R.A);
     BasicBlock *BB = R.Load->getParent();
     Value *&Pin = Pinned[{Raw, BB}];
     if (!Pin) {
@@ -387,8 +475,9 @@ static bool lowerLDSAddrPins(Function &F) {
     }
     IRBuilder<> B(R.Load);
     Value *Addr = B.CreateAdd(Pin, B.getInt32(R.A.Off - C->Start));
-    R.Load->setOperand(R.Load->getPointerOperandIndex(),
-                       B.CreateIntToPtr(Addr, R.Load->getPointerOperandType()));
+    R.Load->setOperand(
+        R.AddrOp,
+        B.CreateIntToPtr(Addr, R.Load->getOperand(R.AddrOp)->getType()));
   }
   return true;
 }
