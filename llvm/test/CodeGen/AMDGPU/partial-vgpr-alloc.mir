@@ -1,0 +1,39 @@
+# REQUIRES: asserts
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx1250 -amdgpu-partial-vgpr-alloc=1 -run-pass=amdgpu-partial-vgpr-alloc -debug-only=amdgpu-partial-vgpr-alloc -o /dev/null %s 2>&1 | FileCheck %s
+
+# After scheduling, a DS load in a loop is followed by an add whose src0 is
+# pinned to $vgpr300. The pass hints the load's address (its src0) into the
+# add's src0 window (window 1), and the load's destination and the add's result
+# into one window. The function's VGPRs fit in window 0, so that is the one.
+
+# CHECK-DAG: %1 -> $vgpr0_vgpr1_vgpr2_vgpr3
+# CHECK-DAG: %2 -> $vgpr4
+# CHECK-DAG: %0 -> $vgpr256
+--- |
+  define amdgpu_kernel void @ds_window() #0 { ret void }
+  attributes #0 = { "amdgpu-waves-per-eu"="1,1" "amdgpu-flat-work-group-size"="1,32" }
+...
+---
+name: ds_window
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: vgpr_32 }
+  - { id: 1, class: vreg_128_align2 }
+  - { id: 2, class: vgpr_32 }
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $vgpr0, $vgpr300
+    %0:vgpr_32 = COPY $vgpr0
+    S_BRANCH %bb.1
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $vgpr300
+    %1:vreg_128_align2 = DS_READ_B128_gfx9 %0, 0, 0, implicit $exec
+    %2:vgpr_32 = V_ADD_U32_e32 $vgpr300, %1.sub0, implicit $exec
+    S_CBRANCH_SCC1 %bb.1, implicit undef $scc
+
+  bb.2:
+    S_ENDPGM 0, implicit %2
+...

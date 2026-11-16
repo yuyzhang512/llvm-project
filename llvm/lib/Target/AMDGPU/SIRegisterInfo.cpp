@@ -4328,6 +4328,25 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
     }
     return false;
   }
+  case AMDGPURI::Window: {
+    // The chosen register first, then the others of its window, then the
+    // copy hints.
+    MCRegister Want = Hint.second.asMCReg();
+    if (Want && !MRI.isReserved(Want) && is_contained(Order, Want))
+      Hints.insert(Want);
+    unsigned Window = getHWRegIndex(Want) >> 8;
+    unsigned Added = 0;
+    for (MCPhysReg PhysReg : Order) {
+      if (Added >= 8)
+        break;
+      if (!isVGPR(MRI, PhysReg) || getHWRegIndex(PhysReg) >> 8 != Window)
+        continue;
+      if (Hints.insert(PhysReg))
+        ++Added;
+    }
+    TargetRegisterInfo::getRegAllocationHints(VirtReg, Order, Hints, MF, VRM);
+    return false;
+  }
   default:
     return TargetRegisterInfo::getRegAllocationHints(VirtReg, Order, Hints, MF,
                                                      VRM);

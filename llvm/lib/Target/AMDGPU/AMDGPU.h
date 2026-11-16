@@ -113,6 +113,9 @@ FunctionPass *createAMDGPUImageIntrinsicOptimizerPass(const TargetMachine *);
 ModulePass *createAMDGPURemoveIncompatibleFunctionsPass(const TargetMachine *);
 FunctionPass *createAMDGPUCodeGenPreparePass();
 FunctionPass *createAMDGPULowerPinToNamedRegLegacyPass();
+FunctionPass *createAMDGPUPartialVGPRAllocLegacyPass();
+/// Whether -amdgpu-partial-vgpr-alloc asks for the pass.
+bool isAMDGPUPartialVGPRAllocEnabled();
 FunctionPass *createAMDGPULateCodeGenPrepareLegacyPass();
 ModulePass *
 createAMDGPULowerModuleLDSLegacyPass(const AMDGPUTargetMachine *TM = nullptr);
@@ -556,6 +559,12 @@ void initializeAMDGPUCodeGenPreparePass(PassRegistry&);
 
 void initializeAMDGPULowerPinToNamedRegLegacyPass(PassRegistry &);
 extern char &AMDGPULowerPinToNamedRegLegacyID;
+
+void initializeAMDGPUPartialVGPRAllocLegacyPass(PassRegistry &);
+extern char &AMDGPUPartialVGPRAllocLegacyID;
+
+void initializeAMDGPUCollectRAHintsLegacyPass(PassRegistry &);
+extern char &AMDGPUCollectRAHintsLegacyID;
 extern char &AMDGPUCodeGenPrepareID;
 
 void initializeAMDGPURemoveIncompatibleFunctionsLegacyPass(PassRegistry &);

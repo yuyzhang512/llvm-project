@@ -667,6 +667,38 @@ public:
   }
 
 public:
+  // Facts from llvm.amdgcn.ra.hint, per virtual register.
+  struct RAHint {
+    int Window = -1;
+    unsigned Group = 0, Priority = 100, Guard = 0;
+  };
+
+private:
+  // Per FAKE_USE marker placed after selection on the hinted value: the marker
+  // follows the value through PHI elimination and coalescing.
+  DenseMap<const MachineInstr *, RAHint> RAHintMarkers;
+
+public:
+  void setRAHintMarker(const MachineInstr *MI, RAHint H) {
+    RAHintMarkers[MI] = H;
+  }
+  const DenseMap<const MachineInstr *, RAHint> &getRAHintMarkers() const {
+    return RAHintMarkers;
+  }
+  void clearRAHintMarkers() { RAHintMarkers.clear(); }
+
+private:
+  // The facts per register, read from the markers before scheduling.
+  DenseMap<Register, RAHint> RAHints;
+  SmallVector<std::string, 0> RAHintConflicts;
+  unsigned RAHintsLost = 0;
+
+public:
+  DenseMap<Register, RAHint> &getRAHints() { return RAHints; }
+  SmallVector<std::string, 0> &getRAHintConflicts() { return RAHintConflicts; }
+  unsigned &getRAHintsLost() { return RAHintsLost; }
+
+public:
   SIMachineFunctionInfo(const SIMachineFunctionInfo &MFI) = default;
   SIMachineFunctionInfo(const Function &F, const GCNSubtarget *STI);
 

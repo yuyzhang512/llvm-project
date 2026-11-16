@@ -20576,6 +20576,29 @@ void SITargetLowering::finalizeLowering(MachineFunction &MF) const {
   const SIRegisterInfo *TRI = Subtarget->getRegisterInfo();
   const SIInstrInfo *TII = ST.getInstrInfo();
 
+  // llvm.amdgcn.ra.hint: a copy. When the partial VGPR allocation will read
+  // the facts, a FAKE_USE of the copy marks the value: PHI elimination and the
+  // coalescer rewrite its operand to whatever register ends up holding it.
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : make_early_inc_range(MBB)) {
+      if (MI.getOpcode() != AMDGPU::SI_RA_HINT)
+        continue;
+      Register Dst = MI.getOperand(0).getReg(), Src = MI.getOperand(1).getReg();
+      BuildMI(MBB, MI, MI.getDebugLoc(), TII->get(TargetOpcode::COPY), Dst)
+          .addReg(Src);
+      if (isAMDGPUPartialVGPRAllocEnabled()) {
+        auto Marker = BuildMI(MBB, MI, MI.getDebugLoc(),
+                              TII->get(TargetOpcode::FAKE_USE))
+                          .addReg(Dst);
+        Info->setRAHintMarker(Marker,
+                              {int(MI.getOperand(2).getImm()),
+                               unsigned(MI.getOperand(3).getImm()),
+                               unsigned(MI.getOperand(4).getImm()),
+                               unsigned(MI.getOperand(5).getImm())});
+      }
+      MI.eraseFromParent();
+    }
+
   if (Info->isEntryFunction()) {
     // Callable functions have fixed registers used for stack access.
     reservePrivateMemoryRegs(getTargetMachine(), MF, *TRI, *Info);

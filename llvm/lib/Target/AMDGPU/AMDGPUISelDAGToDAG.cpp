@@ -3389,6 +3389,15 @@ void AMDGPUDAGToDAGISel::SelectINTRINSIC_WO_CHAIN(SDNode *N) {
   case Intrinsic::amdgcn_interp_p1_f16:
     SelectInterpP1F16(N);
     return;
+  case Intrinsic::amdgcn_ra_hint: {
+    SDLoc DL(N);
+    SmallVector<SDValue, 5> Ops{N->getOperand(1)};
+    for (unsigned I = 2; I <= 5; ++I)
+      Ops.push_back(CurDAG->getTargetConstant(N->getConstantOperandVal(I), DL,
+                                              MVT::i32));
+    CurDAG->SelectNodeTo(N, AMDGPU::SI_RA_HINT, N->getVTList(), Ops);
+    return;
+  }
   case Intrinsic::amdgcn_permlane16_swap:
   case Intrinsic::amdgcn_permlane32_swap: {
     if ((IntrID == Intrinsic::amdgcn_permlane16_swap &&

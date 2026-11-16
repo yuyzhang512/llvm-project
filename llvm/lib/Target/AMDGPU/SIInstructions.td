@@ -686,6 +686,16 @@ def SI_BR_UNDEF : SPseudoInstSI <(outs), (ins SOPPBrTarget:$simm16)> {
   let isBranch = 1;
 }
 
+// llvm.amdgcn.ra.hint through selection: finalizeLowering turns it into a
+// COPY and records the facts for AMDGPUPartialVGPRAlloc.
+def SI_RA_HINT : PseudoInstSI <(outs unknown:$vdst),
+  (ins unknown:$src, i32imm:$window, i32imm:$group, i32imm:$priority,
+       i32imm:$guard)> {
+  let hasSideEffects = 0;
+  let mayLoad = 0;
+  let mayStore = 0;
+}
+
 def SI_PS_LIVE : PseudoInstSI <
   (outs SReg_1:$dst), (ins),
   [(set i1:$dst, (int_amdgcn_ps_live))]> {

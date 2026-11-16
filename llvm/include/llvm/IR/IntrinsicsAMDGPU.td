@@ -2706,6 +2706,18 @@ def int_amdgcn_pin_lds_addr :
             [IntrNoMem, IntrWillReturn, IntrNoCallback, IntrNoFree,
              ImmArg<ArgIndex<1>>, ImmArg<ArgIndex<2>>]>;
 
+// Returns the value (the first operand) and tells the register allocation what
+// its registers are for: the 256-VGPR window they should be in (-1: any), a
+// group of values sharing a window (0: none), a priority in percent, and how
+// many instructions after their last read they should not be reused (0: the
+// default). Read by AMDGPUPartialVGPRAlloc (-amdgpu-partial-vgpr-alloc).
+def int_amdgcn_ra_hint :
+  Intrinsic<[llvm_any_ty],
+            [LLVMMatchType<0>, llvm_i32_ty, llvm_i32_ty, llvm_i32_ty, llvm_i32_ty],
+            [IntrNoMem, IntrWillReturn, IntrNoCallback, IntrNoFree,
+             ImmArg<ArgIndex<1>>, ImmArg<ArgIndex<2>>, ImmArg<ArgIndex<3>>,
+             ImmArg<ArgIndex<4>>]>;
+
 def int_amdgcn_readfirstlane :
   Intrinsic<[llvm_any_ty], [LLVMMatchType<0>],
             [IntrNoMem, IntrConvergent, IntrWillReturn, IntrNoCallback, IntrNoFree, IntrNoCreateUndefOrPoison]>;

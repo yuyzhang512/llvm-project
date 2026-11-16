@@ -723,6 +723,8 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPUPromoteAllocaPass(*PR);
   initializeAMDGPUCodeGenPreparePass(*PR);
   initializeAMDGPULowerPinToNamedRegLegacyPass(*PR);
+  initializeAMDGPUPartialVGPRAllocLegacyPass(*PR);
+  initializeAMDGPUCollectRAHintsLegacyPass(*PR);
   initializeAMDGPULateCodeGenPrepareLegacyPass(*PR);
   initializeAMDGPURemoveIncompatibleFunctionsLegacyPass(*PR);
   initializeAMDGPULowerModuleLDSLegacyPass(*PR);
@@ -1868,6 +1870,11 @@ void GCNPassConfig::addOptimizedRegAlloc() {
   if (EnableRewritePartialRegUses)
     insertPass(&RenameIndependentSubregsID, &GCNRewritePartialRegUsesID);
 
+  // llvm.amdgcn.ra.hint markers: read once coalescing is done, before the
+  // machine scheduler sees them.
+  if (isAMDGPUPartialVGPRAllocEnabled())
+    insertPass(&RenameIndependentSubregsID, &AMDGPUCollectRAHintsLegacyID);
+
   // Insertion point for passes depends on whether MachineScheduler is enabled.
   AnalysisID EndOfPreRA = UseSSAMachineScheduler ? &RenameIndependentSubregsID
                                                  : &MachineSchedulerID;
@@ -1982,6 +1989,10 @@ bool GCNPassConfig::addRegAssignAndRewriteOptimized() {
     reportFatalUsageError(RegAllocOptNotSupportedMessage);
 
   addPass(&GCNPreRALongBranchRegID);
+
+  // Allocate the VGPRs around DS loads, now that the schedule is fixed.
+  if (isAMDGPUPartialVGPRAllocEnabled())
+    addPass(createAMDGPUPartialVGPRAllocLegacyPass());
 
   addPass(createSGPRAllocPass(true));
 
