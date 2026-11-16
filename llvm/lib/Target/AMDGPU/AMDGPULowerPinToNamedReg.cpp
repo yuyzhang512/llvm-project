@@ -148,18 +148,28 @@ static void lowerToNamedReg(Value *V, Value *Old, Instruction *WriteAt,
   IRBuilder<> B(WriteAt);
   B.CreateIntrinsic(Intrinsic::write_register, {IntTy},
                     {MD, B.CreateBitCast(V, IntTy)});
+  // The first write a joined PHI's other incoming value makes at the end of
+  // each block. A read for a use in that block must come before it: when the
+  // pinned value also flows on that edge into another PHI (a ring of values
+  // rotating through the merge), the read takes the old contents of the tuple
+  // and the write then replaces them.
+  DenseMap<BasicBlock *, Instruction *> FirstJoinWrite;
   for (PHINode *PN : Joined)
     for (unsigned K = 0, E = PN->getNumIncomingValues(); K != E; ++K) {
       Value *In = PN->getIncomingValue(K);
       if (Pinned.contains(In) || isa<UndefValue>(In))
         continue;
-      IRBuilder<> WB(PN->getIncomingBlock(K)->getTerminator());
-      WB.CreateIntrinsic(Intrinsic::write_register, {IntTy},
-                         {MD, WB.CreateBitCast(In, IntTy)});
+      BasicBlock *InBB = PN->getIncomingBlock(K);
+      IRBuilder<> WB(InBB->getTerminator());
+      auto *W = WB.CreateIntrinsic(Intrinsic::write_register, {IntTy},
+                                   {MD, WB.CreateBitCast(In, IntTy)});
+      FirstJoinWrite.try_emplace(InBB, cast<Instruction>(W));
     }
 
   for (auto &[BB, Uses] : UsesByBlock) {
     Instruction *At = BB->getTerminator();
+    if (Instruction *W = FirstJoinWrite.lookup(BB))
+      At = W;
     for (Use *U : Uses) {
       auto *User = cast<Instruction>(U->getUser());
       if (!isa<PHINode>(User) && User->comesBefore(At))
