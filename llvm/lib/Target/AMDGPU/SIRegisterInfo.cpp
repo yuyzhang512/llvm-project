@@ -4331,19 +4331,36 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
   case AMDGPURI::Window: {
     // The chosen register first, then the others of its window, then the
     // copy hints.
+    //
+    // Hints are tried before the anti-hint ordering of the rest of the
+    // order, so leave out registers whose units an allocated anti-hinted
+    // value holds: a write there right after an in-flight WMMA reads it waits
+    // for that WMMA (s_wait_alu depctr_va_vdst), which costs more than the
+    // S_SET_VGPR_MSB the window saves. They stay in the order, behind the
+    // other registers. Offer every other register of the window: a window
+    // that is mostly taken would otherwise send the value out of it.
+    BitVector AntiUnits;
+    if (VRM) {
+      for (Register AntiVReg : MRI.getRegAllocationAntiHints(VirtReg)) {
+        if (!VRM->hasPhys(AntiVReg))
+          continue;
+        if (AntiUnits.empty())
+          AntiUnits.resize(getNumRegUnits());
+        for (MCRegUnit Unit : regunits(VRM->getPhys(AntiVReg)))
+          AntiUnits.set(static_cast<unsigned>(Unit));
+      }
+    }
+    auto Offer = [&](MCPhysReg PhysReg) {
+      if (!AntiUnits.any() || !isAntiHintedReg(PhysReg, AntiUnits))
+        Hints.insert(PhysReg);
+    };
     MCRegister Want = Hint.second.asMCReg();
     if (Want && !MRI.isReserved(Want) && is_contained(Order, Want))
-      Hints.insert(Want);
+      Offer(Want);
     unsigned Window = getHWRegIndex(Want) >> 8;
-    unsigned Added = 0;
-    for (MCPhysReg PhysReg : Order) {
-      if (Added >= 8)
-        break;
-      if (!isVGPR(MRI, PhysReg) || getHWRegIndex(PhysReg) >> 8 != Window)
-        continue;
-      if (Hints.insert(PhysReg))
-        ++Added;
-    }
+    for (MCPhysReg PhysReg : Order)
+      if (isVGPR(MRI, PhysReg) && getHWRegIndex(PhysReg) >> 8 == Window)
+        Offer(PhysReg);
     TargetRegisterInfo::getRegAllocationHints(VirtReg, Order, Hints, MF, VRM);
     return false;
   }
