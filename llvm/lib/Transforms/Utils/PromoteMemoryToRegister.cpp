@@ -630,6 +630,7 @@ static bool rewriteSingleStoreAlloca(
       ReplVal = PoisonValue::get(LI->getType());
 
     convertMetadataToAssumes(LI, ReplVal, DL, AC, &DT);
+    transferValueHintMetadata(*LI, ReplVal);
     LI->replaceAllUsesWith(ReplVal);
     LI->eraseFromParent();
     LBI.deleteValue(LI);
@@ -744,6 +745,7 @@ static bool promoteSingleBlockAlloca(
     // code.
     if (ReplVal == LI)
       ReplVal = PoisonValue::get(LI->getType());
+    transferValueHintMetadata(*LI, ReplVal);
 
     LI->replaceAllUsesWith(ReplVal);
     LI->eraseFromParent();
@@ -1316,6 +1318,7 @@ void PromoteMem2Reg::RenamePass(BasicBlock *BB, BasicBlock *Pred) {
 
       Value *V = IncomingVals[AI->second];
       convertMetadataToAssumes(LI, V, SQ.DL, AC, &DT);
+      transferValueHintMetadata(*LI, V);
 
       // Anything using the load now uses the current value.
       LI->replaceAllUsesWith(V);
@@ -1356,11 +1359,29 @@ void PromoteMem2Reg::RenamePass(BasicBlock *BB, BasicBlock *Pred) {
       pushToWorklist(S, BB);
 }
 
+// An alloca marked !llvm.pin.register !{!"<name>"} holds a variable hinted to
+// a register. Give each instruction stored to it the same metadata before it
+// is promoted, so the hint stays with the values once the alloca is gone. An
+// instruction with its own hint keeps it.
+static void hintStoredValues(AllocaInst *AI) {
+  MDNode *MD = AI->getMetadata("llvm.pin.register");
+  if (!MD)
+    return;
+  for (User *U : AI->users())
+    if (auto *SI = dyn_cast<StoreInst>(U); SI && SI->getPointerOperand() == AI)
+      if (auto *I = dyn_cast<Instruction>(SI->getValueOperand()))
+        if (!I->getMetadata("llvm.pin.register"))
+          I->setMetadata("llvm.pin.register", MD);
+}
+
 void llvm::PromoteMemToReg(ArrayRef<AllocaInst *> Allocas, DominatorTree &DT,
                            AssumptionCache *AC) {
   // If there is nothing to do, bail out...
   if (Allocas.empty())
     return;
+
+  for (AllocaInst *AI : Allocas)
+    hintStoredValues(AI);
 
   PromoteMem2Reg(Allocas, DT, AC).run();
 }

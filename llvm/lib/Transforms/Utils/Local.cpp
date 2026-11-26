@@ -3135,6 +3135,18 @@ void llvm::combineAAMetadata(Instruction *K, const Instruction *J) {
   combineMetadata(K, J, /*DoesKMove=*/true, /*AAOnly=*/true);
 }
 
+void llvm::transferValueHintMetadata(const LoadInst &From, Value *To) {
+  auto *I = dyn_cast<Instruction>(To);
+  // Instruction selection reads a hint from the instruction defining the
+  // value, which a PHI is not.
+  if (!I || I == &From || isa<PHINode>(I) ||
+      !From.hasMetadataOtherThanDebugLoc())
+    return;
+  for (StringRef Kind : {"llvm.pin.register"})
+    if (MDNode *MD = From.getMetadata(Kind); MD && !I->getMetadata(Kind))
+      I->setMetadata(Kind, MD);
+}
+
 void llvm::copyMetadataForLoad(LoadInst &Dest, const LoadInst &Source) {
   SmallVector<std::pair<unsigned, MDNode *>, 8> MD;
   Source.getAllMetadata(MD);

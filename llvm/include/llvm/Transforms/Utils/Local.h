@@ -431,6 +431,12 @@ LLVM_ABI void combineAAMetadata(Instruction *K, const Instruction *J);
 /// replacement for the source instruction).
 LLVM_ABI void copyMetadataForLoad(LoadInst &Dest, const LoadInst &Source);
 
+/// When load \p From is replaced by \p To, give \p To the metadata of \p From
+/// that hints how to place the loaded value, such as !llvm.pin.register, if
+/// \p To is an instruction without it. The hint then follows the value rather
+/// than the deleted load.
+LLVM_ABI void transferValueHintMetadata(const LoadInst &From, Value *To);
+
 /// Patch the replacement so that it is not more restrictive than the value
 /// being replaced. It assumes that the replacement does not get moved from
 /// its original position.

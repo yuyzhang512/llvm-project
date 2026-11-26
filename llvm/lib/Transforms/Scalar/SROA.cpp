@@ -3630,10 +3630,12 @@ private:
                        false, Align(1));
       V = insertInteger(DL, IRB, Placeholder, V, NewBeginOffset - BeginOffset,
                         "insert");
+      transferValueHintMetadata(LI, V);
       LI.replaceAllUsesWith(V);
       Placeholder->replaceAllUsesWith(&LI);
       Placeholder->deleteValue();
     } else {
+      transferValueHintMetadata(LI, V);
       LI.replaceAllUsesWith(V);
     }
 

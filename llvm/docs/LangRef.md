@@ -8036,6 +8036,29 @@ related to compare and branch instructions. The metadata is treated as a
 boolean value; if it exists, it signals that the branch, select, or switch that
 it is attached to is completely unpredictable.
 
+(md_pin_register)=
+
+#### '`llvm.pin.register`' Metadata
+
+`llvm.pin.register` metadata may be attached to an instruction that produces
+a value. It has one string operand, a register name given the same way as for
+'`llvm.read_register`', and asks the register allocator to place the value in
+that register where possible. It is a hint: it may be dropped, and the value
+is placed elsewhere when the register is not available or not in the register
+class the value is selected into, or when the target does not recognize the
+name for the value's type. Targets that do not support it ignore it.
+
+```llvm
+%d = call <4 x float> @llvm.amdgcn.mfma.f32.16x16x16f16(<4 x half> %a, <4 x half> %b, <4 x float> %c, i32 0, i32 0, i32 0), !llvm.pin.register !0
+
+!0 = !{!"a[0:3]"}
+```
+
+On an `alloca`, it asks the same of each instruction whose value is stored to
+the `alloca`: when the `alloca` is promoted to registers, each such
+instruction is given the metadata, so the request also covers values stored
+through a pointer to the `alloca`.
+
 (md_dereferenceable)=
 
 #### '`dereferenceable`' Metadata
