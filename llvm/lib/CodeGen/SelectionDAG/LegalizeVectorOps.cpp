@@ -67,8 +67,12 @@ class VectorLegalizer {
   void AddLegalizedOperand(SDValue From, SDValue To) {
     LegalizedNodes.insert(std::make_pair(From, To));
     // If someone requests legalization of the new node, return itself.
-    if (From != To)
+    if (From != To) {
       LegalizedNodes.insert(std::make_pair(To, To));
+      if (From.getResNo() == 0 && To.getResNo() == 0)
+        if (MDNode *Hint = DAG.getTargetHint(From.getNode()))
+          DAG.addTargetHint(To.getNode(), Hint);
+    }
   }
 
   /// Legalizes the given node.

@@ -7614,6 +7614,11 @@ SDValue SelectionDAG::getNode(unsigned Opcode, const SDLoc &DL, EVT VT,
   }
 
   InsertNode(N);
+  // A bitcast is in the same register as its operand, so it keeps the
+  // operand's target hint when a later combine folds the operand into it.
+  if (Opcode == ISD::BITCAST && N1.getResNo() == 0)
+    if (MDNode *Hint = getTargetHint(N1.getNode()))
+      addTargetHint(N, Hint);
   SDValue V = SDValue(N, 0);
   NewSDValueDbgMsg(V, "Creating new node: ", this);
   return V;
