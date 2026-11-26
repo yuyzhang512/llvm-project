@@ -1616,6 +1616,9 @@ private:
   /// decls.
   DeclMapTy LocalDeclMap;
 
+  /// Locals pinned to a register, keyed by their address.
+  llvm::DenseMap<llvm::Value *, const VarDecl *> PinnedLocals;
+
   /// Lookup map for privatized BindingDecls.
   /// Used when BindingDecls are remapped during OpenMP outlining, since the
   /// remapped BindingDecl has a different pointer than the original.
@@ -4578,6 +4581,11 @@ public:
   LValue EmitVAArgExprLValue(const VAArgExpr *E);
   LValue EmitDeclRefLValue(const DeclRefExpr *E);
   LValue EmitOMPCapturedBindingLValue(const BindingDecl *BD);
+  /// The register name node of a local with amdgpu_pin_{vgpr,agpr}.
+  llvm::MDNode *getAMDGPUPinnedRegName(const VarDecl *VD);
+  /// If \p Addr is a pinned local, give \p Value, which is about to be stored
+  /// there, the !llvm.pin.register hint.
+  void EmitPinnedStoreHint(llvm::Value *Value, Address Addr);
   LValue EmitStringLiteralLValue(const StringLiteral *E);
   LValue EmitObjCEncodeExprLValue(const ObjCEncodeExpr *E);
   LValue EmitPredefinedLValue(const PredefinedExpr *E);

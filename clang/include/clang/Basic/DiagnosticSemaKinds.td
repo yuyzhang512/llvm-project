@@ -14441,6 +14441,13 @@ def note_acc_reduction_combiner_forming
            "operator|final assignment operator}0">;
 
 // AMDGCN type diagnostics
+def err_pinned_reg_invalid : Error<
+  "%0 cannot be pinned to %1 on this target">;
+def err_pinned_reg_out_of_range : Error<
+  "%0 is pinned to %1, %select{past the %2 %3|but there are no %3}4 on %5">;
+def err_pinned_reg_width : Error<
+  "%0 takes %1 registers; a pinned value must take %2">;
+
 def err_amdgpu_target_ext_type_unsupported : Error<
   "AMDGPU built-in type %0 is not supported on target '%1'">;
 

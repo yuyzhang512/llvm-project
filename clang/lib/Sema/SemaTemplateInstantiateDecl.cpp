@@ -676,6 +676,17 @@ ExplicitSpecifier Sema::instantiateExplicitSpecifier(
   return Result;
 }
 
+static void instantiateDependentAMDGPUPinRegAttr(
+    Sema &S, const MultiLevelTemplateArgumentList &TemplateArgs, Expr *RegExpr,
+    const AttributeCommonInfo &CI, bool IsAGPR, Decl *New) {
+  EnterExpressionEvaluationContext Unevaluated(
+      S, Sema::ExpressionEvaluationContext::ConstantEvaluated);
+  ExprResult Result = S.SubstExpr(RegExpr, TemplateArgs);
+  if (Result.isInvalid())
+    return;
+  S.AMDGPU().addAMDGPUPinRegAttr(New, CI, Result.getAs<Expr>(), IsAGPR);
+}
+
 static void instantiateDependentAMDGPUWavesPerEUAttr(
     Sema &S, const MultiLevelTemplateArgumentList &TemplateArgs,
     const AMDGPUWavesPerEUAttr &Attr, Decl *New) {
@@ -1010,6 +1021,20 @@ void Sema::InstantiateAttrs(const MultiLevelTemplateArgumentList &TemplateArgs,
             dyn_cast<AMDGPUMaxNumWorkGroupsAttr>(TmplAttr)) {
       instantiateDependentAMDGPUMaxNumWorkGroupsAttr(
           *this, TemplateArgs, *AMDGPUMaxNumWorkGroups, New);
+      continue;
+    }
+
+    if (const auto *PinVGPR = dyn_cast<AMDGPUPinVGPRAttr>(TmplAttr)) {
+      instantiateDependentAMDGPUPinRegAttr(*this, TemplateArgs,
+                                           PinVGPR->getReg(), *PinVGPR,
+                                           /*IsAGPR=*/false, New);
+      continue;
+    }
+
+    if (const auto *PinAGPR = dyn_cast<AMDGPUPinAGPRAttr>(TmplAttr)) {
+      instantiateDependentAMDGPUPinRegAttr(*this, TemplateArgs,
+                                           PinAGPR->getReg(), *PinAGPR,
+                                           /*IsAGPR=*/true, New);
       continue;
     }
 

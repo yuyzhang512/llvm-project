@@ -1359,6 +1359,14 @@ static llvm::Constant *replaceUndef(CodeGenModule &CGM, IsPattern isPattern,
 /// These turn into simple stack objects, or GlobalValues depending on target.
 void CodeGenFunction::EmitAutoVarDecl(const VarDecl &D) {
   AutoVarEmission emission = EmitAutoVarAlloca(D);
+  if (D.hasAttr<AMDGPUPinVGPRAttr>() || D.hasAttr<AMDGPUPinAGPRAttr>()) {
+    PinnedLocals[emission.Addr.getBasePointer()] = &D;
+    // Values stored through a pointer to the variable, such as a by-reference
+    // capture, get the hint when the alloca is promoted.
+    if (auto *AI = dyn_cast<llvm::AllocaInst>(
+            emission.getOriginalAllocatedAddress().getPointer()))
+      AI->setMetadata("llvm.pin.register", getAMDGPUPinnedRegName(&D));
+  }
   EmitAutoVarInit(emission);
   EmitAutoVarCleanups(emission);
 }

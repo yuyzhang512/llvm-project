@@ -4155,6 +4155,16 @@ public:
   void CheckVariableDeclarationType(VarDecl *NewVD);
   void CheckCompleteVariableDeclaration(VarDecl *VD);
 
+  /// Check that the target can pin local variable \p VD to the register it
+  /// asks for.
+  void CheckPinnedRegisterVar(VarDecl *VD);
+
+  /// The register local variable \p VD is pinned to by an attribute, spelled
+  /// as in !llvm.pin.register, the size of the value in bits, and the
+  /// attribute. False if there is none or it is not known yet.
+  bool getPinnedRegisterRequest(const VarDecl *VD, std::string &Name,
+                                uint64_t &Bits, const Attr *&A);
+
   NamedDecl *ActOnFunctionDeclarator(Scope *S, Declarator &D, DeclContext *DC,
                                      TypeSourceInfo *TInfo,
                                      LookupResult &Previous,

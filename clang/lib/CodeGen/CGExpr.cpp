@@ -2439,6 +2439,8 @@ void CodeGenFunction::EmitStoreOfScalar(llvm::Value *Value, Address Addr,
                                         LValueBaseInfo BaseInfo,
                                         TBAAAccessInfo TBAAInfo,
                                         bool isInit, bool isNontemporal) {
+  EmitPinnedStoreHint(Value, Addr);
+
   if (auto *GV = dyn_cast<llvm::GlobalValue>(Addr.getBasePointer()))
     if (GV->isThreadLocal())
       Addr = Addr.withPointer(Builder.CreateThreadLocalAddress(GV),
@@ -2860,6 +2862,7 @@ void CodeGenFunction::EmitStoreThroughLValue(RValue Src, LValue Dst,
         Vec = Builder.CreateBitCast(Vec, IRStoreTy);
       }
 
+      EmitPinnedStoreHint(Vec, Dst.getVectorAddress());
       auto *I = Builder.CreateStore(Vec, Dst.getVectorAddress(),
                                     Dst.isVolatileQualified());
       addInstToCurrentSourceAtom(I, Vec);
@@ -3243,6 +3246,7 @@ void CodeGenFunction::EmitStoreThroughExtVectorComponentLValue(RValue Src,
     Vec = Builder.CreateInsertElement(Vec, SrcVal, Elt);
   }
 
+  EmitPinnedStoreHint(Vec, Dst.getExtVectorAddress());
   Builder.CreateStore(Vec, Dst.getExtVectorAddress(),
                       Dst.isVolatileQualified());
 }
@@ -3553,6 +3557,39 @@ static LValue EmitCapturedFieldLValue(CodeGenFunction &CGF, const FieldDecl *FD,
 /// So far, only the name is being passed down, but other options such as
 /// register type, allocation type or even optimization options could be
 /// passed down via the metadata node.
+llvm::MDNode *CodeGenFunction::getAMDGPUPinnedRegName(const VarDecl *VD) {
+  bool IsAGPR = VD->hasAttr<AMDGPUPinAGPRAttr>();
+  const Expr *RegE = IsAGPR ? VD->getAttr<AMDGPUPinAGPRAttr>()->getReg()
+                            : VD->getAttr<AMDGPUPinVGPRAttr>()->getReg();
+  unsigned Reg = RegE->EvaluateKnownConstInt(getContext()).getZExtValue();
+  QualType T = VD->getType();
+  uint64_t Bits = getContext().getTypeSize(T);
+  // A vector's padding takes no register, so a float3 takes three.
+  if (const auto *VT = T->getAs<VectorType>())
+    Bits =
+        VT->getNumElements() * getContext().getTypeSize(VT->getElementType());
+  unsigned NumRegs = Bits / 32;
+
+  SmallString<16> RegName;
+  llvm::raw_svector_ostream OS(RegName);
+  OS << (IsAGPR ? 'a' : 'v');
+  if (NumRegs > 1)
+    OS << '[' << Reg << ':' << Reg + NumRegs - 1 << ']';
+  else
+    OS << Reg;
+
+  llvm::Metadata *Ops[] = {llvm::MDString::get(getLLVMContext(), RegName)};
+  return llvm::MDNode::get(getLLVMContext(), Ops);
+}
+
+void CodeGenFunction::EmitPinnedStoreHint(llvm::Value *Value, Address Addr) {
+  if (PinnedLocals.empty())
+    return;
+  if (const VarDecl *VD = PinnedLocals.lookup(Addr.getBasePointer()))
+    if (auto *I = dyn_cast<llvm::Instruction>(Value))
+      I->setMetadata("llvm.pin.register", getAMDGPUPinnedRegName(VD));
+}
+
 static LValue EmitGlobalNamedRegister(const VarDecl *VD, CodeGenModule &CGM) {
   SmallString<64> Name("llvm.named.register.");
   AsmLabelAttr *Asm = VD->getAttr<AsmLabelAttr>();

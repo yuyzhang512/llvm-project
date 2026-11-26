@@ -3672,6 +3672,33 @@ recent declaration that specifies them are used; a definition without
   }];
 }
 
+def AMDGPUPinRegDocs : Documentation {
+  let Category = DocCatAMDGPUAttributes;
+  let Content = [{
+``amdgpu_pin_vgpr`` and ``amdgpu_pin_agpr`` ask the register allocator to keep
+a local variable in a particular register:
+
+.. code-block:: c++
+
+  // acc is kept in v[256:259] where possible
+  __attribute__((amdgpu_pin_vgpr(256))) float4 acc;
+
+The argument is the first register of the tuple; how many registers are taken
+follows from the type, so a four-dword value pinned to 256 asks for
+``v[256:259]``. Each value stored to the variable carries the request as
+``!llvm.pin.register`` metadata.
+
+Only an automatic local can be placed this way, and only one whose type is a
+whole number of 32-bit registers; the attribute is ignored elsewhere. An
+``amdgpu_pin_agpr`` request additionally selects the form of an MFMA that writes
+its result to the AGPR file, so that an accumulator kept there needs no moves
+between the two files.
+
+This is a hint. Allocation still succeeds when the register is unavailable, so
+an unsatisfiable request costs performance, not correctness.
+  }];
+}
+
 def AMDGPUNumSGPRNumVGPRDocs : Documentation {
   let Category = DocCatAMDGPUAttributes;
   let Content = [{

@@ -81,6 +81,31 @@ public:
   void handleAMDGPUNumVGPRAttr(Decl *D, const ParsedAttr &AL);
   void handleAMDGPUMaxNumWorkGroupsAttr(Decl *D, const ParsedAttr &AL);
   void handleAMDGPUFlatWorkGroupSizeAttr(Decl *D, const ParsedAttr &AL);
+  void handleAMDGPUPinRegAttr(Decl *D, const ParsedAttr &AL, bool IsAGPR);
+  void addAMDGPUPinRegAttr(Decl *D, const AttributeCommonInfo &CI, Expr *E,
+                           bool IsAGPR);
+  /// Drop a register pin from a variable whose type, once known, does not fill
+  /// whole registers. Covers types deduced after the attribute was attached.
+  void checkPinnedRegVarType(VarDecl *VD);
+
+  /// The register name of a local pinned to \p Num registers from \p First,
+  /// e.g. "v8" or "a[4:7]".
+  static std::string getPinnedRegName(bool IsAGPR, unsigned First,
+                                      unsigned Num);
+
+  /// The bits a pinned value of type \p T occupies. A vector's padding is not
+  /// part of the value, so a float3 takes three registers.
+  static uint64_t getPinnedValueBits(ASTContext &Ctx, QualType T);
+
+  /// Sema::getPinnedRegisterRequest for amdgpu_pin_{vgpr,agpr}.
+  static bool getPinnedRegisterRequest(ASTContext &Ctx, const VarDecl *VD,
+                                       std::string &Name, uint64_t &Bits,
+                                       const Attr *&A);
+
+private:
+  bool fillsWholeRegisters(QualType T);
+
+public:
 
   /// Expand a valid use of the feature identification builtins into its
   /// corresponding sequence of instructions.
