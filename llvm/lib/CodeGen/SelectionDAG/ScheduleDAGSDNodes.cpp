@@ -1104,13 +1104,14 @@ EmitSchedule(MachineBasicBlock::iterator &InsertPos) {
   // Hint each value once all its uses in the block are emitted. If the
   // register is outside the value's class, the class is widened where every
   // instruction using the value allows, e.g. to take an AGPR for a value
-  // selected into a VGPR class.
+  // selected into a VGPR class. A hint still outside it is kept for a later
+  // pass that moves the value, e.g. from SGPRs to VGPRs; the allocator ignores
+  // it until then.
   MachineRegisterInfo &MRI = MF.getRegInfo();
   for (auto [VReg, PinReg] : PinHints) {
     if (!MRI.getRegClass(VReg)->contains(PinReg))
       MRI.recomputeRegClass(VReg);
-    if (MRI.getRegClass(VReg)->contains(PinReg))
-      MRI.setPinHint(VReg, PinReg);
+    MRI.setPinHint(VReg, PinReg);
   }
 
   InsertPos = Emitter.getInsertPos();

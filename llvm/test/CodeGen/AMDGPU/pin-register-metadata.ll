@@ -49,28 +49,28 @@ define amdgpu_kernel void @loop(ptr addrspace(1) %p, i32 %n) {
 ; GFX942-NEXT:    s_load_dwordx2 s[2:3], s[4:5], 0x0
 ; GFX942-NEXT:    s_load_dword s0, s[4:5], 0x8
 ; GFX942-NEXT:    v_and_b32_e32 v0, 0x3ff, v0
-; GFX942-NEXT:    v_lshlrev_b32_e32 v8, 4, v0
-; GFX942-NEXT:    v_mov_b32_e32 v9, 0
+; GFX942-NEXT:    v_lshlrev_b32_e32 v4, 4, v0
+; GFX942-NEXT:    v_mov_b32_e32 v5, 0
 ; GFX942-NEXT:    s_waitcnt lgkmcnt(0)
-; GFX942-NEXT:    global_load_dwordx4 v[0:3], v8, s[2:3]
-; GFX942-NEXT:    v_lshl_add_u64 v[10:11], s[2:3], 0, v[8:9]
+; GFX942-NEXT:    global_load_dwordx4 v[0:3], v4, s[2:3]
+; GFX942-NEXT:    v_lshl_add_u64 v[6:7], s[2:3], 0, v[4:5]
 ; GFX942-NEXT:    s_mov_b32 s1, 0
-; GFX942-NEXT:    v_mov_b32_e32 v5, v9
-; GFX942-NEXT:    v_mov_b32_e32 v6, v9
-; GFX942-NEXT:    v_mov_b32_e32 v7, v9
+; GFX942-NEXT:    v_mov_b32_e32 v21, v5
+; GFX942-NEXT:    v_mov_b32_e32 v22, v5
+; GFX942-NEXT:    v_mov_b32_e32 v23, v5
 ; GFX942-NEXT:  .LBB1_1: ; %body
 ; GFX942-NEXT:    ; =>This Inner Loop Header: Depth=1
 ; GFX942-NEXT:    s_add_i32 s1, s1, 1
 ; GFX942-NEXT:    s_waitcnt vmcnt(0)
-; GFX942-NEXT:    v_add_u32_e32 v7, v7, v3
-; GFX942-NEXT:    v_add_u32_e32 v6, v6, v2
-; GFX942-NEXT:    v_add_u32_e32 v5, v5, v1
+; GFX942-NEXT:    v_add_u32_e32 v23, v23, v3
+; GFX942-NEXT:    v_add_u32_e32 v22, v22, v2
+; GFX942-NEXT:    v_add_u32_e32 v21, v21, v1
 ; GFX942-NEXT:    s_cmp_lt_i32 s1, s0
-; GFX942-NEXT:    v_add_u32_e32 v9, v9, v0
+; GFX942-NEXT:    v_add_u32_e32 v5, v5, v0
 ; GFX942-NEXT:    s_cbranch_scc1 .LBB1_1
 ; GFX942-NEXT:  ; %bb.2: ; %exit
-; GFX942-NEXT:    v_mov_b32_e32 v4, v9
-; GFX942-NEXT:    global_store_dwordx4 v[10:11], v[4:7], off
+; GFX942-NEXT:    v_mov_b32_e32 v20, v5
+; GFX942-NEXT:    global_store_dwordx4 v[6:7], v[20:23], off
 ; GFX942-NEXT:    s_endpgm
 ;
 ; GFX950-LABEL: loop:
@@ -78,28 +78,28 @@ define amdgpu_kernel void @loop(ptr addrspace(1) %p, i32 %n) {
 ; GFX950-NEXT:    s_load_dwordx2 s[2:3], s[4:5], 0x0
 ; GFX950-NEXT:    s_load_dword s0, s[4:5], 0x8
 ; GFX950-NEXT:    v_and_b32_e32 v0, 0x3ff, v0
-; GFX950-NEXT:    v_lshlrev_b32_e32 v8, 4, v0
-; GFX950-NEXT:    v_mov_b32_e32 v9, 0
+; GFX950-NEXT:    v_lshlrev_b32_e32 v4, 4, v0
+; GFX950-NEXT:    v_mov_b32_e32 v5, 0
 ; GFX950-NEXT:    s_waitcnt lgkmcnt(0)
-; GFX950-NEXT:    global_load_dwordx4 v[0:3], v8, s[2:3]
-; GFX950-NEXT:    v_lshl_add_u64 v[10:11], s[2:3], 0, v[8:9]
+; GFX950-NEXT:    global_load_dwordx4 v[0:3], v4, s[2:3]
+; GFX950-NEXT:    v_lshl_add_u64 v[6:7], s[2:3], 0, v[4:5]
 ; GFX950-NEXT:    s_mov_b32 s1, 0
-; GFX950-NEXT:    v_mov_b32_e32 v5, v9
-; GFX950-NEXT:    v_mov_b32_e32 v6, v9
-; GFX950-NEXT:    v_mov_b32_e32 v7, v9
+; GFX950-NEXT:    v_mov_b32_e32 v21, v5
+; GFX950-NEXT:    v_mov_b32_e32 v22, v5
+; GFX950-NEXT:    v_mov_b32_e32 v23, v5
 ; GFX950-NEXT:  .LBB1_1: ; %body
 ; GFX950-NEXT:    ; =>This Inner Loop Header: Depth=1
 ; GFX950-NEXT:    s_add_i32 s1, s1, 1
 ; GFX950-NEXT:    s_waitcnt vmcnt(0)
-; GFX950-NEXT:    v_add_u32_e32 v7, v7, v3
-; GFX950-NEXT:    v_add_u32_e32 v6, v6, v2
-; GFX950-NEXT:    v_add_u32_e32 v5, v5, v1
+; GFX950-NEXT:    v_add_u32_e32 v23, v23, v3
+; GFX950-NEXT:    v_add_u32_e32 v22, v22, v2
+; GFX950-NEXT:    v_add_u32_e32 v21, v21, v1
 ; GFX950-NEXT:    s_cmp_lt_i32 s1, s0
-; GFX950-NEXT:    v_add_u32_e32 v9, v9, v0
+; GFX950-NEXT:    v_add_u32_e32 v5, v5, v0
 ; GFX950-NEXT:    s_cbranch_scc1 .LBB1_1
 ; GFX950-NEXT:  ; %bb.2: ; %exit
-; GFX950-NEXT:    v_mov_b32_e32 v4, v9
-; GFX950-NEXT:    global_store_dwordx4 v[10:11], v[4:7], off
+; GFX950-NEXT:    v_mov_b32_e32 v20, v5
+; GFX950-NEXT:    global_store_dwordx4 v[6:7], v[20:23], off
 ; GFX950-NEXT:    s_endpgm
 entry:
   %id = call i32 @llvm.amdgcn.workitem.id.x()
@@ -423,6 +423,80 @@ define amdgpu_kernel void @ds_read_src_agpr(ptr addrspace(1) %p) {
   %m = call <4 x float> @llvm.amdgcn.mfma.f32.4x4x1f32(float %a, float %b, <4 x float> zeroinitializer, i32 0, i32 0, i32 0)
   %g = getelementptr <4 x float>, ptr addrspace(1) %p, i32 %id
   store <4 x float> %m, ptr addrspace(1) %g
+  ret void
+}
+
+; A vector split into packed operations is hinted as a whole: its parts are
+; computed into the hinted registers, including through the bitcast to
+; integers for the store.
+define amdgpu_kernel void @split(ptr addrspace(1) %p) {
+; GFX942-LABEL: split:
+; GFX942:       ; %bb.0:
+; GFX942-NEXT:    s_load_dwordx2 s[0:1], s[4:5], 0x0
+; GFX942-NEXT:    v_and_b32_e32 v0, 0x3ff, v0
+; GFX942-NEXT:    v_lshlrev_b32_e32 v4, 4, v0
+; GFX942-NEXT:    s_waitcnt lgkmcnt(0)
+; GFX942-NEXT:    global_load_dwordx4 v[0:3], v4, s[0:1]
+; GFX942-NEXT:    s_waitcnt vmcnt(0)
+; GFX942-NEXT:    v_pk_add_f32 v[10:11], v[2:3], v[2:3]
+; GFX942-NEXT:    v_pk_add_f32 v[8:9], v[0:1], v[0:1]
+; GFX942-NEXT:    global_store_dwordx4 v4, v[8:11], s[0:1]
+; GFX942-NEXT:    s_endpgm
+;
+; GFX950-LABEL: split:
+; GFX950:       ; %bb.0:
+; GFX950-NEXT:    s_load_dwordx2 s[0:1], s[4:5], 0x0
+; GFX950-NEXT:    v_and_b32_e32 v0, 0x3ff, v0
+; GFX950-NEXT:    v_lshlrev_b32_e32 v4, 4, v0
+; GFX950-NEXT:    s_waitcnt lgkmcnt(0)
+; GFX950-NEXT:    global_load_dwordx4 v[0:3], v4, s[0:1]
+; GFX950-NEXT:    s_waitcnt vmcnt(0)
+; GFX950-NEXT:    v_pk_add_f32 v[10:11], v[2:3], v[2:3]
+; GFX950-NEXT:    v_pk_add_f32 v[8:9], v[0:1], v[0:1]
+; GFX950-NEXT:    global_store_dwordx4 v4, v[8:11], s[0:1]
+; GFX950-NEXT:    s_endpgm
+  %id = call i32 @llvm.amdgcn.workitem.id.x()
+  %g = getelementptr <4 x float>, ptr addrspace(1) %p, i32 %id
+  %x = load <4 x float>, ptr addrspace(1) %g
+  %m = fmul <4 x float> %x, splat (float 2.0), !llvm.pin.register !0
+  store <4 x float> %m, ptr addrspace(1) %g
+  ret void
+}
+
+; A uniform value the VALU computes from SGPRs: the hint follows it when it
+; is moved to VGPRs.
+define amdgpu_kernel void @uniform_valu(ptr addrspace(1) %p, <4 x float> %x, <4 x float> %y) {
+; GFX942-LABEL: uniform_valu:
+; GFX942:       ; %bb.0:
+; GFX942-NEXT:    s_load_dwordx8 s[8:15], s[4:5], 0x10
+; GFX942-NEXT:    s_load_dwordx2 s[0:1], s[4:5], 0x0
+; GFX942-NEXT:    v_mov_b32_e32 v4, 0
+; GFX942-NEXT:    s_waitcnt lgkmcnt(0)
+; GFX942-NEXT:    v_mov_b32_e32 v0, s14
+; GFX942-NEXT:    v_mov_b32_e32 v1, s15
+; GFX942-NEXT:    v_mov_b32_e32 v2, s12
+; GFX942-NEXT:    v_mov_b32_e32 v3, s13
+; GFX942-NEXT:    v_pk_mul_f32 v[10:11], s[10:11], v[0:1]
+; GFX942-NEXT:    v_pk_mul_f32 v[8:9], s[8:9], v[2:3]
+; GFX942-NEXT:    global_store_dwordx4 v4, v[8:11], s[0:1]
+; GFX942-NEXT:    s_endpgm
+;
+; GFX950-LABEL: uniform_valu:
+; GFX950:       ; %bb.0:
+; GFX950-NEXT:    s_load_dwordx8 s[8:15], s[4:5], 0x10
+; GFX950-NEXT:    s_load_dwordx2 s[0:1], s[4:5], 0x0
+; GFX950-NEXT:    v_mov_b32_e32 v4, 0
+; GFX950-NEXT:    s_waitcnt lgkmcnt(0)
+; GFX950-NEXT:    v_mov_b32_e32 v0, s14
+; GFX950-NEXT:    v_mov_b32_e32 v1, s15
+; GFX950-NEXT:    v_mov_b32_e32 v2, s12
+; GFX950-NEXT:    v_mov_b32_e32 v3, s13
+; GFX950-NEXT:    v_pk_mul_f32 v[10:11], s[10:11], v[0:1]
+; GFX950-NEXT:    v_pk_mul_f32 v[8:9], s[8:9], v[2:3]
+; GFX950-NEXT:    global_store_dwordx4 v4, v[8:11], s[0:1]
+; GFX950-NEXT:    s_endpgm
+  %m = fmul <4 x float> %x, %y, !llvm.pin.register !0
+  store <4 x float> %m, ptr addrspace(1) %p
   ret void
 }
 

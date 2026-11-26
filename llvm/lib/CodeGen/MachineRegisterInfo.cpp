@@ -398,6 +398,11 @@ void MachineRegisterInfo::replaceRegWith(Register FromReg, Register ToReg) {
       O.setReg(ToReg);
     }
   }
+
+  // A requested hint follows the value into its new register.
+  if (FromReg.isVirtual() && ToReg.isVirtual() && hasPinHint(FromReg) &&
+      !getSimpleHint(ToReg))
+    setPinHint(ToReg, getSimpleHint(FromReg));
 }
 
 /// getVRegDef - Return the machine instr that defines the specified virtual
