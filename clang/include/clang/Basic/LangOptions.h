@@ -347,6 +347,9 @@ public:
     NamedRegister,
     /// An alloca; each value stored to it goes through llvm.pin.register.
     Intrinsic,
+    /// An alloca; with -fpin-register-hint, each instruction whose value is
+    /// stored to it carries !llvm.pin.register, otherwise as Intrinsic.
+    Metadata,
   };
 
   enum class GPUDefaultStreamKind {

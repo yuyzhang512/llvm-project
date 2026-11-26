@@ -3640,6 +3640,12 @@ bool CodeGenFunction::isPinnedToNamedRegister(const VarDecl &D) {
          getLangOpts().pinnedLocalsHaveNoStorage();
 }
 
+bool CodeGenFunction::pinnedHintIsMetadata() const {
+  return getLangOpts().PinRegisterLowering ==
+             LangOptions::PinRegisterLoweringKind::Metadata &&
+         getLangOpts().PinRegisterHint;
+}
+
 llvm::Value *CodeGenFunction::EmitPinnedStoreValue(llvm::Value *Value,
                                                    Address Addr) {
   if (PinnedLocals.empty())
@@ -3647,6 +3653,13 @@ llvm::Value *CodeGenFunction::EmitPinnedStoreValue(llvm::Value *Value,
   const VarDecl *VD = PinnedLocals.lookup(Addr.getBasePointer());
   if (!VD)
     return Value;
+  // A hint may be dropped, so it can be metadata on the value. A required pin
+  // may not, and still goes through the intrinsic.
+  if (pinnedHintIsMetadata()) {
+    if (auto *I = dyn_cast<llvm::Instruction>(Value))
+      I->setMetadata("llvm.pin.register", getAMDGPUPinnedRegName(VD));
+    return Value;
+  }
   llvm::Value *Name =
       llvm::MetadataAsValue::get(getLLVMContext(), getAMDGPUPinnedRegName(VD));
   return Builder.CreateIntrinsic(

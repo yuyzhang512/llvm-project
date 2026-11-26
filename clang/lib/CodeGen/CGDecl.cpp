@@ -1373,11 +1373,14 @@ void CodeGenFunction::EmitAutoVarDecl(const VarDecl &D) {
     // capture, are pinned when the alloca is promoted.
     if (auto *AI = dyn_cast<llvm::AllocaInst>(
             emission.getOriginalAllocatedAddress().getPointer())) {
-      llvm::Metadata *Ops[] = {getAMDGPUPinnedRegName(&D)->getOperand(0),
-                               llvm::ConstantAsMetadata::get(Builder.getInt1(
-                                   !getLangOpts().PinRegisterHint))};
-      AI->setMetadata("llvm.pin.register",
-                      llvm::MDNode::get(getLLVMContext(), Ops));
+      llvm::MDNode *Name = getAMDGPUPinnedRegName(&D);
+      if (!pinnedHintIsMetadata()) {
+        llvm::Metadata *Ops[] = {Name->getOperand(0),
+                                 llvm::ConstantAsMetadata::get(Builder.getInt1(
+                                     !getLangOpts().PinRegisterHint))};
+        Name = llvm::MDNode::get(getLLVMContext(), Ops);
+      }
+      AI->setMetadata("llvm.pin.register", Name);
     }
   }
   EmitAutoVarInit(emission);
