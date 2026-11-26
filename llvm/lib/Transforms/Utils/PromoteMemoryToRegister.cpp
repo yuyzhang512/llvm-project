@@ -631,6 +631,7 @@ static bool rewriteSingleStoreAlloca(
       ReplVal = PoisonValue::get(LI->getType());
 
     convertMetadataToAssumes(LI, ReplVal, DL, AC, &DT);
+    transferValueHintMetadata(*LI, ReplVal);
     LI->replaceAllUsesWith(ReplVal);
     LI->eraseFromParent();
     LBI.deleteValue(LI);
@@ -745,6 +746,7 @@ static bool promoteSingleBlockAlloca(
     // code.
     if (ReplVal == LI)
       ReplVal = PoisonValue::get(LI->getType());
+    transferValueHintMetadata(*LI, ReplVal);
 
     LI->replaceAllUsesWith(ReplVal);
     LI->eraseFromParent();
@@ -1317,6 +1319,7 @@ void PromoteMem2Reg::RenamePass(BasicBlock *BB, BasicBlock *Pred) {
 
       Value *V = IncomingVals[AI->second];
       convertMetadataToAssumes(LI, V, SQ.DL, AC, &DT);
+      transferValueHintMetadata(*LI, V);
 
       // Anything using the load now uses the current value.
       LI->replaceAllUsesWith(V);
@@ -1360,10 +1363,22 @@ void PromoteMem2Reg::RenamePass(BasicBlock *BB, BasicBlock *Pred) {
 // An alloca marked !llvm.pin.register !{!"<name>", i1 <required>} holds a
 // variable pinned to a register. Pin each value stored to it before it is
 // promoted, so the value keeps the request once the alloca is gone. A value
-// already pinned to the register is left alone.
+// already pinned to the register is left alone. With !{!"<name>"}, a hint,
+// each stored instruction gets the same metadata instead.
 static void pinStoredValues(AllocaInst *AI) {
   MDNode *MD = AI->getMetadata("llvm.pin.register");
-  if (!MD || MD->getNumOperands() != 2 || !isa<MDString>(MD->getOperand(0)))
+  if (!MD || MD->getNumOperands() == 0 || !isa<MDString>(MD->getOperand(0)))
+    return;
+  if (MD->getNumOperands() == 1) {
+    for (User *U : AI->users())
+      if (auto *SI = dyn_cast<StoreInst>(U);
+          SI && SI->getPointerOperand() == AI)
+        if (auto *I = dyn_cast<Instruction>(SI->getValueOperand()))
+          if (!I->getMetadata("llvm.pin.register"))
+            I->setMetadata("llvm.pin.register", MD);
+    return;
+  }
+  if (MD->getNumOperands() != 2)
     return;
   auto *Required = mdconst::dyn_extract<ConstantInt>(MD->getOperand(1));
   if (!Required)
