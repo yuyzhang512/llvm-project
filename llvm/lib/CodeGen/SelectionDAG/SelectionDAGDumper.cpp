@@ -1082,6 +1082,21 @@ void SDNode::print_details(raw_ostream &OS, const SelectionDAG *G) const {
                            G->getMachineFunction().getFunction().getParent());
       OS << ']';
     }
+
+    if (MDNode *Hint = G ? G->getTargetHint(this) : nullptr) {
+      // Print the node inline: a hint made in codegen has no number.
+      OS << " [target-hint !{";
+      ListSeparator LS;
+      for (const MDOperand &Op : Hint->operands()) {
+        OS << LS;
+        if (Op)
+          Op->printAsOperand(OS,
+                             G->getMachineFunction().getFunction().getParent());
+        else
+          OS << "null";
+      }
+      OS << "}]";
+    }
   }
 }
 

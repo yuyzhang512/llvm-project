@@ -59,19 +59,27 @@ inline bool namesAGPR(const SDNode *N, unsigned MDOpNo) {
 }
 
 // True when an MFMA's accumulator lives in a register the program named with
-// llvm.{read,write}_register, and that register is an AGPR -- either the
+// llvm.{read,write}_register or llvm.pin.register, or hinted to with
+// !llvm.pin.register, and that register is an AGPR -- either the
 // accumulator is read from one, or the result is written to one. The two ends
 // move together, so either is enough to pick the form that writes the AGPR
 // file. Choosing it for any other accumulator only moves that value into the
 // AGPR file and back out again.
-inline bool mfmaAccIsNamedAGPR(const SDNode *N, const SIRegisterInfo *TRI) {
-  // An llvm.pin.register hint names its register in operand 1.
+inline bool mfmaAccIsNamedAGPR(const SDNode *N, const SelectionDAG &DAG,
+                               const SIRegisterInfo *TRI) {
+  // An llvm.pin.register hint names its register in operand 1;
+  // !llvm.pin.register metadata stays with the node as a target hint.
   auto HintsAGPR = [&](const SDNode *P) {
-    return P->isMachineOpcode() &&
-           P->getMachineOpcode() == TargetOpcode::PIN_REGISTER &&
-           SIRegisterInfo::isAGPRClass(
-               TRI->getPhysRegBaseClass(P->getConstantOperandVal(1)));
+    Register Reg = DAG.getTargetLoweringInfo().getPinRegisterHintNum(P, DAG);
+    if (P->isMachineOpcode() &&
+        P->getMachineOpcode() == TargetOpcode::PIN_REGISTER)
+      Reg = P->getConstantOperandVal(1);
+    return Reg &&
+           SIRegisterInfo::isAGPRClass(TRI->getPhysRegBaseClass(Reg.asMCReg()));
   };
+
+  if (HintsAGPR(N))
+    return true;
 
   // Operand 0 is the intrinsic id, so the accumulator is operand 3.
   if (N->getNumOperands() >= 4) {

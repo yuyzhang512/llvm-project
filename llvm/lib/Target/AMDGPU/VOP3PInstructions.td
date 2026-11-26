@@ -1246,7 +1246,7 @@ class MAIFrag<SDPatternOperator Op, bit HasAbid = true, bit Scaled = false> : Pa
 class CanUseAGPR_MAI<ValueType vt> {
   code PredicateCode = [{
     return !Subtarget->hasGFX90AInsts() ||
-      mfmaAccIsNamedAGPR(N, Subtarget->getRegisterInfo()) ||
+      mfmaAccIsNamedAGPR(N, *CurDAG, Subtarget->getRegisterInfo()) ||
       MF->getInfo<SIMachineFunctionInfo>()->selectAGPRFormMFMAByBudget(
         }] # !srl(vt.Size, 5) # ");";
 

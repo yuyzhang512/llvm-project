@@ -491,6 +491,10 @@ public:
   SDValue lowerSET_FPENV(SDValue Op, SelectionDAG &DAG) const;
   SDValue lowerROTR(SDValue Op, SelectionDAG &DAG) const;
 
+  MDNode *getTargetHint(const Instruction &I) const override {
+    return getPinRegisterHint(I);
+  }
+
   Register getRegisterByName(const char* RegName, LLT VT,
                              const MachineFunction &MF) const override;
 
