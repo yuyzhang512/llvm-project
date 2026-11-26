@@ -6275,6 +6275,21 @@ const char *TargetLowering::LowerXConstraint(EVT ConstraintVT) const {
   return nullptr;
 }
 
+Register TargetLowering::getPinRegisterHintNum(const SDNode *N,
+                                               const SelectionDAG &DAG) const {
+  const MDNode *Hint = DAG.getTargetHint(N);
+  if (!Hint || Hint->getNumOperands() != 2 || !N->getNumValues())
+    return Register();
+  auto *Tag = dyn_cast<MDString>(Hint->getOperand(0));
+  auto *Name = dyn_cast<MDString>(Hint->getOperand(1));
+  MVT VT = N->getSimpleValueType(0);
+  if (!Tag || !Name || Tag->getString() != "llvm.pin.register" ||
+      (!VT.isInteger() && !VT.isFloatingPoint()))
+    return Register();
+  return getRegisterByName(Name->getString().str().c_str(), getLLTForMVT(VT),
+                           DAG.getMachineFunction());
+}
+
 SDValue TargetLowering::LowerAsmOutputForConstraint(
     SDValue &Chain, SDValue &Glue, const SDLoc &DL,
     const AsmOperandInfo &OpInfo, SelectionDAG &DAG) const {

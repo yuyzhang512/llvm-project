@@ -5650,6 +5650,35 @@ public:
                                               SmallVectorImpl<SDValue> &Ops,
                                               SelectionDAG &DAG) const;
 
+  /// Targets may override this function to return metadata from \p I that
+  /// instruction selection should see. It is recorded on the node computing
+  /// the value of \p I and read back with SelectionDAG::getTargetHint.
+  virtual MDNode *getTargetHint(const Instruction &I) const { return nullptr; }
+
+  /// If \p I has !llvm.pin.register !{!"<name>"}, return the target hint
+  /// !{!"llvm.pin.register", !"<name>"}, which asks for that register, named
+  /// as for llvm.read_register. The tag tells it apart from target hints of
+  /// other kinds. When a node with this hint is emitted, the register becomes
+  /// the allocation hint of its result. A target that supports pinning returns
+  /// it from getTargetHint.
+  static MDNode *getPinRegisterHint(const Instruction &I) {
+    MDNode *Pin = I.getMetadata("llvm.pin.register");
+    auto *Name = Pin && Pin->getNumOperands() == 1
+                     ? dyn_cast<MDString>(Pin->getOperand(0))
+                     : nullptr;
+    if (!Name)
+      return nullptr;
+    LLVMContext &Ctx = I.getContext();
+    return MDNode::get(Ctx, {MDString::get(Ctx, "llvm.pin.register"), Name});
+  }
+
+  /// If the target hint of \p N was made by getPinRegisterHint, return the
+  /// register it asks for, resolved with getRegisterByName for the type of
+  /// result 0 of \p N. Otherwise, or if the target does not resolve the name,
+  /// return an invalid register.
+  Register getPinRegisterHintNum(const SDNode *N,
+                                 const SelectionDAG &DAG) const;
+
   //===--------------------------------------------------------------------===//
   // Div utility functions
   //

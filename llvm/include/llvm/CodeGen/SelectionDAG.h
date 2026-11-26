@@ -299,6 +299,7 @@ class SelectionDAG {
     MDNode *HeapAllocSite = nullptr;
     MDNode *PCSections = nullptr;
     MDNode *MMRA = nullptr;
+    MDNode *TargetHint = nullptr;
     CalledGlobalInfo CalledGlobal{};
     bool NoMerge = false;
   };
@@ -2697,6 +2698,16 @@ public:
     return I != SDEI.end()
                ? std::make_optional(std::move(I->second).CalledGlobal)
                : std::nullopt;
+  }
+  /// Set the target hint returned by TargetLowering::getTargetHint for the
+  /// instruction whose value is result 0 of Node.
+  void addTargetHint(const SDNode *Node, MDNode *MD) {
+    SDEI[Node].TargetHint = MD;
+  }
+  /// Return the target hint associated with Node, or nullptr if none exists.
+  MDNode *getTargetHint(const SDNode *Node) const {
+    auto It = SDEI.find(Node);
+    return It != SDEI.end() ? It->second.TargetHint : nullptr;
   }
   /// Set NoMergeSiteInfo to be associated with Node if NoMerge is true.
   void addNoMergeSiteInfo(const SDNode *Node, bool NoMerge) {

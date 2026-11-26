@@ -106,7 +106,6 @@ private:
   bool fillsWholeRegisters(QualType T);
 
 public:
-
   /// Expand a valid use of the feature identification builtins into its
   /// corresponding sequence of instructions.
   Expr *ExpandAMDGPUPredicateBuiltIn(Expr *CE);

@@ -46,6 +46,29 @@ static inline bool getConstantValue(SDValue N, uint32_t &Out) {
   return false;
 }
 
+// True when an MFMA's result or its accumulator is hinted to an AGPR with
+// !llvm.pin.register. The two ends move together, so either is enough to pick
+// the form that writes the AGPR file; otherwise the result is selected into
+// VGPRs and the hint can never be met.
+inline bool mfmaAccIsHintedAGPR(const SDNode *N, const SelectionDAG &DAG,
+                                const SIRegisterInfo *TRI) {
+  const TargetLowering &TLI = DAG.getTargetLoweringInfo();
+  auto HintsAGPR = [&](const SDNode *P) {
+    Register Reg = TLI.getPinRegisterHintNum(P, DAG);
+    return Reg &&
+           SIRegisterInfo::isAGPRClass(TRI->getPhysRegBaseClass(Reg.asMCReg()));
+  };
+  if (HintsAGPR(N))
+    return true;
+  // Operand 0 is the intrinsic id, so the accumulator is operand 3.
+  if (N->getNumOperands() < 4)
+    return false;
+  SDValue SrcC = N->getOperand(3);
+  while (SrcC.getOpcode() == ISD::BITCAST)
+    SrcC = SrcC.getOperand(0);
+  return HintsAGPR(SrcC.getNode());
+}
+
 /// AMDGPU specific code to select AMDGPU machine instructions for
 /// SelectionDAG operations.
 class AMDGPUDAGToDAGISel : public SelectionDAGISel {

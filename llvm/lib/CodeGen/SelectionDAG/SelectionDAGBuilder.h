@@ -636,6 +636,7 @@ private:
   void visitAtomicRMW(const AtomicRMWInst &I);
   void visitFence(const FenceInst &I);
   void visitPHI(const PHINode &I);
+  void addTargetHint(const Instruction &I, MDNode *Hint);
   void visitCall(const CallInst &I);
   bool visitMemCmpBCmpCall(const CallInst &I);
   bool visitMemCCpyCall(const CallInst &I);

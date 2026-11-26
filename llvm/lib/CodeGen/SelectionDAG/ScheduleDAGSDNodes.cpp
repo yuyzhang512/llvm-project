@@ -878,6 +878,9 @@ EmitSchedule(MachineBasicBlock::iterator &InsertPos) {
   SmallVector<std::pair<unsigned, MachineInstr*>, 32> Orders;
   SmallSet<Register, 8> Seen;
   bool HasDbg = DAG->hasDebugValues();
+  // Virtual registers to hint, from !llvm.pin.register target hints.
+  SmallVector<std::pair<Register, Register>, 4> PinHints;
+  const TargetLowering &TLI = DAG->getTargetLoweringInfo();
 
   // Emit a node, and determine where its first instruction is for debuginfo.
   // Zero, one, or multiple instructions can be created when emitting a node.
@@ -895,6 +898,10 @@ EmitSchedule(MachineBasicBlock::iterator &InsertPos) {
     MachineBasicBlock::iterator Before = GetPrevInsn(Emitter.getInsertPos());
     Emitter.EmitNode(Node, IsClone, IsCloned, VRBaseMap);
     MachineBasicBlock::iterator After = GetPrevInsn(Emitter.getInsertPos());
+
+    if (Register PinReg = TLI.getPinRegisterHintNum(Node, *DAG))
+      if (Register VReg = VRBaseMap.lookup(SDValue(Node, 0)); VReg.isVirtual())
+        PinHints.emplace_back(VReg, PinReg);
 
     // If the iterator did not change, no instructions were inserted.
     if (Before == After)
@@ -1092,6 +1099,18 @@ EmitSchedule(MachineBasicBlock::iterator &InsertPos) {
 
       LastOrder = Order;
     }
+  }
+
+  // Hint each value once all its uses in the block are emitted. If the
+  // register is outside the value's class, the class is widened where every
+  // instruction using the value allows, e.g. to take an AGPR for a value
+  // selected into a VGPR class.
+  MachineRegisterInfo &MRI = MF.getRegInfo();
+  for (auto [VReg, PinReg] : PinHints) {
+    if (!MRI.getRegClass(VReg)->contains(PinReg))
+      MRI.recomputeRegClass(VReg);
+    if (MRI.getRegClass(VReg)->contains(PinReg))
+      MRI.setPinHint(VReg, PinReg);
   }
 
   InsertPos = Emitter.getInsertPos();

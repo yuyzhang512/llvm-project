@@ -1408,6 +1408,10 @@ void SelectionDAGBuilder::visit(const Instruction &I) {
       !isa<GCStatepointInst>(I)) // statepoints handle their exports internally
     CopyToExportRegsIfNeeded(&I);
 
+  if (I.hasMetadataOtherThanDebugLoc())
+    if (MDNode *Hint = DAG.getTargetLoweringInfo().getTargetHint(I))
+      addTargetHint(I, Hint);
+
   // Handle metadata.
   if (PCSectionsMD || MMRA) {
     auto It = NodeMap.find(&I);
@@ -1427,6 +1431,19 @@ void SelectionDAGBuilder::visit(const Instruction &I) {
   }
 
   CurInst = nullptr;
+}
+
+// Record the target hint of I on the node computing its value.
+void SelectionDAGBuilder::addTargetHint(const Instruction &I, MDNode *Hint) {
+  auto It = NodeMap.find(&I);
+  if (It == NodeMap.end())
+    return;
+  SDValue V = It->second;
+  // A constant node is shared by every use of the constant.
+  if (!V.getNode() || V.getResNo() != 0 || isa<ConstantSDNode>(V) ||
+      isa<ConstantFPSDNode>(V))
+    return;
+  DAG.addTargetHint(V.getNode(), Hint);
 }
 
 void SelectionDAGBuilder::visitPHI(const PHINode &) {
